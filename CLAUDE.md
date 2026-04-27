@@ -60,6 +60,15 @@ Three things to internalise about this pipeline before changing it:
 - **Adaptive timeout**: `_resolve_timeout` defaults to `max(3600, 6 × duration_seconds)`; `--timeout 0` disables; an explicit positive value wins. A 3-hour movie therefore gets an 18-hour cap.
 - **Ruff `ignore` list in `pyproject.toml` is intentional** (subprocess-to-ffmpeg, module-level encoder cache, blind cleanup excepts in kill paths, etc.). Don't silence those rules per-line; if a new violation needs an exception, add it to the central list with a comment matching the existing style.
 
+## Where work-in-progress is tracked
+
+`TODO.md` at the repo root is the actionable backlog (planned features,
+known performance work, etc.). The README's "Known limitations" section
+is a *current-state* warning to users; `TODO.md` is the to-do list. When
+adding a new feature item, write enough context that picking it up later
+doesn't require re-deriving the why — `TODO.md`'s parallelism entry is a
+template for the level of detail that's useful.
+
 ## README cross-reference
 
 The README documents every flag, the bitrate flag table, the audio/subtitle handling contract, and the Radarr/Sonarr filename workflow. When changing user-visible behaviour (a flag's default, a rule's threshold, the bitrate table, encoder preference order, the keep-langs contract), update both the code and the matching README section — the README's tables are the user-facing source of truth and the docstrings inside the code defer to them.
