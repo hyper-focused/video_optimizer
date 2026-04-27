@@ -212,9 +212,10 @@ track that ffprobe tagged `eng`.
     than AAC at this operating point. Plays on Plex/Jellyfin server and
     direct on Apple TV 4K (tvOS 17+), all Android, Chromecast, Firefox/Chrome
     browsers, iOS 17+.
-  - **AAC-LC 2.0 @ 320 kbps** — Tier 2, universal compat. Anything from the
-    last 15 years decodes this; it's the "always works" stereo fallback for
-    devices that can't handle Opus or the lossless source.
+  - **AAC-LC 2.0 @ 256 kbps** — Tier 2, universal compat. Same operating
+    point Apple Music uses for stereo; anything from the last 15 years
+    decodes it. The "always works" stereo fallback for devices that can't
+    handle Opus or the lossless source.
 
   Compat tracks are tagged non-default and labelled `Opus 5.1 (compat)` /
   `AAC 2.0 (compat)`, so players still pick the original lossless track

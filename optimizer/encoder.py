@@ -318,8 +318,8 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
     two-tier compatibility ladder:
       * Tier 1 — Opus 5.1 @ 384k (only if source has ≥ 6 channels): high
         quality-per-bit, plays on modern devices that can't decode lossless.
-      * Tier 2 — AAC-LC 2.0 @ 320k: universal stereo fallback, plays on
-        anything from the last 15 years.
+      * Tier 2 — AAC-LC 2.0 @ 256k: universal stereo fallback, plays on
+        anything from the last 15 years (Apple Music's stereo bitrate).
     All compat tracks are tagged non-default so players still pick the
     original lossless track first.
     """
@@ -360,12 +360,14 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
         )
         out_idx += 1
 
-    # Tier 2: AAC-LC 2.0 @ 320k. Universal compatibility — anything that
+    # Tier 2: AAC-LC 2.0 @ 256k. Universal compatibility — anything that
     # decodes audio plays this. The "always works" fallback when older
-    # devices can't handle Opus or the lossless source.
+    # devices can't handle Opus or the lossless source. 256k AAC stereo
+    # is the same operating point Apple Music uses; transparent for any
+    # plausible source.
     args += _compat_track_args(
         out_idx, src_in_idx,
-        codec="aac", channels=2, bitrate="320k", lang=src_lang,
+        codec="aac", channels=2, bitrate="256k", lang=src_lang,
         title="AAC 2.0 (compat)",
     )
     return args
