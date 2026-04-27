@@ -737,39 +737,66 @@ def _parse_progress_line(line: str, state: _ProgressState,
     return state
 
 
-def _render_progress(state: _ProgressState, duration_seconds: float) -> None:
-    """Write a single in-place progress line to stderr (bar / fps / speed / ETA)."""
+def _render_progress(state: _ProgressState, duration_seconds: float, *,
+                     label: str = "", is_tty: bool = True) -> None:
+    """Write a progress update to stderr.
+
+    TTY mode: in-place line with `\\r`, redrawn frequently — the
+    interactive UX. Non-TTY mode (nohup, redirected stderr, `tee`):
+    newline-terminated line that includes `label` (typically
+    `[idx/total] filename`) so a `tail -f` of the log always answers
+    "what's running now". Caller is responsible for throttling the
+    non-TTY path.
+    """
     frac = (state.current_seconds / duration_seconds
             if duration_seconds > 0 else 0.0)
-    line = (f"\r{_format_bar(frac)} {frac * 100:5.1f}%  "
-            f"{state.current_seconds:7.1f}s/{duration_seconds:7.1f}s")
-    if state.fps > 0:
-        line += f"  {state.fps:5.1f}fps"
-    if state.speed > 0:
-        line += f"  {state.speed:4.2f}x"
-        # ETA only meaningful once speed has stabilised and we're not done.
-        remaining = duration_seconds - state.current_seconds
-        if remaining > 0:
-            line += f"  ETA {_format_secs(remaining / state.speed)}"
-    # Pad to clear leftover characters from a shorter previous render.
-    sys.stderr.write(line.ljust(100))
+    if is_tty:
+        line = (f"\r{label}{_format_bar(frac)} {frac * 100:5.1f}%  "
+                f"{state.current_seconds:7.1f}s/{duration_seconds:7.1f}s")
+        if state.fps > 0:
+            line += f"  {state.fps:5.1f}fps"
+        if state.speed > 0:
+            line += f"  {state.speed:4.2f}x"
+            remaining = duration_seconds - state.current_seconds
+            if remaining > 0:
+                line += f"  ETA {_format_secs(remaining / state.speed)}"
+        # Pad to clear leftover characters from a shorter previous render.
+        sys.stderr.write(line.ljust(120))
+    else:
+        parts = [f"{label}{frac * 100:5.1f}% "
+                 f"{state.current_seconds:.0f}/{duration_seconds:.0f}s"]
+        if state.fps > 0:
+            parts.append(f"{state.fps:.1f}fps")
+        if state.speed > 0:
+            parts.append(f"{state.speed:.2f}x")
+            remaining = duration_seconds - state.current_seconds
+            if remaining > 0:
+                parts.append(f"ETA {_format_secs(remaining / state.speed)}")
+        sys.stderr.write(" ".join(parts) + "\n")
     sys.stderr.flush()
 
 
 def _stream_progress_until_done(proc: subprocess.Popen,
                                 duration_seconds: float,
                                 timeout_seconds: int | None,
-                                start: float) -> bool:
+                                start: float,
+                                *, label: str = "") -> bool:
     """Pump ffmpeg progress lines until EOF; return True if a timeout fired."""
     timeout_active = bool(timeout_seconds and timeout_seconds > 0)
+    is_tty = sys.stderr.isatty()
+    # Interactive: refresh every 0.5s for a smooth bar. Detached (log file):
+    # one line every 30s — readable via `tail -f`, log size stays bounded
+    # at a few thousand lines per multi-hour encode rather than 7,200/hour.
+    render_interval = 0.5 if is_tty else 30.0
     last_render = 0.0
     state = _ProgressState()
     assert proc.stdout is not None
     for line in proc.stdout:
         state = _parse_progress_line(line.strip(), state, duration_seconds)
         now = time.monotonic()
-        if now - last_render >= 0.5:
-            _render_progress(state, duration_seconds)
+        if now - last_render >= render_interval:
+            _render_progress(state, duration_seconds,
+                             label=label, is_tty=is_tty)
             last_render = now
         if timeout_active and now - start > timeout_seconds:
             return True
@@ -778,10 +805,14 @@ def _stream_progress_until_done(proc: subprocess.Popen,
 
 def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
                timeout_seconds: int | None = 3600,
-               verbose: bool = False) -> tuple[bool, str]:
+               verbose: bool = False,
+               label: str = "") -> tuple[bool, str]:
     """Run ffmpeg with single-line progress; enforce wall-clock timeout.
 
     timeout_seconds: positive int caps wall-clock; 0 or None disables the cap.
+    label: prefix written on each progress update (typically
+    "[idx/total] filename: "). Most useful when stderr is not a TTY —
+    `tail -f` of a nohup log can answer "what's running" from any line.
     Returns (success, error_message).
     """
     if verbose:
@@ -798,7 +829,7 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
     start = time.monotonic()
     try:
         timed_out = _stream_progress_until_done(
-            proc, duration_seconds, timeout_seconds, start,
+            proc, duration_seconds, timeout_seconds, start, label=label,
         )
         if timed_out:
             proc.kill()

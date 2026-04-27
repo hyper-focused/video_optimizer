@@ -475,7 +475,8 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         print("    " + " ".join(cmd))
         return "dry_run", 0
 
-    return _execute_encode(db, dec, pr, cmd, desc, output_path, args)
+    label = f"[{idx}/{total}] {Path(pr.path).name}: "
+    return _execute_encode(db, dec, pr, cmd, desc, output_path, args, label)
 
 
 def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> None:
@@ -507,7 +508,8 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
 
 def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                     cmd: list[str], desc: str, output_path: Path,
-                    args: argparse.Namespace) -> tuple[str, int]:
+                    args: argparse.Namespace,
+                    label: str = "") -> tuple[str, int]:
     """Run ffmpeg, finalise the output path, update the decision row."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
@@ -518,7 +520,8 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
 
     ok, err = encoder.run_ffmpeg(cmd, pr.duration_seconds,
                                  timeout_seconds=timeout,
-                                 verbose=args.verbose)
+                                 verbose=args.verbose,
+                                 label=label)
     if not ok:
         print(f"    FAIL: {err}")
         # Clean up partial output so re-runs don't trip on it.
