@@ -118,8 +118,8 @@ Software fallbacks if QSV isn't available: `libsvtav1 -preset 6
 -pix_fmt yuv420p10le` or `libaom-av1 -cpu-used 4`.
 
 Both pick `--hwaccel auto` by default and require an explicit `--output-root`
-(side mode) or `--mode replace` (with optional `--backup`). HDR is skipped
-unless you pass `--allow-hdr-transcode`.
+(side mode) or `--mode replace` (with optional `--backup`). HDR sources are
+re-encoded as HDR (10-bit AV1, BT.2020 / PQ tagging passed through).
 
 ```bash
 # Encode pending HD candidates into a side tree, no prompts
@@ -152,7 +152,7 @@ off rewrite-codec, etc.), use `apply` directly.
 | `over_bitrate` | Video bitrate exceeds the per-resolution flag threshold (e.g. 1080p > 10 Mbps). | medium / high | Re-encode at the target's CRF/CQ. |
 | `legacy_codec` | Codec is MPEG-2, MPEG-4 part 2, VC-1, WMV1/2/3, H.263, RealVideo, or Theora. | high | Re-encode to target codec. |
 | `container_migration` | Container is AVI, WMV, ASF, FLV, MPEG, VOB, or MPEG-TS. | low | When this is the *only* fired rule and the video stream is already H.264 / HEVC / AV1 / VP9, do a stream-copy remux (no re-encode). |
-| `hdr_advisory` | Source has HDR colour metadata (PQ / HLG / BT.2020). | medium | **Advisory only** — never the sole reason for a candidate. `apply` refuses HDR sources unless `--allow-hdr-transcode` is set, since SDR-tonemapped output of HDR is destructive if unintended. |
+| `hdr_advisory` | Source has HDR colour metadata (PQ / HLG / BT.2020). | medium | **Advisory only** — never the sole reason for a candidate. Since v0.4.0 `apply` re-encodes HDR sources as HDR (10-bit AV1, BT.2020 / PQ tagging preserved); the rule remains as informational signalling about the source. |
 
 Use `--rules over_bitrate,legacy_codec` to restrict to a subset.
 
@@ -239,7 +239,7 @@ track that ffprobe tagged `eng`.
 - `--dry-run` — print planned ffmpeg commands; encode nothing.
 - `--limit N` — process at most N candidates per run.
 - `--quality Q` — CRF / global_quality / cq / qp / q:v override (encoder-dependent).
-- `--allow-hdr-transcode` — opt in to transcoding HDR sources.
+- `--allow-hdr-transcode` — vestigial no-op; HDR sources have been transcoded by default since v0.4.0. Kept for compatibility with older invocations.
 - `--name-suffix STR` — append to output stem (see Radarr/Sonarr below).
 - `--timeout SECONDS` — per-file ffmpeg wall-clock cap. `0` disables. Default
   is adaptive: `max(3600, 6 × source_duration)`. A 3-hour movie therefore
@@ -363,8 +363,11 @@ arrives.
   re-encode option, no `libfdk_aac` preference even when available.
 - No multi-pass software encoding.
 - Apply runs sequentially (one ffmpeg at a time).
-- HDR re-encode is opt-in only; HDR-preserving transcode (HDR10 → HDR10) is
-  not implemented — `--allow-hdr-transcode` will produce SDR output if the
-  encoder doesn't preserve HDR metadata.
+- HDR mastering display + MaxCLL/MaxFALL SEI metadata is not yet extracted
+  from source or forwarded to output. Output is correctly tagged HDR
+  (BT.2020 / PQ / 10-bit) and players treat it as HDR; this only affects
+  fine-grained tone-mapping accuracy on non-reference displays.
+- Dolby Vision metadata is not preserved. DV-on-HDR10 sources are
+  transcoded as HDR10 (the base layer). DV-only sources will lose DV.
 - Some hardware encoders (notably `av1_qsv`) may not preserve display rotation
   metadata from phone-recorded sources.

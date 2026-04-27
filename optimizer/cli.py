@@ -417,11 +417,13 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
               f"(left pending for another run)")
         return "deferred", 0
 
-    if pr.is_hdr and not args.allow_hdr_transcode:
-        print("    SKIP: HDR source (use --allow-hdr-transcode to override)")
-        db.mark_decision(dec["id"], "skipped",
-                         error="HDR source; --allow-hdr-transcode not set")
-        return "skipped", 0
+    if pr.is_hdr:
+        # av1_qsv main profile carries 10-bit, color metadata is passed
+        # through, and -pix_fmt p010le is pinned for 10-bit sources. That's
+        # the minimum for correctly-tagged HDR output. Mastering display +
+        # MaxCLL SEI are advisory (better tone-mapping on non-reference
+        # displays); not yet forwarded — see encoder._color_passthrough_args.
+        print("    HDR: passthrough (10-bit + BT.2020/PQ tagging)")
 
     if not args.auto and not args.dry_run:
         if not _confirm("    encode this file? [y/N/q]: "):
