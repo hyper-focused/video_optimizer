@@ -74,24 +74,26 @@ two most common library shapes. Use them when you don't want to remember the
 six-flag invocation; drop down to `apply` when you need to vary something the
 preset hard-codes.
 
-| Preset | Target | Quality (AV1 CQ) | Size target | Maxrate / bufsize | Resolution gate | HW decode | Filename rewrite | REENCODE tag | Audio kept |
-|--------|--------|------------------|-------------|-------------------|-----------------|-----------|------------------|--------------|-----------|
-| `hd-archive` | `av1+mkv` | 18 | ~5 GB/hr | 12M / 24M | height < 1440 | on | yes (dotted) | yes | `en,und` |
-| `uhd-archive` | `av1+mkv` | 21 | ~12 GB/hr | 30M / 60M | height ≥ 1440 | on | yes (dotted) | yes | `en,und` |
+| Preset | Target | Quality (AV1 CQ) | Size target | Resolution gate | HW decode | Filename rewrite | REENCODE tag | Audio kept |
+|--------|--------|------------------|-------------|-----------------|-----------|------------------|--------------|-----------|
+| `hd-archive` | `av1+mkv` | 18 | ~5 GB/hr | height < 1440 | on | yes (dotted) | yes | `en,und` |
+| `uhd-archive` | `av1+mkv` | 21 | ~12 GB/hr | height ≥ 1440 | on | yes (dotted) | yes | `en,und` |
 
 Both run `av1_qsv -preset veryslow` with the archive-tuned QSV flag set
 (`-extbrc 1 -low_power 0 -adaptive_i 1 -adaptive_b 1 -b_strategy 1 -bf 7
--refs 5 -profile:v main`). Three values are tuned by tier: `-look_ahead_depth`
+-refs 5 -profile:v main`). Two values are tuned by tier: `-look_ahead_depth`
 is **100** for UHD (~4s) and **60** for HD; `-g` (GOP) is **240** for UHD
-and **120** for HD; `-maxrate` / `-bufsize` is **30M / 60M** for UHD and
-**12M / 24M** for HD, sized to the per-tier GB/hr targets with ~35–50%
-headroom — ICQ stays in charge of the quality floor, the cap only bites in
-the hardest scenes. 10-bit sources are pinned to `-pix_fmt p010le` so they
-don't silently downconvert through QSV's default pipeline; 8-bit sources
-are left to the encoder default. The QSV decode pipeline (`-hwaccel qsv
--hwaccel_output_format qsv`) is on by default for the preset wrappers and
-can be turned off with `--no-hw-decode`. Source color metadata (BT.709 vs
-BT.2020/PQ) is passed through to the output rather than forced.
+and **120** for HD. Pure ICQ — no `-maxrate` / `-bufsize`; on av1_qsv the
+combination `extbrc + ICQ + maxrate` drops the encoder into a hybrid VBR
+mode that targets a much lower average than the headline cap suggests, so
+the cap-and-floor pair acts as a hard ceiling instead of a peak buffer
+and produces dramatically smaller files than CQ alone. 10-bit sources are
+pinned to `-pix_fmt p010le` so they don't silently downconvert through
+QSV's default pipeline; 8-bit sources are left to the encoder default.
+The QSV decode pipeline (`-hwaccel qsv -hwaccel_output_format qsv`) is on
+by default for the preset wrappers and can be turned off with
+`--no-hw-decode`. Source color metadata (BT.709 vs BT.2020/PQ) is passed
+through to the output rather than forced.
 
 **Resolution gate:** when pointing a preset at a mixed-resolution library,
 the gate skips files outside the preset's resolution band and **leaves them

@@ -401,6 +401,11 @@ def _qsv_args(encoder: str, quality: int, *,
     HD-vs-UHD knobs; AV1_QSV_BASE for the tier-independent flag set that
     matches the validated `videos/ff_uhd_av1.sh` reference script).
 
+    Pure ICQ, no -maxrate / -bufsize — on av1_qsv, the combination of
+    extbrc + ICQ + maxrate collapses to a hybrid VBR mode that under-allocates
+    by an order of magnitude (observed ~300 kb/s video at CQ 18 with maxrate
+    12M on a 1080p source). CQ alone gets the expected 4–7 Mb/s.
+
     bit_depth >= 10 pins -pix_fmt p010le so 10-bit sources don't silently
     downconvert to 8-bit through QSV's default pipeline. 8-bit sources are
     left to the encoder default.
@@ -420,8 +425,6 @@ def _qsv_args(encoder: str, quality: int, *,
             "-bf", base["bf"],
             "-refs", base["refs"],
             "-g", tier["gop"],
-            "-maxrate", tier["maxrate"],
-            "-bufsize", tier["bufsize"],
             "-profile:v", base["profile"],
         ]
         if bit_depth >= 10:

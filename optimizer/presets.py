@@ -64,24 +64,23 @@ PRESETS: dict[str, dict[str, object]] = {
 # HD = 1080p and below; UHD = 1440p and above. The split is decided by
 # probe.height >= 1440 inside encoder.build_encode_command.
 #
-# - maxrate / bufsize: ICQ ceiling. ICQ alone is uncapped; this floor-and-cap
-#   pair keeps the worst scenes from blowing the GB/hr budget. Sized with
-#   ~35–50% headroom over the expected per-tier average video bitrate.
 # - look_ahead_depth: frames of motion-prediction lookahead. Deeper = better
 #   compression on slow/static content, more memory and slower init.
 # - gop: max keyframe interval (frames). Longer GOP compresses better but
 #   makes seeks coarser. 24 fps content: 120 ≈ 5s, 240 ≈ 10s.
+#
+# No maxrate / bufsize on purpose. On av1_qsv, the combination
+# `extbrc=1 + ICQ + maxrate` drops the encoder into a hybrid VBR mode
+# that targets a *much* lower average than the maxrate suggests
+# (observed: ~300 kb/s video on a 1080p source at CQ 18 with maxrate=12M).
+# Pure ICQ produces the expected 4–7 Mb/s for archive-quality 1080p AV1.
 
 AV1_QSV_TIER: dict[str, dict[str, str]] = {
     "hd": {
-        "maxrate": "12M",
-        "bufsize": "24M",
         "look_ahead_depth": "60",
         "gop": "120",
     },
     "uhd": {
-        "maxrate": "30M",
-        "bufsize": "60M",
         "look_ahead_depth": "100",
         "gop": "240",
     },
