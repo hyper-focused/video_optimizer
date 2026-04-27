@@ -31,9 +31,11 @@ from __future__ import annotations
 # --------------------------------------------------------------------------- #
 
 # `quality` is av1_qsv ICQ. Lower = larger files + higher quality.
-# On Intel Arc + ffmpeg 7.x av1_qsv, archive-grade live-action targets are
-# roughly: HD CQ 18 ≈ 5 GB/hr, UHD CQ 21 ≈ 12 GB/hr (matches the maxrate
-# ceiling in AV1_QSV_TIER below).
+# Calibrated against Intel Arc / Battlemage with ffmpeg 7.x for archive-
+# grade live-action content:
+#   HD  CQ 22 → ~5 GB/hr  (1080p SDR; with the v0.5.0 audio ladder)
+#   UHD CQ 15 → ~12 GB/hr (2160p HDR; CQ 15-16 sit on the av1_qsv ICQ
+#                          quality plateau, CQ 17 falls off the knee)
 
 PRESETS: dict[str, dict[str, object]] = {
     "hd-archive": {
@@ -48,7 +50,7 @@ PRESETS: dict[str, dict[str, object]] = {
     "uhd-archive": {
         "label": "2160p / UHD library archive (AV1 + MKV)",
         "target": "av1+mkv",
-        "quality": 24,
+        "quality": 15,
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
