@@ -293,12 +293,13 @@ def _kept_subtitle_metadata(out_idx: int, track: SubtitleTrack) -> list[str]:
     return args
 
 
-def _compat_track_args(out_idx: int, src_in_idx: int, *, channels: int,
-                       bitrate: str, lang: str, title: str) -> list[str]:
-    """Build the -map + per-stream codec args for one AAC compat track."""
+def _compat_track_args(out_idx: int, src_in_idx: int, *, codec: str,
+                       channels: int, bitrate: str, lang: str,
+                       title: str) -> list[str]:
+    """Build the -map + per-stream codec args for one compat audio track."""
     return [
         "-map", f"0:a:{src_in_idx}?",
-        f"-c:a:{out_idx}", "aac",
+        f"-c:a:{out_idx}", codec,
         f"-b:a:{out_idx}", bitrate,
         f"-ac:a:{out_idx}", str(channels),
         f"-ar:a:{out_idx}", "48000",
@@ -310,15 +311,17 @@ def _compat_track_args(out_idx: int, src_in_idx: int, *, channels: int,
 
 def _audio_map_args(probe: ProbeResult, langs: set[str], *,
                     add_compat: bool = True) -> list[str]:
-    """-map / -c:a fragment for kept tracks plus optional AAC compat tracks.
+    """-map / -c:a fragment for kept tracks plus optional compat tracks.
 
     When `add_compat` is true and a kept track is hi-res lossless (TrueHD,
-    DTS-HD MA, FLAC, etc.), the best such track is also re-encoded to:
-      * AAC 5.1 @ 640k (only if source has ≥ 6 channels)
-      * AAC 2.0 @ 320k
-    Both are tagged as non-default so players still pick the original first;
-    they are "cheap insurance" for downstream devices that can't decode
-    lossless formats.
+    DTS-HD MA, FLAC, etc.), the best such track is also re-encoded into a
+    two-tier compatibility ladder:
+      * Tier 1 — Opus 5.1 @ 384k (only if source has ≥ 6 channels): high
+        quality-per-bit, plays on modern devices that can't decode lossless.
+      * Tier 2 — AAC-LC 2.0 @ 320k: universal stereo fallback, plays on
+        anything from the last 15 years.
+    All compat tracks are tagged non-default so players still pick the
+    original lossless track first.
     """
     kept = _select_kept_audio(probe, langs)
     if not kept:
@@ -347,16 +350,22 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
     out_idx = len(kept)
 
     if src_track.channels >= 6:
+        # Tier 1: Opus 5.1 @ 384k. Substantially better quality-per-bit than
+        # AAC at this operating point. Plays on Plex/Jellyfin, Apple TV 4K
+        # (tvOS 17+), all Android, Chromecast, Firefox/Chrome, iOS 17+.
         args += _compat_track_args(
             out_idx, src_in_idx,
-            channels=6, bitrate="640k", lang=src_lang,
-            title="AAC 5.1 (compat)",
+            codec="libopus", channels=6, bitrate="384k", lang=src_lang,
+            title="Opus 5.1 (compat)",
         )
         out_idx += 1
 
+    # Tier 2: AAC-LC 2.0 @ 320k. Universal compatibility — anything that
+    # decodes audio plays this. The "always works" fallback when older
+    # devices can't handle Opus or the lossless source.
     args += _compat_track_args(
         out_idx, src_in_idx,
-        channels=2, bitrate="320k", lang=src_lang,
+        codec="aac", channels=2, bitrate="320k", lang=src_lang,
         title="AAC 2.0 (compat)",
     )
     return args

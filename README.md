@@ -206,15 +206,19 @@ track that ffprobe tagged `eng`.
 - **Compat audio shadowing** (on by default; disable with `--no-compat-audio`):
   when any kept track is hi-res lossless — TrueHD, DTS-HD MA (DTS codec at
   ≥ 6 channels), FLAC, multichannel PCM — the best such source is also
-  re-encoded into two AAC compatibility tracks appended to the output:
-  - **AAC 5.1 @ 640 kbps** (only when the source has ≥ 6 channels)
-  - **AAC 2.0 @ 320 kbps**
+  re-encoded into a two-tier compatibility ladder appended to the output:
+  - **Opus 5.1 @ 384 kbps** (only when the source has ≥ 6 channels) —
+    Tier 1, modern high-quality lossy. Substantially better quality-per-bit
+    than AAC at this operating point. Plays on Plex/Jellyfin server and
+    direct on Apple TV 4K (tvOS 17+), all Android, Chromecast, Firefox/Chrome
+    browsers, iOS 17+.
+  - **AAC-LC 2.0 @ 320 kbps** — Tier 2, universal compat. Anything from the
+    last 15 years decodes this; it's the "always works" stereo fallback for
+    devices that can't handle Opus or the lossless source.
 
-  Compat tracks are tagged non-default and labelled `AAC 5.1 (compat)` /
+  Compat tracks are tagged non-default and labelled `Opus 5.1 (compat)` /
   `AAC 2.0 (compat)`, so players still pick the original lossless track
-  first. The bitrates are intentionally generous — these are cheap insurance
-  for downstream devices (older TVs, Chromecast, phones) that can't decode
-  TrueHD or DTS-HD MA.
+  first when possible.
 - Subtitles in the keep list are retained. MKV preserves them as-is. MP4
   outputs convert text subtitles to `mov_text`; image subtitles
   (`hdmv_pgs_subtitle`, `dvd_subtitle`) are dropped with a warning, since
