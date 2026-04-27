@@ -76,8 +76,8 @@ preset hard-codes.
 
 | Preset | Target | Quality (AV1 CQ) | Size target | Resolution gate | HW decode | Filename rewrite | REENCODE tag | Audio kept |
 |--------|--------|------------------|-------------|-----------------|-----------|------------------|--------------|-----------|
-| `hd-archive` | `av1+mkv` | 18 | ~5 GB/hr | height < 1440 | on | yes (dotted) | yes | `en,und` |
-| `uhd-archive` | `av1+mkv` | 21 | ~12 GB/hr | height ≥ 1440 | on | yes (dotted) | yes | `en,und` |
+| `hd-archive` | `av1+mkv` | 24 | ~5 GB/hr | height < 1440 | on | yes (dotted) | yes | `en,und` |
+| `uhd-archive` | `av1+mkv` | 27 | ~12 GB/hr | height ≥ 1440 | on | yes (dotted) | yes | `en,und` |
 
 Both run `av1_qsv -preset veryslow` with the archive-tuned QSV flag set
 (`-extbrc 1 -low_power 0 -adaptive_i 1 -adaptive_b 1 -b_strategy 1 -bf 7
@@ -194,9 +194,15 @@ mapped into the output. Two- and three-letter language codes (`en`/`eng`,
 track that ffprobe tagged `eng`.
 
 - All audio tracks whose language is in the keep list are retained as-is
-  (`-c:a copy`). The *default* track is always kept (so output is never
-  silent). Multiple matching-language tracks are all preserved — e.g. a
-  TrueHD 7.1, AC3 5.1, and DTS 2.0 commentary in English all survive.
+  (`-c:a copy`), **except commentary tracks** — any audio stream whose
+  title contains "commentary" (case-insensitive) is dropped, even when its
+  language matches. Commentaries pass the language filter (almost always
+  tagged English) but bloat archives by a couple hundred MB per episode.
+  The *default* track is always kept (so output is never silent), and if
+  every audio stream looks like commentary the first one is retained as a
+  safety net. Multiple non-commentary matching-language tracks are all
+  preserved — e.g. a TrueHD 7.1 main mix and a DTS 2.0 alternate mix in
+  English both survive.
 - **Compat audio shadowing** (on by default; disable with `--no-compat-audio`):
   when any kept track is hi-res lossless — TrueHD, DTS-HD MA (DTS codec at
   ≥ 6 channels), FLAC, multichannel PCM — the best such source is also

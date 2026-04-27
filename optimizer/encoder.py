@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import AudioTrack, ProbeResult
+from .models import AudioTrack, ProbeResult, SubtitleTrack
 from .presets import AV1_QSV_BASE, AV1_QSV_TIER
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +212,18 @@ def _is_hires_lossless(track: AudioTrack) -> bool:
     return codec == "dts" and track.channels >= 6
 
 
+def _is_commentary(track: AudioTrack) -> bool:
+    """True when the track's title labels it as commentary.
+
+    Commentary tracks pass the language filter (almost always tagged
+    English) but are noise for an archive workflow — they bloat files
+    and aren't what someone wants when they pick "English audio". Match
+    on title rather than codec/channels because a commentary track and
+    a primary track can share both.
+    """
+    return bool(track.title and "commentary" in track.title.lower())
+
+
 def _audio_quality_rank(codec: str) -> int:
     """Rank an audio codec by perceptual quality; higher is better."""
     return _AUDIO_QUALITY_RANK.get(codec.lower(), 10)
@@ -233,18 +245,52 @@ def _pick_compat_source(
 def _select_kept_audio(
     probe: ProbeResult, langs: set[str],
 ) -> list[tuple[int, AudioTrack]]:
-    """Pick which input audio tracks survive the language filter."""
+    """Pick which input audio tracks survive the language and commentary filters."""
     have_default = any(a.default for a in probe.audio_tracks)
     kept: list[tuple[int, AudioTrack]] = []
     for i, a in enumerate(probe.audio_tracks):
+        if _is_commentary(a):
+            continue
         lang = (a.language or "").lower()
         keep = lang in langs or a.default or (not have_default and i == 0)
         if keep:
             kept.append((i, a))
     if not kept and probe.audio_tracks:
-        # Safety: never produce a silent file.
-        kept = [(0, probe.audio_tracks[0])]
+        # Safety: never produce a silent file. Prefer first non-commentary
+        # track; fall back to first of any kind only if nothing else exists.
+        for i, a in enumerate(probe.audio_tracks):
+            if not _is_commentary(a):
+                kept = [(i, a)]
+                break
+        if not kept:
+            kept = [(0, probe.audio_tracks[0])]
     return kept
+
+
+def _kept_audio_metadata(out_idx: int, track: AudioTrack) -> list[str]:
+    """Re-set language/title on a copied audio track.
+
+    Needed because the build_*_command paths strip per-stream metadata
+    (`-map_metadata:s -1`) to evict source mkvmerge statistics tags
+    (BPS, NUMBER_OF_BYTES, etc.) that would otherwise carry verbatim and
+    misreport bitrate on new streams.
+    """
+    args: list[str] = []
+    lang = (track.language or "und").lower()
+    args += [f"-metadata:s:a:{out_idx}", f"language={lang}"]
+    if track.title:
+        args += [f"-metadata:s:a:{out_idx}", f"title={track.title}"]
+    return args
+
+
+def _kept_subtitle_metadata(out_idx: int, track: SubtitleTrack) -> list[str]:
+    """Re-set language/title on a copied subtitle track (mirrors the audio helper)."""
+    args: list[str] = []
+    lang = (track.language or "und").lower()
+    args += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
+    if track.title:
+        args += [f"-metadata:s:s:{out_idx}", f"title={track.title}"]
+    return args
 
 
 def _compat_track_args(out_idx: int, src_in_idx: int, *, channels: int,
@@ -279,8 +325,9 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
         return []
 
     args: list[str] = []
-    for in_idx, _ in kept:
+    for out_idx, (in_idx, track) in enumerate(kept):
         args += ["-map", f"0:a:{in_idx}?"]
+        args += _kept_audio_metadata(out_idx, track)
     # Blanket copy for the originals; per-stream specifiers below override
     # only the appended compat outputs.
     args += ["-c:a", "copy"]
@@ -331,8 +378,9 @@ def _subtitle_map_args(probe: ProbeResult, langs: set[str],
         kept.append(i)
 
     args: list[str] = []
-    for i in kept:
+    for out_idx, i in enumerate(kept):
         args += ["-map", f"0:s:{i}?"]
+        args += _kept_subtitle_metadata(out_idx, probe.subtitle_tracks[i])
     if kept:
         # mkv preserves any sub format; mp4 needs text subs converted.
         args += ["-c:s", "copy"] if target_container == "mkv" else ["-c:s", "mov_text"]
@@ -491,6 +539,7 @@ def build_remux_command(probe: ProbeResult, output_path: Path,
         "ffmpeg", "-hide_banner", "-y",
         "-i", probe.path,
         "-map_metadata", "0",
+        "-map_metadata:s", "-1",
         "-map_chapters", "0",
         "-c:v", "copy",
     ]
@@ -524,7 +573,9 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
         cmd += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
     if encoder.endswith("_vaapi"):
         cmd += ["-vaapi_device", _VAAPI_DEVICE]
-    cmd += ["-i", probe.path, "-map_metadata", "0", "-map_chapters", "0"]
+    cmd += ["-i", probe.path,
+            "-map_metadata", "0", "-map_metadata:s", "-1",
+            "-map_chapters", "0"]
 
     cmd += _codec_args(encoder, q, is_uhd=is_uhd, bit_depth=probe.bit_depth)
     cmd += _color_passthrough_args(probe)
