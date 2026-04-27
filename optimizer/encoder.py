@@ -455,7 +455,8 @@ def _software_args(encoder: str, quality: int) -> list[str] | None:
 
 
 def _qsv_args(encoder: str, quality: int, *,
-              is_uhd: bool = False, bit_depth: int = 8) -> list[str]:
+              is_uhd: bool = False, bit_depth: int = 8,
+              hw_decode: bool = False) -> list[str]:
     """Codec args for Intel Quick Sync encoders.
 
     All av1_qsv tuning lives in `optimizer/presets.py` (AV1_QSV_TIER for
@@ -467,9 +468,12 @@ def _qsv_args(encoder: str, quality: int, *,
     by an order of magnitude (observed ~300 kb/s video at CQ 18 with maxrate
     12M on a 1080p source). CQ alone gets the expected 4–7 Mb/s.
 
-    bit_depth >= 10 pins -pix_fmt p010le so 10-bit sources don't silently
-    downconvert to 8-bit through QSV's default pipeline. 8-bit sources are
-    left to the encoder default.
+    Bit depth handling: when hw_decode is True, the QSV decode->encode
+    pipeline keeps frames in GPU-resident `qsv` surfaces that natively
+    preserve source bit depth. Pinning -pix_fmt p010le in that path forces
+    a qsv->p010le conversion that ffmpeg's auto_scale filter can't bridge,
+    breaking the encode. So pix_fmt is only pinned when hw_decode is False
+    (SW decode -> QSV encode), where it does prevent stealth downconvert.
     """
     base = AV1_QSV_BASE
     a = ["-c:v", encoder, "-preset", base["preset"],
@@ -488,12 +492,16 @@ def _qsv_args(encoder: str, quality: int, *,
             "-g", tier["gop"],
             "-profile:v", base["profile"],
         ]
-        if bit_depth >= 10:
+        if bit_depth >= 10 and not hw_decode:
             a += ["-pix_fmt", "p010le"]
     if encoder == "hevc_qsv":
         a += ["-tag:v", "hvc1"]
         if bit_depth >= 10:
-            a += ["-pix_fmt", "p010le", "-profile:v", "main10"]
+            # Profile is fine to set in either pipeline; only pix_fmt is
+            # incompatible with the qsv-surface path.
+            a += ["-profile:v", "main10"]
+            if not hw_decode:
+                a += ["-pix_fmt", "p010le"]
     return a
 
 
@@ -523,13 +531,15 @@ def _videotoolbox_args(encoder: str, quality: int) -> list[str]:
 
 
 def _codec_args(encoder: str, quality: int, *,
-                is_uhd: bool = False, bit_depth: int = 8) -> list[str]:
+                is_uhd: bool = False, bit_depth: int = 8,
+                hw_decode: bool = False) -> list[str]:
     """Return -c:v + quality/preset arg fragment for the given encoder."""
     sw = _software_args(encoder, quality)
     if sw is not None:
         return sw
     if encoder.endswith("_qsv"):
-        return _qsv_args(encoder, quality, is_uhd=is_uhd, bit_depth=bit_depth)
+        return _qsv_args(encoder, quality, is_uhd=is_uhd,
+                         bit_depth=bit_depth, hw_decode=hw_decode)
     if encoder.endswith("_nvenc"):
         return _nvenc_args(encoder, quality)
     if encoder.endswith("_vaapi"):
@@ -590,7 +600,8 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
             "-map_metadata", "0", "-map_metadata:s", "-1",
             "-map_chapters", "0"]
 
-    cmd += _codec_args(encoder, q, is_uhd=is_uhd, bit_depth=probe.bit_depth)
+    cmd += _codec_args(encoder, q, is_uhd=is_uhd,
+                       bit_depth=probe.bit_depth, hw_decode=hw_decode)
     cmd += _color_passthrough_args(probe)
 
     if encoder.endswith("_vaapi"):

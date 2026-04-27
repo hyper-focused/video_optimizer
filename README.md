@@ -90,10 +90,16 @@ the cap-and-floor pair acts as a hard ceiling instead of a peak buffer
 and produces dramatically smaller files than CQ alone. 10-bit sources are
 pinned to `-pix_fmt p010le` so they don't silently downconvert through
 QSV's default pipeline; 8-bit sources are left to the encoder default.
-The QSV decode pipeline (`-hwaccel qsv -hwaccel_output_format qsv`) is on
-by default for the preset wrappers and can be turned off with
-`--no-hw-decode`. Source color metadata (BT.709 vs BT.2020/PQ) is passed
-through to the output rather than forced.
+CPU decode → QSV encode by default (since v0.4.1). The QSV decode pipeline
+(`-hwaccel qsv -hwaccel_output_format qsv`) is available behind
+`--hw-decode` but off by default — av1_qsv at preset veryslow is the
+pipeline bottleneck (1–3× realtime), CPU HEVC decode runs at 5–10×
+realtime, so HW decode never speeds anything up that matters here.
+CPU decode also produces well-defined p010le frames (no QSV-surface
+bridge issues for 10-bit sources) and preserves HDR mastering display +
+MaxCLL side_data more reliably than the QSV decode path. Source color
+metadata (BT.709 vs BT.2020/PQ) is passed through to the output rather
+than forced.
 
 **Resolution gate:** when pointing a preset at a mixed-resolution library,
 the gate skips files outside the preset's resolution band and **leaves them
