@@ -327,10 +327,12 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
     args: list[str] = []
     for out_idx, (in_idx, track) in enumerate(kept):
         args += ["-map", f"0:a:{in_idx}?"]
+        # Per-stream copy rather than a blanket `-c:a copy` — the appended
+        # compat outputs below set their own `-c:a:N aac`, and a blanket
+        # `-c:a copy` collides with those (ffmpeg warns "Multiple -codec
+        # options specified" and falls back to last-wins).
+        args += [f"-c:a:{out_idx}", "copy"]
         args += _kept_audio_metadata(out_idx, track)
-    # Blanket copy for the originals; per-stream specifiers below override
-    # only the appended compat outputs.
-    args += ["-c:a", "copy"]
 
     if not add_compat:
         return args
