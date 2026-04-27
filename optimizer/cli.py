@@ -356,6 +356,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 # the last scan. Drop the cache row so we stop queueing
                 # files that won't open at apply time. A subsequent scan
                 # of the new location will re-populate as needed.
+                #
+                # Decisions reference files via FK with default RESTRICT;
+                # delete dependent decisions first or the DELETE fails
+                # with sqlite3.IntegrityError. Audit history for
+                # already-recycled files is acceptable to lose — the
+                # source is gone, the record has nothing to anchor to.
+                db.conn.execute("DELETE FROM decisions WHERE path = ?", (pr.path,))
                 db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
                 pruned += 1
                 continue
