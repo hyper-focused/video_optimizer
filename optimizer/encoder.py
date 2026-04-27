@@ -530,8 +530,12 @@ def _qsv_args(encoder: str, quality: int, *,
     (SW decode -> QSV encode), where it does prevent stealth downconvert.
     """
     base = AV1_QSV_BASE
+    # `-global_quality` is scoped to the video stream (`:v`) so the qscale
+    # flag isn't applied to every encoder in the graph. Without the scope,
+    # libopus rejects with "Quality-based encoding not supported" and the
+    # whole encode fails before producing any output.
     a = ["-c:v", encoder, "-preset", base["preset"],
-         "-global_quality", str(quality), "-look_ahead", "1"]
+         "-global_quality:v", str(quality), "-look_ahead", "1"]
     if encoder == "av1_qsv":
         tier = AV1_QSV_TIER["uhd" if is_uhd else "hd"]
         a += [
