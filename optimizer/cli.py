@@ -87,7 +87,16 @@ def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
                     help="Strip this prefix from source paths when placing outputs "
                          "in --output-root (default: filesystem root).")
     ap.add_argument("--backup", type=Path,
-                    help="For --mode replace: copy original here before replacing.")
+                    help="For --mode replace: copy original here before replacing. "
+                         "Doubles disk use during the run; prefer --recycle-to "
+                         "for NAS targets that have a recycle-bin directory.")
+    ap.add_argument("--recycle-to", type=Path,
+                    help="For --mode replace: atomically move (rather than copy or "
+                         "delete) originals into this directory. Preserves source "
+                         "hierarchy under it. Atomic and instant when source and "
+                         "target are on the same filesystem (typical NAS share "
+                         "with @Recycle / #recycle). Mutually exclusive with "
+                         "--backup.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Process at most N candidates (0 = no limit).")
     ap.add_argument("--min-height", type=int, default=None,
@@ -185,6 +194,10 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
                        help="Strip this prefix when placing outputs in --output-root.")
         p.add_argument("--backup", type=Path,
                        help="For --mode replace: copy original here before replacing.")
+        p.add_argument("--recycle-to", type=Path,
+                       help="For --mode replace: atomically move originals into "
+                            "this dir (e.g. /mnt/nas/<share>/@Recycle). Preserves "
+                            "source hierarchy. Mutually exclusive with --backup.")
         p.add_argument("--limit", type=int, default=0,
                        help="Process at most N candidates (0 = no limit).")
         p.add_argument("--min-height", type=int, default=None,
@@ -362,6 +375,14 @@ def cmd_apply(args: argparse.Namespace) -> int:
     """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
     if args.mode == "side" and not args.output_root:
         print("error: --mode side requires --output-root", file=sys.stderr)
+        return 2
+    if args.backup and getattr(args, "recycle_to", None):
+        print("error: --backup and --recycle-to are mutually exclusive "
+              "(both preserve the original; pick one)", file=sys.stderr)
+        return 2
+    if getattr(args, "recycle_to", None) and args.mode != "replace":
+        print("error: --recycle-to only applies to --mode replace "
+              "(side mode never deletes originals)", file=sys.stderr)
         return 2
 
     keep_langs = [s.strip() for s in args.keep_langs.split(",") if s.strip()]
@@ -730,10 +751,37 @@ def _resolve_timeout(user_value: int | None, duration_seconds: float) -> int | N
     return max(3600, int(duration_seconds * 6))
 
 
+def _recycle_destination(src: Path, recycle_to: Path,
+                         source_root: Path | None) -> Path:
+    """Compute the recycle-bin destination path for `src`.
+
+    Mirrors the source hierarchy under `recycle_to` using `source_root` as
+    the prefix to strip (falls back to filename-only if src isn't under
+    source_root). If a file already exists at the computed path, appends
+    `_recycled<N>` so prior recycles aren't clobbered.
+    """
+    if source_root:
+        try:
+            rel = src.relative_to(source_root)
+        except ValueError:
+            rel = Path(src.name)
+    else:
+        rel = Path(src.name)
+    dst = recycle_to / rel
+    if not dst.exists():
+        return dst
+    counter = 1
+    while True:
+        candidate = dst.parent / f"{dst.stem}_recycled{counter}{dst.suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def _finalize_output(pr: ProbeResult, output_path: Path,
                      args: argparse.Namespace, db: Database,
                      dec: dict) -> float:
-    """Compute savings, run backup + remove-original for replace mode, update db."""
+    """Compute savings, run backup-or-recycle + remove-original, update db."""
     try:
         out_size = output_path.stat().st_size
     except OSError:
@@ -741,7 +789,27 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
     actual_mb = (pr.size - out_size) / (1024 * 1024)
 
     if args.mode == "replace":
-        if args.backup:
+        recycle_to = getattr(args, "recycle_to", None)
+        if recycle_to:
+            # Atomic move into recycle-bin instead of copy-then-delete. Wins
+            # over --backup for NAS targets: no doubled disk use, no I/O
+            # cost beyond a directory entry rename when source and target
+            # share a filesystem.
+            dst = _recycle_destination(Path(pr.path), recycle_to,
+                                       getattr(args, "source_root", None))
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(pr.path), str(dst))
+            except OSError as e:
+                print(f"    WARN: recycle move failed: {e}; "
+                      f"keeping output and original intact")
+                db.mark_decision(dec["id"], "completed",
+                                 output_path=str(output_path),
+                                 actual_savings_mb=actual_mb,
+                                 error=f"recycle move failed: {e}")
+                return actual_mb
+            # Original is now at `dst`; nothing more to delete.
+        elif args.backup:
             args.backup.mkdir(parents=True, exist_ok=True)
             backup_path = args.backup / Path(pr.path).name
             counter = 1
@@ -761,7 +829,9 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
                                  error=f"backup failed: {e}")
                 return actual_mb
 
-        if Path(pr.path) != output_path:
+        # When --recycle-to is set the move above already removed the
+        # original; otherwise unlink it now (after the optional backup copy).
+        if not recycle_to and Path(pr.path) != output_path:
             try:
                 Path(pr.path).unlink()
             except OSError as e:

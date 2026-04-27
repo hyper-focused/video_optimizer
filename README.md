@@ -244,9 +244,20 @@ high-quality stream 0.
 - `--mode side` (default, safer): outputs go under `--output-root DIR`,
   mirroring the source tree relative to `--source-root` (defaults to filesystem
   root). Originals are never touched.
-- `--mode replace`: encode to a temp file, optionally backup the original to
-  `--backup DIR`, then `os.replace` over the original on success. Failures
-  leave the original intact.
+- `--mode replace`: encode the new file to its final path, then dispose of
+  the original. Failures leave the original intact. Three sub-modes for
+  what happens to the original:
+  - **default** (no flag): hard-delete the original after the new file is
+    in place
+  - **`--backup DIR`**: copy the original to `DIR` first, then delete.
+    Doubles disk use during the run (every original is copied before
+    encode-output replaces it). Useful for offline backup targets.
+  - **`--recycle-to DIR`** *(v0.5.2+)*: atomically move the original into
+    `DIR`, preserving source hierarchy under it. Atomic and instant when
+    source and `DIR` share a filesystem (typical NAS share with
+    `@Recycle` or `#recycle`). No doubled disk use. Files appear in the
+    NAS recycle-bin view and age out per the share's auto-purge policy.
+    Mutually exclusive with `--backup`.
 
 ## Other useful flags
 
