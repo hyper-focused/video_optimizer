@@ -53,25 +53,14 @@ why.
 
 ## Robustness
 
-- [ ] **Filter NAS / OS system directories during crawl**
-      (`optimizer/crawler.py`). On the user's first full library scan
-      ~84 % (2,026 of 2,401) of cache rows were Synology / QNAP
-      thumbnail garbage from `.@__thumb/` directories. The thumbnails
-      use the source filename verbatim (including `.mkv` extension)
-      with JPEG content inside, so the existing extension filter
-      passes them, ffprobe reports them as `mjpeg 3840x2160 0.0 Mbps`,
-      and they bloat the cache + every `plan` output.
-
-      Approach: directory-level skip-list at the entry of
-      `_classify_entry`. Skip if the directory name starts with
-      `.@__thumb`, `@Recycle`, `@Recently-Snapshot`, `#recycle`, or
-      `.AppleDouble` (the common NAS / SMB system dirs). Plus
-      `__pycache__`, `.git`, `.svn` for the basic-hygiene set.
-      Single-pass: cheap, no other side effects.
-
-      One-time cleanup of existing cache: a `reprobe --prune` mode
-      (or just a SQL `DELETE FROM files WHERE path GLOB '*.@__thumb*'`)
-      to evict the existing cruft. Document for users with old caches.
+- [x] **Filter NAS / OS system directories during crawl** — landed
+      in v0.5.6 as `_SKIP_DIRS` + `_is_skipped_dir` in
+      `optimizer/crawler.py`. Skips `.@__thumb`, `@Recycle`,
+      `@Recently-Snapshot`, `#recycle`, `.AppleDouble`, plus
+      `__pycache__` / `.git` / `.svn`. Existing cache pruned via
+      `DELETE FROM files / decisions WHERE path LIKE '%.@__thumb%'`
+      etc. (11,168 rows of garbage gone, ~85 % of the cache).
+      Test coverage: `tests/test_crawler.py`.
 
 - [ ] **DB schema migration framework** (`optimizer/db.py`). Schema is
       created idempotently on every connect via `executescript(_SCHEMA)`,

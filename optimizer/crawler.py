@@ -15,9 +15,30 @@ SUPPORTED_EXTENSIONS = frozenset({
 })
 
 
+# Directory names to skip during recursive walk. These are NAS-server
+# system directories (Synology, QNAP) and OS metadata dirs whose contents
+# either masquerade as video files (Synology's `.@__thumb` re-uses source
+# filenames + extensions for JPEG thumbnails — passes the extension
+# filter, ffprobe reports them as 1-frame mjpeg) or are recycled/snapshot
+# duplicates we don't want to re-process.
+_SKIP_DIRS = frozenset({
+    ".@__thumb",          # Synology DSM thumbnail cache
+    "@Recycle",           # QNAP recycle bin
+    "@Recently-Snapshot", # QNAP snapshot directory
+    "#recycle",           # Synology recycle bin
+    ".AppleDouble",       # Mac SMB metadata
+    "__pycache__", ".git", ".svn",  # tooling hygiene
+})
+
+
 def _is_supported(path: Path) -> bool:
     """Return True if path has a supported video extension."""
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def _is_skipped_dir(path: Path) -> bool:
+    """Return True if a directory name matches the NAS / OS skip-list."""
+    return path.name in _SKIP_DIRS
 
 
 def _is_usable(path: Path) -> bool:
@@ -69,6 +90,9 @@ def _classify_entry(entry: Path, root_resolved: Path,
         log.debug("skip escaping symlink: %s", entry)
         return "skip", None
     if entry.is_dir():
+        if _is_skipped_dir(entry):
+            log.debug("skip system dir: %s", entry)
+            return "skip", None
         return ("recurse", entry) if recursive else ("skip", None)
     if entry.is_file() and _is_supported(entry) and _is_usable(entry):
         return "yield", entry
