@@ -7,10 +7,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The tool is stdlib-only Python 3.10+. There is no install step, no test suite, and no build artefact — `video_optimizer.py` is a shim that injects the repo onto `sys.path` and calls `optimizer.cli.main`.
 
 ```bash
-./video_optimizer.py <subcommand> [...]   # run the CLI directly
-ruff check .                              # lint (config in pyproject.toml)
-ruff check --select=ALL .                 # full ruleset; expected clean modulo the documented ignores
+./video_optimizer.py <subcommand> [...]      # run the CLI directly
+ruff check .                                 # lint (config in pyproject.toml)
+ruff check --select=ALL .                    # full ruleset; expected clean modulo the documented ignores
+python3 -m unittest discover -s tests -v     # run the test suite
 ```
+
+The test suite (`tests/`) is stdlib `unittest` — no pytest, no fixtures
+beyond `tests/_fixtures.py`. Each module pins a class of bug observed in
+production: `test_qsv_args.py` covers the v0.4.1 maxrate-clamping and
+v0.5.4 `-global_quality` scoping regressions; `test_audio_ladder.py`
+covers the v0.5.0 ladder-shape rules; `test_naming.py` mirrors the
+README's documented filename-rewrite examples. Run before touching
+`encoder.py`, `naming.py`, or `presets.py`.
 
 External runtime deps: `ffmpeg` and `ffprobe` on `PATH`. `list-encoders` is the canonical pre-flight to confirm the local ffmpeg has the encoders the user expects (it parses `ffmpeg -encoders` and also reports `/dev/dri/renderD128` for VAAPI).
 

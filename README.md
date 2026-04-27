@@ -366,16 +366,21 @@ video_optimizer/
 ├── archive-hd.sh             # turnkey driver script for NAS-archive runs
 ├── version.py
 ├── video_optimizer.py        # entrypoint shim
-└── optimizer/
-    ├── cli.py                # argparse + subcommand dispatch
-    ├── crawler.py            # recursive directory walk
-    ├── probe.py              # ffprobe → ProbeResult
-    ├── models.py             # dataclasses + JSON ser/de
-    ├── presets.py            # tuning surface (CQ, GOP, lookahead, bitrate table)
-    ├── rules.py              # rule engine + v1 rules
-    ├── encoder.py            # ffmpeg command builder + runner; audio ladder
-    ├── db.py                 # SQLite persistence
-    └── report.py             # text + JSON candidate rendering
+├── optimizer/
+│   ├── cli.py                # argparse + subcommand dispatch
+│   ├── crawler.py            # recursive directory walk
+│   ├── probe.py              # ffprobe → ProbeResult
+│   ├── models.py             # dataclasses + JSON ser/de
+│   ├── presets.py            # tuning surface (CQ, GOP, lookahead, bitrate table)
+│   ├── rules.py              # rule engine + v1 rules
+│   ├── encoder.py            # ffmpeg command builder + runner; audio ladder
+│   ├── db.py                 # SQLite persistence
+│   └── report.py             # text + JSON candidate rendering
+└── tests/                    # stdlib unittest; run with
+    ├── _fixtures.py          # `python3 -m unittest discover -s tests -v`
+    ├── test_audio_ladder.py
+    ├── test_qsv_args.py
+    └── test_naming.py
 ```
 
 ## Tuning

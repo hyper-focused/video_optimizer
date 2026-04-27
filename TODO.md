@@ -205,17 +205,10 @@ why.
         the Custom Format setup needed (already covered in README's
         Radarr/Sonarr section).
 
-- [ ] **Formalise synthetic probe tests** (new `tests/` directory).
-      Throughout the v0.4–v0.5 work cycle every check ran ad-hoc via
-      Python heredocs (synthetic `ProbeResult` → `_build_audio_ladder`
-      / `_qsv_args` / `build_encode_command` → assert argv). Those
-      checks lived in conversation history, not the repo.
-
-      Approach: `tests/test_audio_ladder.py`, `tests/test_qsv_args.py`,
-      `tests/test_naming.py` covering the three cases that have caught
-      regressions in this cycle: ladder-shape for various source
-      audio configs, av1_qsv argv with hw_decode + 10-bit + HDR, and
-      filename rewrite for the documented input-stem table. Use
-      stdlib `unittest` (consistent with the project's stdlib-only
-      stance). Wire into `pyproject.toml` / a CI workflow when there
-      is one.
+- [x] **Formalise synthetic probe tests** — landed in v0.5.5 as
+      `tests/test_audio_ladder.py`, `tests/test_qsv_args.py`,
+      `tests/test_naming.py` plus shared `tests/_fixtures.py`. 32
+      assertions covering the v0.4.1 maxrate, v0.4.1 hw_decode pix_fmt,
+      and v0.5.4 `-global_quality:v` regressions (each test with a
+      docstring tying it to the bug it pins). Run with
+      `python3 -m unittest discover -s tests -v`.
