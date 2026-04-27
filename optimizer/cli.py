@@ -347,7 +347,18 @@ def cmd_plan(args: argparse.Namespace) -> int:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
-        for pr in db.iter_probes():
+        # Materialise the probe list so we can mutate the cache (DELETE
+        # stale rows) without invalidating the iterator.
+        pruned = 0
+        for pr in list(db.iter_probes()):
+            if not Path(pr.path).exists():
+                # Source moved (recycle-to) or deleted out-of-band since
+                # the last scan. Drop the cache row so we stop queueing
+                # files that won't open at apply time. A subsequent scan
+                # of the new location will re-populate as needed.
+                db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
+                pruned += 1
+                continue
             cand = engine.evaluate(pr)
             if cand is None:
                 continue
@@ -358,6 +369,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 projected_savings_mb=cand.total_projected_savings_mb,
             )
             candidates.append(cand)
+        if pruned:
+            db.conn.commit()
+            print(f"pruned {pruned} stale cache rows (source moved or deleted)")
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -366,7 +380,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         else:
             print(report.format_candidates_text(candidates))
 
-        summary = {"cleared_pending": cleared, "candidates": len(candidates)}
+        summary = {"cleared_pending": cleared,
+                   "candidates": len(candidates),
+                   "pruned_stale_rows": pruned}
         db.end_run(run_id, summary)
     return 0
 
@@ -465,6 +481,16 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         print(f"[{idx}/{total}] {dec['path']}: probe missing, skipping")
         db.mark_decision(dec["id"], "skipped",
                          error="probe missing in cache (rerun scan)")
+        return "skipped", 0
+
+    # Defense in depth: catch sources that disappeared between plan and
+    # apply (e.g. file moved to recycle by an earlier apply, or unmounted
+    # NFS share). cmd_plan already prunes these, but a long-running apply
+    # could lose a source mid-run.
+    if not Path(pr.path).exists():
+        print(f"[{idx}/{total}] {pr.path}: source no longer exists, skipping")
+        db.mark_decision(dec["id"], "skipped",
+                         error="source no longer exists at apply time")
         return "skipped", 0
 
     _print_decision_header(dec, pr, idx, total)
