@@ -28,3 +28,8 @@ state.db-shm
 
 # Run logs from archive-hd.sh (e.g. archive-20260427.log)
 archive-*.log
+
+# Local one-shot recovery scripts (not project code)
+clear.py
+cleanup.py
+fix_*.py

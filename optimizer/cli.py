@@ -371,6 +371,43 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prefilter_resolution_gate(db: Database, pending: list[dict],
+                               args: argparse.Namespace) -> list[dict]:
+    """Drop pending rows outside the preset's height band before --limit slices.
+
+    Without this, `--limit N` can be consumed entirely by DEFER outcomes
+    (a queue whose top-N-by-savings are all UHD candidates burns the
+    limit on 10 defers and does zero encodes). With it, `--limit N`
+    means "N actual encodes within this preset's resolution band."
+
+    The in-loop gate in _apply_one is kept as defense in depth — any
+    caller that bypasses cmd_apply still gets correct DEFER behavior.
+    """
+    min_h = getattr(args, "min_height", None)
+    max_h = getattr(args, "max_height", None)
+    if min_h is None and max_h is None:
+        return pending
+    eligible = []
+    deferred = 0
+    for dec in pending:
+        pr = _load_probe_for_decision(db, dec)
+        if pr is None:
+            # Let _apply_one surface "probe missing" — don't filter here.
+            eligible.append(dec)
+            continue
+        if min_h is not None and pr.height < min_h:
+            deferred += 1
+            continue
+        if max_h is not None and pr.height > max_h:
+            deferred += 1
+            continue
+        eligible.append(dec)
+    if deferred:
+        print(f"deferred {deferred} candidates outside the resolution band "
+              f"(min={min_h}, max={max_h}); they remain pending for another preset.")
+    return eligible
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
     if args.mode == "side" and not args.output_root:
@@ -390,34 +427,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     with Database(args.db) as db:
         run_id = db.start_run("apply", None, _args_dict(args))
         pending = db.list_pending_decisions()
-
-        # Pre-filter by the resolution gate BEFORE applying --limit. Without
-        # this, --limit N can be consumed entirely by DEFER outcomes (a queue
-        # whose top-N-by-savings are all UHD candidates burns the limit on
-        # 10 defers and does zero encodes). With it, --limit N means "N
-        # actual encodes within this preset's resolution band."
-        min_h = getattr(args, "min_height", None)
-        max_h = getattr(args, "max_height", None)
-        gate_deferred = 0
-        if min_h is not None or max_h is not None:
-            eligible = []
-            for dec in pending:
-                pr = _load_probe_for_decision(db, dec)
-                if pr is None:
-                    eligible.append(dec)  # let _apply_one handle "probe missing"
-                    continue
-                if min_h is not None and pr.height < min_h:
-                    gate_deferred += 1
-                    continue
-                if max_h is not None and pr.height > max_h:
-                    gate_deferred += 1
-                    continue
-                eligible.append(dec)
-            pending = eligible
-            if gate_deferred:
-                print(f"deferred {gate_deferred} candidates outside the "
-                      f"resolution band (min={min_h}, max={max_h}); they "
-                      f"remain pending for another preset.")
+        pending = _prefilter_resolution_gate(db, pending, args)
 
         if args.limit > 0:
             pending = pending[: args.limit]
