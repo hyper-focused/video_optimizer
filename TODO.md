@@ -146,6 +146,65 @@ why.
       `${PRESET}-archive` in the apply args. Update the script's help
       text to mention both.
 
+- [ ] **Sonarr/Radarr import hook**: per-file re-encode triggered on
+      Arr import. Once the backlog is encoded, the steady-state goal
+      is that newly-downloaded files run through the same rules engine
+      + audio ladder + HDR pipeline before they ever look like a
+      "finished" import to the rest of the library.
+
+      Trigger surface: both apps have *Settings → Connect → Custom
+      Script* with a "Download / Import / Upgrade" event. They pass
+      the imported file path via environment variables
+      (`sonarr_episodefile_path`, `sonarr_episodefile_sourcefolder`,
+      `radarr_moviefile_path`, `radarr_movie_path`, etc.). Script
+      must return 0 quickly — encode is hours-long, so the hook
+      enqueues and detaches.
+
+      Approach (sketched, not committed):
+      1. New `tools/arr-import-hook.sh` reads the relevant Arr env
+         vars, normalises the import path, exits 0 immediately.
+      2. Either fire-and-forget a background job
+         (`nohup video_optimizer.py scan "$file" && plan && apply
+         --auto --mode replace --recycle-to ... &`) or push a row
+         into a new `import_queue` table that a periodic worker
+         drains. Worker is preferable — avoids overlapping encodes
+         when the Arr app imports a season pack of 20 episodes.
+      3. New CLI surface either way: a single-file shortcut like
+         `video_optimizer.py one-shot PATH` that runs scan + plan +
+         apply for one path, respecting the existing decision /
+         status / recycle plumbing. The Arr hook calls this; cron
+         or systemd-timer drains the queue at off-hours.
+
+      Quality gate: only re-encode when the rules engine would have
+      flagged the file in a normal `plan` pass — over_bitrate or
+      legacy_codec firing. Pass-through everything that's already
+      archive-grade (modern codec at sane bitrate). The hook should
+      *not* fire a re-encode on imports that don't meet the gate; it
+      should exit 0 silently and leave the file alone.
+
+      Failure handling: the Arr app has already imported the file
+      to its library path by the time our hook runs. If our re-encode
+      fails, the original stays at the library path (replace mode
+      never deletes until encode succeeds), the decision row is
+      `failed`, and the Arr app is none the wiser. Worker retries
+      on the next drain cycle; if persistently failing, manual
+      review via `status`.
+
+      Caveats / open questions:
+      - Sonarr's "Upgrade" event re-fires the hook when a better
+        source replaces an existing file. Want to handle: re-encode
+        the new source, recycle the old encoded file (which may
+        itself be ours from a prior import). Need to detect the
+        `.AV1.REENCODE` marker to avoid encoding our own output.
+      - Concurrent imports (season packs): single-worker queue
+        avoids contention; multi-engine GPU could parallelize but
+        see the apply-parallelism TODO item — they share the same
+        underlying refactor.
+      - Arr apps may scan/index the new encoded file as a "different
+        file" since the codec rewrite changes the filename. Document
+        the Custom Format setup needed (already covered in README's
+        Radarr/Sonarr section).
+
 - [ ] **Formalise synthetic probe tests** (new `tests/` directory).
       Throughout the v0.4–v0.5 work cycle every check ran ad-hoc via
       Python heredocs (synthetic `ProbeResult` → `_build_audio_ladder`
