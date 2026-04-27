@@ -39,7 +39,7 @@ PRESETS: dict[str, dict[str, object]] = {
     "hd-archive": {
         "label": "1080p / HD library archive (AV1 + MKV)",
         "target": "av1+mkv",
-        "quality": 24,
+        "quality": 22,
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
@@ -48,7 +48,7 @@ PRESETS: dict[str, dict[str, object]] = {
     "uhd-archive": {
         "label": "2160p / UHD library archive (AV1 + MKV)",
         "target": "av1+mkv",
-        "quality": 27,
+        "quality": 24,
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",

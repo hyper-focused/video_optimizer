@@ -199,33 +199,41 @@ mapped into the output. Two- and three-letter language codes (`en`/`eng`,
 `ja`/`jpn`, etc.) are treated as equivalents, so passing `en` will match a
 track that ffprobe tagged `eng`.
 
-- All audio tracks whose language is in the keep list are retained as-is
-  (`-c:a copy`), **except commentary tracks** — any audio stream whose
-  title contains "commentary" (case-insensitive) is dropped, even when its
-  language matches. Commentaries pass the language filter (almost always
-  tagged English) but bloat archives by a couple hundred MB per episode.
-  The *default* track is always kept (so output is never silent), and if
-  every audio stream looks like commentary the first one is retained as a
-  safety net. Multiple non-commentary matching-language tracks are all
-  preserved — e.g. a TrueHD 7.1 main mix and a DTS 2.0 alternate mix in
-  English both survive.
-- **Compat audio shadowing** (on by default; disable with `--no-compat-audio`):
-  when any kept track is hi-res lossless — TrueHD, DTS-HD MA (DTS codec at
-  ≥ 6 channels), FLAC, multichannel PCM — the best such source is also
-  re-encoded into a two-tier compatibility ladder appended to the output:
-  - **Opus 5.1 @ 384 kbps** (only when the source has ≥ 6 channels) —
-    Tier 1, modern high-quality lossy. Substantially better quality-per-bit
-    than AAC at this operating point. Plays on Plex/Jellyfin server and
-    direct on Apple TV 4K (tvOS 17+), all Android, Chromecast, Firefox/Chrome
-    browsers, iOS 17+.
-  - **AAC-LC 2.0 @ 256 kbps** — Tier 2, universal compat. Same operating
-    point Apple Music uses for stereo; anything from the last 15 years
-    decodes it. The "always works" stereo fallback for devices that can't
-    handle Opus or the lossless source.
+Since v0.5.0 every output has a **standardized 3-stream audio ladder**:
 
-  Compat tracks are tagged non-default and labelled `Opus 5.1 (compat)` /
-  `AAC 2.0 (compat)`, so players still pick the original lossless track
-  first when possible.
+| Output | Role | Source |
+|--------|------|--------|
+| Stream 0 (default) | Highest-quality available | Passthrough — best lossless track if present, else best lossy track. Picked by `(lossless, codec_rank, channels, default_flag)`. |
+| Stream 1 | 5.1 surround compat | Best 5.1 source track if present (excluding stream 0); otherwise **Opus 5.1 @ 384 kbps** encoded from stream 0 (when stream 0 has ≥ 6 channels). |
+| Stream 2 | Stereo compat | Best 2.0 source track if present (excluding streams 0/1); otherwise **AAC-LC 2.0 @ 256 kbps** encoded from stream 0 (downmix when stream 0 has > 2 channels, lossy fallback when stream 0 is lossless 2.0). |
+
+Streams 1 and 2 are skipped only when the source can't sensibly produce
+them — a stereo-only lossy source produces just stream 0; an AC-3 5.1 +
+AC-3 2.0 source produces 2 streams (no redundant Opus middle tier when
+stream 0 is already lossy 5.1 with no separate lossy-5.1 sibling). The
+common Blu-ray remux case (lossless surround source + native 5.1 + native
+2.0) yields 3 fully-passthrough streams with no transcode at all.
+
+Filter rules:
+
+- `--keep-langs en,und` (default) controls eligibility. Two-/three-letter
+  language codes (`en`/`eng`, `ja`/`jpn`) are treated as equivalents.
+- **Commentary tracks are dropped** regardless of language — any audio
+  stream whose title contains "commentary" (case-insensitive). The default
+  track is always considered (so output is never silent); if every track
+  looks like commentary the first non-commentary fallback is kept.
+- Tracks in non-keep languages are dropped. Multiple matching-language
+  tracks become candidates for the three ladder slots, not separate output
+  streams. **Parallel lossless tracks** (TrueHD + DTS-HD MA from the same
+  master, common in 4K Blu-ray remuxes) collapse to whichever ranks higher
+  — TrueHD wins, the DTS-HD MA is dropped. Saves ~4 Mb/s on a typical UHD
+  remux.
+- `--no-compat-audio` collapses output to stream 0 only (just the best
+  track, no ladder).
+
+Compat tracks are tagged non-default and titled `Opus 5.1 (compat)` /
+`AAC 2.0 (compat)` so players treat them as fallbacks behind the
+high-quality stream 0.
 - Subtitles in the keep list are retained. MKV preserves them as-is. MP4
   outputs convert text subtitles to `mov_text`; image subtitles
   (`hdmv_pgs_subtitle`, `dvd_subtitle`) are dropped with a warning, since

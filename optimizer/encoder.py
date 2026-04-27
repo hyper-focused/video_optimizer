@@ -229,42 +229,94 @@ def _audio_quality_rank(codec: str) -> int:
     return _AUDIO_QUALITY_RANK.get(codec.lower(), 10)
 
 
-def _pick_compat_source(
-    hires_kept: list[tuple[int, AudioTrack]],
-) -> tuple[int, AudioTrack] | None:
-    """Return the (input-index, track) of the best hi-res source, if any."""
-    if not hires_kept:
-        return None
-    return max(hires_kept, key=lambda iat: (
-        _audio_quality_rank(iat[1].codec),
-        iat[1].channels,
-        -iat[0],          # tie-break: earlier track wins
-    ))
-
-
-def _select_kept_audio(
+def _eligible_tracks(
     probe: ProbeResult, langs: set[str],
 ) -> list[tuple[int, AudioTrack]]:
-    """Pick which input audio tracks survive the language and commentary filters."""
+    """Source tracks passing the language + commentary filters.
+
+    Used as the candidate pool for `_build_audio_ladder`. Always returns at
+    least one track when the source has audio (safety: never produce a
+    silent file).
+    """
     have_default = any(a.default for a in probe.audio_tracks)
-    kept: list[tuple[int, AudioTrack]] = []
+    out: list[tuple[int, AudioTrack]] = []
     for i, a in enumerate(probe.audio_tracks):
         if _is_commentary(a):
             continue
         lang = (a.language or "").lower()
-        keep = lang in langs or a.default or (not have_default and i == 0)
-        if keep:
-            kept.append((i, a))
-    if not kept and probe.audio_tracks:
-        # Safety: never produce a silent file. Prefer first non-commentary
-        # track; fall back to first of any kind only if nothing else exists.
+        if lang in langs or a.default or (not have_default and i == 0):
+            out.append((i, a))
+    if not out and probe.audio_tracks:
         for i, a in enumerate(probe.audio_tracks):
             if not _is_commentary(a):
-                kept = [(i, a)]
+                out.append((i, a))
                 break
-        if not kept:
-            kept = [(0, probe.audio_tracks[0])]
-    return kept
+        if not out:
+            out.append((0, probe.audio_tracks[0]))
+    return out
+
+
+def _track_quality_key(track: AudioTrack) -> tuple:
+    """Sort key for picking the 'best' track. Higher tuples sort later (use max)."""
+    return (
+        _is_hires_lossless(track),
+        _audio_quality_rank(track.codec),
+        track.channels,
+        track.default,
+    )
+
+
+def _build_audio_ladder(
+    probe: ProbeResult, langs: set[str],
+) -> list[tuple[str, int, AudioTrack]]:
+    """Build the standardized 3-stream audio output ladder.
+
+    Output stream layout (deterministic, regardless of source):
+      0 — best available track (lossless preferred), passthrough
+      1 — 5.1 tier: a different 5.1 source if present, otherwise Opus 5.1
+          encoded from stream 0 (only when stream 0 has >= 6 channels)
+      2 — 2.0 tier: a different 2.0 source if present, otherwise AAC 2.0
+          encoded from stream 0 (with downmix when stream 0 has > 2 channels,
+          or as a lossy fallback when stream 0 is lossless 2.0)
+
+    Streams 1 and 2 are skipped when the source can't sensibly produce them
+    (e.g. stereo-only lossy source produces just stream 0). Returns a list
+    of (kind, src_idx, track) tuples in output order. kind is one of:
+    'copy', 'opus51', 'aac20'.
+    """
+    eligible = _eligible_tracks(probe, langs)
+    if not eligible:
+        return []
+
+    # Stream 0: the best available track.
+    s0_idx, s0_track = max(eligible, key=lambda it: _track_quality_key(it[1]))
+    ladder: list[tuple[str, int, AudioTrack]] = [("copy", s0_idx, s0_track)]
+    used = {s0_idx}
+
+    # Stream 1: 5.1 tier.
+    five_one = [it for it in eligible
+                if it[0] not in used and it[1].channels == 6]
+    if five_one:
+        s1_idx, s1_track = max(five_one, key=lambda it: _track_quality_key(it[1]))
+        ladder.append(("copy", s1_idx, s1_track))
+        used.add(s1_idx)
+    elif s0_track.channels >= 6:
+        # Synthesize 5.1 from stream 0 (it has the channels for it).
+        ladder.append(("opus51", s0_idx, s0_track))
+    # else: source has no 5.1-capable audio; skip the 5.1 tier (no upmix).
+
+    # Stream 2: 2.0 tier.
+    stereo = [it for it in eligible
+              if it[0] not in used and it[1].channels == 2]
+    if stereo:
+        s2_idx, s2_track = max(stereo, key=lambda it: _track_quality_key(it[1]))
+        ladder.append(("copy", s2_idx, s2_track))
+    elif s0_track.channels > 2 or _is_hires_lossless(s0_track):
+        # Downmix-from-surround OR lossless-stereo-fallback. Skip when
+        # stream 0 is already lossy stereo (a re-encode would be redundant).
+        ladder.append(("aac20", s0_idx, s0_track))
+
+    return ladder
 
 
 def _kept_audio_metadata(out_idx: int, track: AudioTrack) -> list[str]:
@@ -296,7 +348,11 @@ def _kept_subtitle_metadata(out_idx: int, track: SubtitleTrack) -> list[str]:
 def _compat_track_args(out_idx: int, src_in_idx: int, *, codec: str,
                        channels: int, bitrate: str, lang: str,
                        title: str) -> list[str]:
-    """Build the -map + per-stream codec args for one compat audio track."""
+    """Build the -map + per-stream codec args for one compat audio track.
+
+    Disposition is intentionally not set here — `_audio_map_args` assigns
+    dispositions to all output streams centrally after the ladder is built.
+    """
     return [
         "-map", f"0:a:{src_in_idx}?",
         f"-c:a:{out_idx}", codec,
@@ -305,71 +361,69 @@ def _compat_track_args(out_idx: int, src_in_idx: int, *, codec: str,
         f"-ar:a:{out_idx}", "48000",
         f"-metadata:s:a:{out_idx}", f"title={title}",
         f"-metadata:s:a:{out_idx}", f"language={lang}",
-        f"-disposition:a:{out_idx}", "0",
     ]
 
 
 def _audio_map_args(probe: ProbeResult, langs: set[str], *,
                     add_compat: bool = True) -> list[str]:
-    """-map / -c:a fragment for kept tracks plus optional compat tracks.
+    """-map / -c:a fragment for the standardized 3-stream audio ladder.
 
-    When `add_compat` is true and a kept track is hi-res lossless (TrueHD,
-    DTS-HD MA, FLAC, etc.), the best such track is also re-encoded into a
-    two-tier compatibility ladder:
-      * Tier 1 — Opus 5.1 @ 384k (only if source has ≥ 6 channels): high
-        quality-per-bit, plays on modern devices that can't decode lossless.
-      * Tier 2 — AAC-LC 2.0 @ 256k: universal stereo fallback, plays on
-        anything from the last 15 years (Apple Music's stereo bitrate).
-    All compat tracks are tagged non-default so players still pick the
-    original lossless track first.
+    Output is always:
+      stream 0 — the highest-quality eligible track, passthrough (default)
+      stream 1 — best 5.1 in source if present, else Opus 5.1 @ 384k from
+                 stream 0 (only when stream 0 has >= 6 channels)
+      stream 2 — best 2.0 in source if present, else AAC 2.0 @ 256k from
+                 stream 0 (downmix or lossless-fallback)
+
+    Streams 1 and 2 may be skipped when the source can't sensibly produce
+    them (stereo-only sources, or lossy stereo where the lossy fallback
+    would just duplicate stream 0).
+
+    `add_compat=False` (--no-compat-audio) collapses output to stream 0
+    only — escape hatch for callers who want just the best track.
     """
-    kept = _select_kept_audio(probe, langs)
-    if not kept:
+    eligible = _eligible_tracks(probe, langs)
+    if not eligible:
+        return []
+
+    if not add_compat:
+        # Just the best track. Used by --no-compat-audio.
+        s0_idx, s0_track = max(eligible, key=lambda it: _track_quality_key(it[1]))
+        args = ["-map", f"0:a:{s0_idx}?", "-c:a:0", "copy"]
+        args += _kept_audio_metadata(0, s0_track)
+        args += ["-disposition:a:0", "default"]
+        return args
+
+    ladder = _build_audio_ladder(probe, langs)
+    if not ladder:
         return []
 
     args: list[str] = []
-    for out_idx, (in_idx, track) in enumerate(kept):
-        args += ["-map", f"0:a:{in_idx}?"]
-        # Per-stream copy rather than a blanket `-c:a copy` — the appended
-        # compat outputs below set their own `-c:a:N aac`, and a blanket
-        # `-c:a copy` collides with those (ffmpeg warns "Multiple -codec
-        # options specified" and falls back to last-wins).
-        args += [f"-c:a:{out_idx}", "copy"]
-        args += _kept_audio_metadata(out_idx, track)
+    for out_idx, (kind, src_idx, track) in enumerate(ladder):
+        if kind == "copy":
+            args += ["-map", f"0:a:{src_idx}?",
+                     f"-c:a:{out_idx}", "copy"]
+            args += _kept_audio_metadata(out_idx, track)
+        elif kind == "opus51":
+            args += _compat_track_args(
+                out_idx, src_idx,
+                codec="libopus", channels=6, bitrate="384k",
+                lang=(track.language or "und").lower(),
+                title="Opus 5.1 (compat)",
+            )
+        elif kind == "aac20":
+            args += _compat_track_args(
+                out_idx, src_idx,
+                codec="aac", channels=2, bitrate="256k",
+                lang=(track.language or "und").lower(),
+                title="AAC 2.0 (compat)",
+            )
 
-    if not add_compat:
-        return args
-
-    hires_kept = [(i, t) for i, t in kept if _is_hires_lossless(t)]
-    picked = _pick_compat_source(hires_kept)
-    if picked is None:
-        return args
-
-    src_in_idx, src_track = picked
-    src_lang = (src_track.language or "und").lower()
-    out_idx = len(kept)
-
-    if src_track.channels >= 6:
-        # Tier 1: Opus 5.1 @ 384k. Substantially better quality-per-bit than
-        # AAC at this operating point. Plays on Plex/Jellyfin, Apple TV 4K
-        # (tvOS 17+), all Android, Chromecast, Firefox/Chrome, iOS 17+.
-        args += _compat_track_args(
-            out_idx, src_in_idx,
-            codec="libopus", channels=6, bitrate="384k", lang=src_lang,
-            title="Opus 5.1 (compat)",
-        )
-        out_idx += 1
-
-    # Tier 2: AAC-LC 2.0 @ 256k. Universal compatibility — anything that
-    # decodes audio plays this. The "always works" fallback when older
-    # devices can't handle Opus or the lossless source. 256k AAC stereo
-    # is the same operating point Apple Music uses; transparent for any
-    # plausible source.
-    args += _compat_track_args(
-        out_idx, src_in_idx,
-        codec="aac", channels=2, bitrate="256k", lang=src_lang,
-        title="AAC 2.0 (compat)",
-    )
+    # Explicit dispositions: stream 0 default, others non-default. Override
+    # source disposition (a passthrough 5.1 may have been default in source).
+    args += ["-disposition:a:0", "default"]
+    for i in range(1, len(ladder)):
+        args += [f"-disposition:a:{i}", "0"]
     return args
 
 
