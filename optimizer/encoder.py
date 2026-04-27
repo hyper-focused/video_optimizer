@@ -784,8 +784,15 @@ def _stream_progress_until_done(proc: subprocess.Popen,
                                 duration_seconds: float,
                                 timeout_seconds: int | None,
                                 start: float,
-                                *, label: str = "") -> bool:
-    """Pump ffmpeg progress lines until EOF; return True if a timeout fired."""
+                                *, label: str = "",
+                                stall_seconds: int = 300,
+                                ) -> tuple[bool, str]:
+    """Pump ffmpeg progress lines until EOF.
+
+    Returns (should_kill, reason). reason is the failure description
+    when should_kill is True, empty string on clean EOF. The caller
+    is responsible for the actual kill + reap.
+    """
     timeout_active = bool(timeout_seconds and timeout_seconds > 0)
     is_tty = sys.stderr.isatty()
     # Interactive: refresh every 0.5s for a smooth bar. Detached (log file):
@@ -793,30 +800,48 @@ def _stream_progress_until_done(proc: subprocess.Popen,
     # at a few thousand lines per multi-hour encode rather than 7,200/hour.
     render_interval = 0.5 if is_tty else 30.0
     last_render = 0.0
+    # Stall detection: if `out_time` (encoded position) doesn't advance
+    # for `stall_seconds` of wall-clock, the encoder is hung. Catches
+    # av1_qsv stalls on certain sources where the pipeline reads frames
+    # but never produces output — observed on a Guardians of the Galaxy
+    # 2014 1080p remux that consumed 4+ hours at 0.0% before manual
+    # interrupt. The wall-clock timeout (6× duration) is too generous
+    # to catch these.
+    last_progress_seconds = 0.0
+    stall_anchor_wall = start
     state = _ProgressState()
     assert proc.stdout is not None
     for line in proc.stdout:
         state = _parse_progress_line(line.strip(), state, duration_seconds)
         now = time.monotonic()
+        if state.current_seconds > last_progress_seconds:
+            last_progress_seconds = state.current_seconds
+            stall_anchor_wall = now
         if now - last_render >= render_interval:
             _render_progress(state, duration_seconds,
                              label=label, is_tty=is_tty)
             last_render = now
+        if now - stall_anchor_wall > stall_seconds:
+            return True, (f"encoder stalled — no progress for "
+                          f"{stall_seconds}s (out_time stuck at "
+                          f"{last_progress_seconds:.0f}s)")
         if timeout_active and now - start > timeout_seconds:
-            return True
-    return False
+            return True, f"timeout after {timeout_seconds}s"
+    return False, ""
 
 
 def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
                timeout_seconds: int | None = 3600,
+               stall_seconds: int = 300,
                verbose: bool = False,
                label: str = "") -> tuple[bool, str]:
-    """Run ffmpeg with single-line progress; enforce wall-clock timeout.
+    """Run ffmpeg with single-line progress; enforce wall-clock + stall caps.
 
     timeout_seconds: positive int caps wall-clock; 0 or None disables the cap.
-    label: prefix written on each progress update (typically
-    "[idx/total] filename: "). Most useful when stderr is not a TTY —
-    `tail -f` of a nohup log can answer "what's running" from any line.
+    stall_seconds: kill if `out_time` doesn't advance for this many wall-
+    clock seconds. Catches encoder hangs that the wall-clock cap is too
+    generous to notice (the adaptive default is 6× source duration).
+    label: prefix written on each progress update.
     Returns (success, error_message).
     """
     if verbose:
@@ -832,14 +857,15 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
 
     start = time.monotonic()
     try:
-        timed_out = _stream_progress_until_done(
-            proc, duration_seconds, timeout_seconds, start, label=label,
+        should_kill, reason = _stream_progress_until_done(
+            proc, duration_seconds, timeout_seconds, start,
+            label=label, stall_seconds=stall_seconds,
         )
-        if timed_out:
+        if should_kill:
             proc.kill()
             proc.wait(timeout=10)
             sys.stderr.write("\n")
-            return False, f"timeout after {timeout_seconds}s"
+            return False, reason
         rc = _wait_with_optional_timeout(proc, start, timeout_seconds)
         sys.stderr.write("\n")
     except subprocess.TimeoutExpired:
