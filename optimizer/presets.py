@@ -6,8 +6,9 @@ without touching the encoder or rules logic. Edit values here, save, run.
 Layout:
 
   - PRESETS              — preset definitions (CQ, height gate, target codec).
-  - AV1_QSV_TIER         — per-tier (hd / uhd) av1_qsv tuning: maxrate /
-                           bufsize / look_ahead_depth / GOP.
+  - AV1_QSV_TIER         — per-tier (hd / uhd) av1_qsv tuning:
+                           look_ahead_depth + GOP. (No maxrate/bufsize on
+                           purpose — see comment below the table.)
   - AV1_QSV_BASE         — av1_qsv flags shared across tiers.
   - BITRATE_FLAG_TABLE   — rules engine's per-resolution
                            (target_mbps, flag_above_mbps) thresholds.

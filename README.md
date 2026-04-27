@@ -76,8 +76,8 @@ preset hard-codes.
 
 | Preset | Target | Quality (AV1 CQ) | Size target | Resolution gate | HW decode | Filename rewrite | REENCODE tag | Audio kept |
 |--------|--------|------------------|-------------|-----------------|-----------|------------------|--------------|-----------|
-| `hd-archive` | `av1+mkv` | 22 | ~5 GB/hr | height < 1440 | on | yes (dotted) | yes | `en,und` |
-| `uhd-archive` | `av1+mkv` | 15 | ~12 GB/hr | height ≥ 1440 | on | yes (dotted) | yes | `en,und` |
+| `hd-archive` | `av1+mkv` | 22 | ~5 GB/hr | height < 1440 | off | yes (dotted) | yes | `en,und` |
+| `uhd-archive` | `av1+mkv` | 15 | ~12 GB/hr | height ≥ 1440 | off | yes (dotted) | yes | `en,und` |
 
 Both run `av1_qsv -preset veryslow` with the archive-tuned QSV flag set
 (`-extbrc 1 -low_power 0 -adaptive_i 1 -adaptive_b 1 -b_strategy 1 -bf 7
@@ -124,8 +124,10 @@ Software fallbacks if QSV isn't available: `libsvtav1 -preset 6
 -pix_fmt yuv420p10le` or `libaom-av1 -cpu-used 4`.
 
 Both pick `--hwaccel auto` by default and require an explicit `--output-root`
-(side mode) or `--mode replace` (with optional `--backup`). HDR sources are
-re-encoded as HDR (10-bit AV1, BT.2020 / PQ tagging passed through).
+(side mode) or `--mode replace` (with optional `--backup` or `--recycle-to`).
+HDR sources are re-encoded as HDR — 10-bit AV1, BT.2020 / PQ tagging passed
+through, and mastering display + MaxCLL SEI metadata propagated end-to-end
+via libavcodec → av1_qsv → matroska muxer (no extra flags needed).
 
 ```bash
 # Encode pending HD candidates into a side tree, no prompts
@@ -146,7 +148,8 @@ re-encoded as HDR (10-bit AV1, BT.2020 / PQ tagging passed through).
 
 Things you can override on a preset (everything else is preset-fixed):
 `--quality`, `--keep-langs`, `--hwaccel`, `--mode`, `--output-root`,
-`--source-root`, `--backup`, `--limit`, `--timeout`, `--allow-hdr-transcode`,
+`--source-root`, `--backup`, `--recycle-to`, `--limit`, `--timeout`,
+`--hw-decode` / `--no-hw-decode`, `--compat-audio` / `--no-compat-audio`,
 `--no-dotted`, `--name-suffix`, `--reencode-tag-value`, `--dry-run`,
 `--verbose`, `--db`. If you need to change anything else (target codec, turn
 off rewrite-codec, etc.), use `apply` directly.
@@ -308,7 +311,16 @@ With `--reencode-tag` added, each gets `.REENCODE` appended:
 ### Recommended workflow
 
 ```bash
-# Re-encode the queue, replace originals (with backup), tag for Custom Formats
+# NAS-archive (recommended for shares with @Recycle / #recycle support):
+# encoded files land alongside originals; originals atomically move to
+# the recycle bin (single rename(2), no doubled disk use).
+./video_optimizer.py hd-archive --auto \
+    --source-root /mnt/nas/media \
+    --recycle-to /mnt/nas/media/@Recycle
+
+# Generic backup workflow when the target filesystem doesn't have a
+# recycle directory: copy originals to a separate tree before deletion.
+# Doubles disk use during the run.
 ./video_optimizer.py apply --auto \
     --mode replace \
     --backup /mnt/media/_orig \
@@ -316,6 +328,11 @@ With `--reencode-tag` added, each gets `.REENCODE` appended:
     --reencode-tag \
     --hwaccel auto
 ```
+
+For unattended NAS runs there's `archive-hd.sh` at the repo root —
+opinionated driver that walks scan → plan → confirm → apply with the
+defaults above pre-filled, plus `--limit N`, `--dry-run`, `--yes` flags
+for cron / nohup.
 
 Then in Radarr/Sonarr, add a Custom Format with a regex match on
 `\bREENCODE\b` and either:
@@ -344,6 +361,9 @@ status (`pending`, `completed`, `failed`, `skipped`) and measured savings.
 ```
 video_optimizer/
 ├── README.md
+├── CLAUDE.md                 # repo-orientation notes for AI coding agents
+├── TODO.md                   # actionable backlog (separate from "Known limitations")
+├── archive-hd.sh             # turnkey driver script for NAS-archive runs
 ├── version.py
 ├── video_optimizer.py        # entrypoint shim
 └── optimizer/
@@ -351,9 +371,9 @@ video_optimizer/
     ├── crawler.py            # recursive directory walk
     ├── probe.py              # ffprobe → ProbeResult
     ├── models.py             # dataclasses + JSON ser/de
-    ├── presets.py            # tuning surface (CQ, maxrate, GOP, bitrate table)
+    ├── presets.py            # tuning surface (CQ, GOP, lookahead, bitrate table)
     ├── rules.py              # rule engine + v1 rules
-    ├── encoder.py            # ffmpeg command builder + runner
+    ├── encoder.py            # ffmpeg command builder + runner; audio ladder
     ├── db.py                 # SQLite persistence
     └── report.py             # text + JSON candidate rendering
 ```
@@ -364,8 +384,10 @@ The knobs you would realistically retune without changing logic all live
 in **`optimizer/presets.py`**:
 
 - `PRESETS` — preset CQ, height gate, target codec.
-- `AV1_QSV_TIER` — per-tier (`hd` / `uhd`) `maxrate` / `bufsize` /
-  `look_ahead_depth` / `gop`.
+- `AV1_QSV_TIER` — per-tier (`hd` / `uhd`) `look_ahead_depth` and `gop`.
+  (No `maxrate` / `bufsize` on purpose — `extbrc + ICQ + maxrate` on
+  av1_qsv collapses to a hybrid VBR mode that under-allocates by an order
+  of magnitude. Pure ICQ produces the expected operating point.)
 - `AV1_QSV_BASE` — av1_qsv flags shared across tiers (`bf`, `refs`,
   `extbrc`, `preset`, `profile`, …).
 - `BITRATE_FLAG_TABLE` — `(target_mbps, flag_above_mbps)` per resolution
@@ -380,19 +402,25 @@ TOML config at `~/.video_optimizer/config.toml`. The shape of `presets.py`
 maps cleanly to TOML tables, so the migration is mechanical when the need
 arrives.
 
-## Known limitations / deferred to v2
+## Known limitations
 
-- No filename normalization beyond `--name-suffix` (originals' stems are
-  preserved; only the suffix and extension change).
-- Audio compat tracks are AAC-only (native ffmpeg encoder); no Opus or AC3
-  re-encode option, no `libfdk_aac` preference even when available.
-- No multi-pass software encoding.
-- Apply runs sequentially (one ffmpeg at a time).
-- HDR mastering display + MaxCLL/MaxFALL SEI metadata is not yet extracted
-  from source or forwarded to output. Output is correctly tagged HDR
-  (BT.2020 / PQ / 10-bit) and players treat it as HDR; this only affects
-  fine-grained tone-mapping accuracy on non-reference displays.
-- Dolby Vision metadata is not preserved. DV-on-HDR10 sources are
-  transcoded as HDR10 (the base layer). DV-only sources will lose DV.
-- Some hardware encoders (notably `av1_qsv`) may not preserve display rotation
-  metadata from phone-recorded sources.
+These are *current-state caveats* for users. Planned/actionable work lives
+in `TODO.md` instead.
+
+- **No filename normalization beyond `--name-suffix`** — originals' stems
+  are preserved; only the suffix and extension change.
+- **No `libfdk_aac` preference** — the AAC compat track uses ffmpeg's
+  native AAC encoder. libfdk_aac is GPL-incompatible and absent from most
+  distros' default ffmpeg builds. The 256k bitrate is calibrated against
+  the native encoder; transparent for stereo at this rate.
+- **No multi-pass software encoding** — single-pass only across all
+  encoders.
+- **`apply` runs sequentially** — one ffmpeg at a time. See `TODO.md` for
+  the parallel-apply roadmap; encode itself is GPU-bound on Battlemage at
+  preset veryslow, so the win comes from concurrency on multi-engine GPUs.
+- **Dolby Vision metadata is not preserved** — DV-on-HDR10 sources are
+  transcoded as HDR10 (the base layer); DV-only sources will lose DV.
+  HDR10 metadata (mastering display + MaxCLL) *is* preserved end-to-end
+  via libavcodec → av1_qsv → matroska muxer.
+- **Some hardware encoders may not preserve display rotation metadata**
+  from phone-recorded sources (notably `av1_qsv`).

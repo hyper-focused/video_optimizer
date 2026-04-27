@@ -25,3 +25,6 @@ env/
 state.db
 state.db-wal
 state.db-shm
+
+# Run logs from archive-hd.sh (e.g. archive-20260427.log)
+archive-*.log
