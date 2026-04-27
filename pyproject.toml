@@ -1,0 +1,50 @@
+# Ruff configuration for video_optimizer (ruff 0.0.x flat schema).
+#
+# Default `ruff check` enforces a focused ruleset (E/W/F + bugbear, simplicity,
+# import sort). `ruff check --select=ALL` is also clean modulo the ignores
+# below, which document deliberate design choices rather than oversights.
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = ["__pycache__"]
+
+select = [
+    "E", "W",       # pycodestyle
+    "F",            # pyflakes
+    "I",            # isort
+    "B",            # flake8-bugbear
+    "C90",          # mccabe complexity
+    "PYI",          # pep-484/591 typing nits
+    "TRY",          # try/except hygiene
+    "DTZ",          # datetime tz awareness
+]
+
+# Things we deliberately accept; documented here once instead of strewn
+# across the source as `# noqa` markers.
+ignore = [
+    # argparse subparser type hints reach into _SubParsersAction; stdlib
+    # doesn't expose a public alias.
+    "SLF001",
+    # subprocess to ffmpeg/ffprobe from PATH is the design.
+    "S603", "S607",
+    # `assert proc.stdout is not None` in encoder.run_ffmpeg narrows the
+    # Optional for the type checker; not a runtime invariant guard.
+    "S101",
+    # Blind/silenced cleanup exceptions during process kill paths.
+    "BLE001", "S110",
+    # Module-level encoder cache uses a global by design.
+    "PLW0603",
+    # `subprocess.run` without `check=` — we read returncode ourselves.
+    "PLW1510",
+    # Allow long error/help messages; we wrap manually where it helps.
+    "TRY003",
+]
+
+[tool.ruff.mccabe]
+max-complexity = 10
+
+[tool.ruff.per-file-ignores]
+# Apply pipeline helpers genuinely take many params; would need a context
+# dataclass solely for the linter, which adds an abstraction used twice.
+"optimizer/cli.py" = ["PLR0913"]
