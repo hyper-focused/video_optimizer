@@ -237,6 +237,16 @@ def _eligible_tracks(
     Used as the candidate pool for `_build_audio_ladder`. Always returns at
     least one track when the source has audio (safety: never produce a
     silent file).
+
+    Eligibility is **language-only**: a track passes if its lang is in
+    `langs`, OR — if the source has no default flag set anywhere — if it's
+    the first track (a heuristic for sources missing disposition info).
+    The default flag is intentionally NOT consulted: some release tools
+    (BEN.THE.MEN among them) set default=True on every track, which
+    flooded eligibility with foreign-lang tracks and produced ladders
+    like "English DTS-HD MA s0 + Italian DTS 5.1 s1." The "no English
+    audio at all" case is handled by the safety net at the bottom, not
+    by the predicate.
     """
     have_default = any(a.default for a in probe.audio_tracks)
     out: list[tuple[int, AudioTrack]] = []
@@ -244,7 +254,7 @@ def _eligible_tracks(
         if _is_commentary(a):
             continue
         lang = (a.language or "").lower()
-        if lang in langs or a.default or (not have_default and i == 0):
+        if lang in langs or (not have_default and i == 0):
             out.append((i, a))
     if not out and probe.audio_tracks:
         for i, a in enumerate(probe.audio_tracks):

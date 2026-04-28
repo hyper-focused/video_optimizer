@@ -104,6 +104,50 @@ class AudioLadderTests(unittest.TestCase):
             expected=[("copy", 1), ("copy", 2), ("copy", 3)],
         )
 
+    def test_all_default_true_does_not_admit_foreign_lang(self):
+        """BEN.THE.MEN releases set default=True on EVERY audio track, which
+        used to flood eligibility with foreign-lang tracks via the
+        `or a.default` clause. The s1 5.1 slot would then prefer Italian
+        DTS 5.1 (codec rank 80) over English EAC3 5.1 (rank 60).
+
+        With v0.5.11's fix, eligibility is language-only and foreign
+        tracks are skipped regardless of their default flag."""
+        self.assert_ladder(
+            audio=[
+                aud(0, "dts",  "eng", 7, title="BTM DTS-HD Master", default=True),
+                aud(1, "eac3", "eng", 6, title="BTM DDP5.1",        default=True),
+                aud(2, "eac3", "spa", 6, title="BTM DDP5.1",        default=True),
+                aud(3, "eac3", "cze", 6, title="BTM DDP5.1",        default=True),
+                aud(4, "dts",  "ita", 6, title="BTM DTS 5.1",       default=True),
+                aud(5, "eac3", "ita", 6, title="BTM DDP5.1",        default=True),
+                aud(6, "eac3", "rus", 6, title="BTM DDP5.1",        default=True),
+                aud(7, "ac3",  "eng", 2, title="BTM Commentary",    default=True),
+            ],
+            # s0 = English DTS-HD MA (track 0). s1 = English EAC3 5.1
+            # (track 1), NOT Italian DTS 5.1 (track 4). s2 = synth AAC 2.0
+            # because no native English 2.0 (the 2-channel commentary at
+            # track 7 is filtered by the commentary rule).
+            expected=[("copy", 0), ("copy", 1), ("aac20", 0)],
+        )
+
+    def test_foreign_only_default_falls_through_to_safety_net(self):
+        """Source where all-default-true tracks are foreign (e.g. anime with
+        Japanese-only audio, no English at all): output isn't silent.
+
+        The safety net at the bottom of _eligible_tracks keeps only the
+        first non-commentary track (just enough to avoid silence). The
+        ladder then synthesizes both compat tiers from it. The Japanese
+        AC3 2.0 (track 1) is NOT used as the s2 passthrough because it
+        isn't eligible — language filter rejected it. To get the foreign
+        2.0 retained, the user would pass --keep-langs jpn,eng."""
+        self.assert_ladder(
+            audio=[
+                aud(0, "flac", "jpn", 6, title="Japanese FLAC 5.1", default=True),
+                aud(1, "ac3",  "jpn", 2, title="Japanese DD 2.0",   default=True),
+            ],
+            expected=[("copy", 0), ("opus51", 0), ("aac20", 0)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
