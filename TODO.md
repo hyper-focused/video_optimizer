@@ -138,7 +138,13 @@ why.
       NAL/RPU sequence wedges the av1_qsv intake. Without that, we're
       guessing about which NAL types to strip.
 
-- [ ] **Drop `-look_ahead 1` from `_qsv_args`** (low priority,
+- [x] **Drop `-look_ahead 1` from `_qsv_args`** — landed in v0.5.16
+      together with the uhd-archive `hw_decode=True` flip and the
+      `-nostdin` addition. Comment in `_qsv_args` notes the option is
+      preserved for the day hevc_qsv / h264_qsv come back into the
+      regular path.
+
+      *Original entry retained for context:* (low priority,
       cosmetic). Every encode produces this warning:
       `Codec AVOption look_ahead (Use VBR algorithm with look ahead)
       has not been used for any stream.`

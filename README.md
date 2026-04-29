@@ -97,16 +97,19 @@ the cap-and-floor pair acts as a hard ceiling instead of a peak buffer
 and produces dramatically smaller files than CQ alone. 10-bit sources are
 pinned to `-pix_fmt p010le` so they don't silently downconvert through
 QSV's default pipeline; 8-bit sources are left to the encoder default.
-CPU decode → QSV encode by default (since v0.4.1). The QSV decode pipeline
-(`-hwaccel qsv -hwaccel_output_format qsv`) is available behind
-`--hw-decode` but off by default — av1_qsv at preset veryslow is the
-pipeline bottleneck (1–3× realtime), CPU HEVC decode runs at 5–10×
-realtime, so HW decode never speeds anything up that matters here.
-CPU decode also produces well-defined p010le frames (no QSV-surface
-bridge issues for 10-bit sources) and preserves HDR mastering display +
-MaxCLL side_data more reliably than the QSV decode path. Source color
-metadata (BT.709 vs BT.2020/PQ) is passed through to the output rather
-than forced.
+Decode pipeline is preset-dependent: `hd-archive` defaults to CPU decode →
+QSV encode (1080p HEVC decodes at 20–30× realtime on a modern CPU, so
+the encode is the only real bottleneck and CPU decode keeps the HDR
+side-data path simple). `uhd-archive` defaults to QSV decode → QSV
+encode (`-hwaccel qsv -hwaccel_output_format qsv`) since v0.5.16: at
+2160p the SW HEVC decoder takes 4–6 cores on high-bitrate sources and
+starts competing with audio re-encode + I/O for headroom, observed as
+fps decay during long batches. The hardware-decode path needs the
+v0.5.15 DV skip filter in place to be reliable — the QSV HEVC decoder
+wedges on Dolby Vision streams. Override per run with `--no-hw-decode`
+(or `--hw-decode` to force on for `hd-archive`). Source color metadata
+(BT.709 vs BT.2020/PQ) is passed through to the output rather than
+forced.
 
 **Resolution gate:** when pointing a preset at a mixed-resolution library,
 the gate skips files outside the preset's resolution band and **leaves them

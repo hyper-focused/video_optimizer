@@ -555,8 +555,15 @@ def _qsv_args(encoder: str, quality: int, *,
     # flag isn't applied to every encoder in the graph. Without the scope,
     # libopus rejects with "Quality-based encoding not supported" and the
     # whole encode fails before producing any output.
+    #
+    # `-look_ahead 1` is intentionally absent: it's a family-level QSV
+    # option that only does something on hevc_qsv / h264_qsv. av1_qsv
+    # ignores it (use `-look_ahead_depth` instead) and ffmpeg surfaces a
+    # `Codec AVOption look_ahead ... has not been used` warning per
+    # encode if it's left on. Restore for hevc_qsv / h264_qsv if those
+    # encoders ever come back into the regular path.
     a = ["-c:v", encoder, "-preset", base["preset"],
-         "-global_quality:v", str(quality), "-look_ahead", "1"]
+         "-global_quality:v", str(quality)]
     if encoder == "av1_qsv":
         tier = AV1_QSV_TIER["uhd" if is_uhd else "hd"]
         a += [
@@ -638,7 +645,7 @@ def build_remux_command(probe: ProbeResult, output_path: Path,
                         *, add_compat_audio: bool = True) -> list[str]:
     """Return ffmpeg argv that stream-copies into target_container."""
     cmd: list[str] = [
-        "ffmpeg", "-hide_banner", "-y",
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
         "-i", probe.path,
         "-map_metadata", "0",
         "-map_metadata:s", "-1",
@@ -670,7 +677,10 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
     # (deeper lookahead, longer GOP); 1080p and below get HD-tuned values.
     is_uhd = probe.height >= 1440
 
-    cmd: list[str] = ["ffmpeg", "-hide_banner", "-y"]
+    # -nostdin: ffmpeg defaults to interactive controls on a TTY; in a
+    # non-interactive long-running batch a stray byte on stdin can wedge
+    # the process. Belt-and-braces against subprocess inheritance quirks.
+    cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     if hw_decode and encoder.endswith("_qsv"):
         cmd += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
     if encoder.endswith("_vaapi"):

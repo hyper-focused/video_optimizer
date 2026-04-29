@@ -242,20 +242,17 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         p.add_argument("--timeout", type=int, default=None,
                        help="Per-file ffmpeg wall-clock cap in seconds. "
                             "0 disables.")
-        # Hardware decode defaults OFF: encode is always the bottleneck
-        # (av1_qsv veryslow runs at 1-3x realtime; CPU HEVC decode runs at
-        # 5-10x realtime), so the QSV decode->encode pipeline doesn't speed
-        # anything up that matters. CPU decode produces well-defined p010le
-        # frames and preserves HDR side_data more reliably than the QSV
-        # surface path. Opt in with --hw-decode if you want it.
+        # Hardware decode default comes from the preset config (`hw_decode`
+        # in PRESETS). Default=None at the parser level so cmd_preset can
+        # tell user-explicit from preset-default; --hw-decode / --no-hw-decode
+        # both override the preset value when passed.
         hwd = p.add_mutually_exclusive_group()
-        hwd.add_argument("--hw-decode", action="store_true", default=False,
-                         help="Opt into the zero-copy QSV decode->encode "
-                              "pipeline. Off by default (CPU decode is the "
-                              "right choice for archive workflows).")
+        hwd.add_argument("--hw-decode", action="store_true", default=None,
+                         help="Force the zero-copy QSV decode->encode "
+                              "pipeline on for this run.")
         hwd.add_argument("--no-hw-decode", action="store_false",
                          dest="hw_decode",
-                         help="(default) Use CPU decode -> QSV encode.")
+                         help="Force CPU decode -> QSV encode for this run.")
         # Compat audio default-on for presets too.
         ca = p.add_mutually_exclusive_group()
         ca.add_argument("--compat-audio", action="store_true", default=True,
@@ -772,6 +769,8 @@ def cmd_preset(args: argparse.Namespace) -> int:
         args.min_height = cfg["min_height"]
     if args.max_height is None and "max_height" in cfg:
         args.max_height = cfg["max_height"]
+    if args.hw_decode is None:
+        args.hw_decode = bool(cfg.get("hw_decode", False))
     if args.verbose:
         bounds = (f"[{args.min_height or '-'}..{args.max_height or '-'}]"
                   if (args.min_height or args.max_height) else "any")

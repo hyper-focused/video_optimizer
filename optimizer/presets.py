@@ -58,6 +58,14 @@ PRESETS: dict[str, dict[str, object]] = {
         "reencode_tag": True,
         "keep_langs": "en,und",
         "min_height": 1440,        # UHD/QHD only — skip HD, leave for hd-archive
+        # 4K HEVC sources land in the SW HEVC decoder otherwise; on a
+        # 60 Mbps 2160p stream that's 4–6 cores chewing decode while the
+        # GPU encode waits, observed as fps decay during long batches.
+        # Routing decode to the QSV asic via -hwaccel qsv keeps the
+        # pipeline zero-copy GPU-to-GPU. Safe now that the v0.5.15 DV
+        # skip filters out the sources that wedge the QSV decoder.
+        # Override per run with --no-hw-decode if a specific title trips it.
+        "hw_decode": True,
     },
 }
 
