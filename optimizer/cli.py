@@ -177,6 +177,16 @@ def _add_list_encoders_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
 
+def _add_replace_list_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `replace-list` subcommand."""
+    rl = sub.add_parser(
+        "replace-list",
+        help="List sources that have hit the av1_qsv encoder watchdog 2+ times "
+             "(candidates for finding a different release).",
+    )
+    _add_common_db_arg(rl)
+
+
 def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
     """Register one subcommand per entry in PRESETS, sharing a narrow flag set."""
     for name, cfg in PRESETS.items():
@@ -272,6 +282,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_apply_parser(sub)
     _add_status_parser(sub)
     _add_list_encoders_parser(sub)
+    _add_replace_list_parser(sub)
     _add_preset_parsers(sub)
     return p
 
@@ -350,6 +361,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         pruned = 0
+        stall_blocked = 0
         for pr in list(db.iter_probes()):
             if not Path(pr.path).exists():
                 # Source moved (recycle-to) or deleted out-of-band since
@@ -366,6 +378,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
                 pruned += 1
                 continue
+            # Two-strikes rule for av1_qsv encoder stalls: once a source
+            # has hit the watchdog twice with the same `encoder stalled`
+            # reason, it's deterministically broken on this driver.
+            # Re-queueing a third time just burns another 5 minutes per
+            # run for the same predictable failure. Files that hit this
+            # case live in `replace-list` — operator's signal to grab a
+            # different release of the same title.
+            stall_count = db.conn.execute(
+                "SELECT COUNT(*) FROM decisions "
+                "WHERE path = ? AND status = 'failed' "
+                "AND error LIKE '%encoder stalled%'",
+                (pr.path,),
+            ).fetchone()[0]
+            if stall_count >= 2:
+                stall_blocked += 1
+                continue
             cand = engine.evaluate(pr)
             if cand is None:
                 continue
@@ -379,6 +407,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         if pruned:
             db.conn.commit()
             print(f"pruned {pruned} stale cache rows (source moved or deleted)")
+        if stall_blocked:
+            print(f"skipped {stall_blocked} files with 2+ stall failures "
+                  f"(see `./video_optimizer.py replace-list` for the list)")
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -714,6 +745,40 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replace_list(args: argparse.Namespace) -> int:
+    """Print sources that hit the av1_qsv stall watchdog 2+ times.
+
+    These are deterministic encoder failures: the bitstream pattern in the
+    source triggers a libvpl AV1 hang that doesn't recover. Re-running
+    won't help; the operator needs to grab a different release of the
+    same title (or accept losing it from the archive backlog).
+
+    `plan` skips these files automatically — they won't re-queue. The
+    list here is purely informational.
+    """
+    with Database(args.db) as db:
+        rows = db.conn.execute(
+            "SELECT path, COUNT(*) AS fails, "
+            "       MAX(decided_at) AS last_failed_at "
+            "FROM decisions "
+            "WHERE status = 'failed' AND error LIKE '%encoder stalled%' "
+            "GROUP BY path "
+            "HAVING COUNT(*) >= 2 "
+            "ORDER BY MAX(decided_at) DESC"
+        ).fetchall()
+
+    if not rows:
+        print("no files have hit the stall watchdog 2+ times.")
+        return 0
+
+    print(f"{len(rows)} source(s) with 2+ encoder stalls "
+          f"— consider replacing with a different release:\n")
+    for r in rows:
+        when = time.strftime("%Y-%m-%d", time.localtime(r["last_failed_at"]))
+        print(f"  {r['fails']}× stalled  (last: {when})  {r['path']}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -939,6 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
         "apply": cmd_apply,
         "status": cmd_status,
         "list-encoders": cmd_list_encoders,
+        "replace-list": cmd_replace_list,
     }
     # Preset subcommands all dispatch to the same wrapper.
     for preset_name in PRESETS:

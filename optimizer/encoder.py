@@ -467,14 +467,25 @@ def _subtitle_map_args(probe: ProbeResult, langs: set[str],
 def build_stream_map_args(probe: ProbeResult, keep_langs: list[str],
                           target_container: str,
                           *, add_compat_audio: bool = True) -> list[str]:
-    """Return -map + audio/subtitle/attachment codec args for chosen streams."""
+    """Return -map + audio/subtitle codec args for chosen streams.
+
+    Attachments (embedded fonts, cover art, etc.) are intentionally NOT
+    mapped, even for MKV targets. A single source attachment with a
+    missing or undeducible mimetype crashes ffmpeg's matroska muxer:
+
+      [matroska] Attachment stream N has no mimetype tag and it cannot
+      be deduced from the codec id.
+      [out] Could not write header (incorrect codec parameters?)
+
+    The fail-the-whole-encode cost is far higher than the benefit of
+    preserving embedded fonts (which mostly only matter for ASS/SSA
+    subtitle rendering — anime, rarely live-action archive content).
+    Observed in the wild on iNCEPTiON-grouped Indiana Jones 4 source.
+    """
     langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
     args: list[str] = ["-map", "0:v:0"]
     args += _audio_map_args(probe, langs, add_compat=add_compat_audio)
     args += _subtitle_map_args(probe, langs, target_container)
-    # Attachments (e.g. embedded fonts in MKV); MKV keeps them, MP4 has none.
-    if target_container == "mkv":
-        args += ["-map", "0:t?", "-c:t", "copy"]
     return args
 
 

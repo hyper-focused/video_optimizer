@@ -102,5 +102,23 @@ class QsvArgsTests(unittest.TestCase):
         self.assertNotIn("-profile:v", args)
 
 
+class StreamMapTests(unittest.TestCase):
+    """Output-stream mapping invariants."""
+
+    def test_attachments_not_mapped_for_mkv(self):
+        """A single source attachment with a missing mimetype tag crashes
+        ffmpeg's matroska muxer with 'Could not write header' (observed
+        on iNCEPTiON-grouped Indiana Jones 4 source). We accept losing
+        embedded fonts to avoid the fail-the-whole-encode behavior."""
+        from optimizer.encoder import build_stream_map_args
+        from tests._fixtures import aud, make_probe
+
+        probe = make_probe(audio=[aud(0, "dts", "eng", 6, default=True)])
+        args = build_stream_map_args(probe, ["en", "und"], "mkv")
+        # No `-map 0:t?` and no `-c:t copy` should appear:
+        self.assertNotIn("0:t?", args)
+        self.assertNotIn("-c:t", args)
+
+
 if __name__ == "__main__":
     unittest.main()

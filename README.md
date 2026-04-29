@@ -33,7 +33,12 @@ scan PATH    →    plan    →    apply  (or hd-archive / uhd-archive preset)
 4. **`status`** — show recent runs and pending decisions.
 5. **`list-encoders`** — pre-flight check: which ffmpeg encoders are compiled
    in, what gets picked per target with `--hwaccel auto`, VAAPI device status.
-6. **`hd-archive` / `uhd-archive`** — opinionated convenience wrappers around
+6. **`replace-list`** — show files that have hit the av1_qsv encoder
+   watchdog 2+ times. These are deterministic encoder hangs on specific
+   bitstream patterns (typically certain H.264 GOP structures); the
+   pipeline auto-skips them on subsequent `plan` runs. The list is the
+   operator's signal to grab a different release of the title.
+7. **`hd-archive` / `uhd-archive`** — opinionated convenience wrappers around
    `apply` with sensible defaults baked in for the two most common library
    shapes. See [Presets](#presets) below.
 
