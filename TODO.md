@@ -115,14 +115,13 @@ why.
 
 ## Tooling
 
-- [ ] **`archive-uhd.sh` companion to `archive-hd.sh`**, OR
-      generalise the existing script to take a `--preset hd|uhd`
-      flag. Right now `archive-hd.sh` is hardcoded to the `hd-archive`
-      preset; running the same workflow against the UHD library
-      requires editing the script in place. Two-line generalisation:
-      add `--preset NAME` defaulting to `hd`, swap `hd-archive` for
-      `${PRESET}-archive` in the apply args. Update the script's help
-      text to mention both.
+- [x] **`archive-uhd.sh` companion to `archive-hd.sh`** — landed
+      in v0.5.14 by consolidating into a single `archive.sh` with a
+      `--preset hd|uhd` flag (default `hd` for backwards-compat
+      ergonomics). Old `archive-hd.sh` removed. Default `SCAN_PATH`
+      widened to `/mnt/nas/media` so the same script can drive both
+      libraries; resolution gate in each preset filters out the other
+      band.
 
 - [ ] **Sonarr/Radarr import hook**: per-file re-encode triggered on
       Arr import. Once the backlog is encoded, the steady-state goal

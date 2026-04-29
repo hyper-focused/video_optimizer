@@ -336,10 +336,11 @@ With `--reencode-tag` added, each gets `.REENCODE` appended:
     --hwaccel auto
 ```
 
-For unattended NAS runs there's `archive-hd.sh` at the repo root —
+For unattended NAS runs there's `archive.sh` at the repo root —
 opinionated driver that walks scan → plan → confirm → apply with the
-defaults above pre-filled, plus `--limit N`, `--dry-run`, `--yes` flags
-for cron / nohup.
+defaults above pre-filled. Pick the band with `--preset hd|uhd`
+(default `hd`); also takes `--limit N`, `--dry-run`, `--yes`,
+`--skip-scan`, `--path DIR` for cron / nohup.
 
 Then in Radarr/Sonarr, add a Custom Format with a regex match on
 `\bREENCODE\b` and either:
@@ -370,7 +371,7 @@ video_optimizer/
 ├── README.md
 ├── CLAUDE.md                 # repo-orientation notes for AI coding agents
 ├── TODO.md                   # actionable backlog (separate from "Known limitations")
-├── archive-hd.sh             # turnkey driver script for NAS-archive runs
+├── archive.sh                # turnkey driver script for NAS-archive runs (--preset hd|uhd)
 ├── version.py
 ├── video_optimizer.py        # entrypoint shim
 ├── optimizer/

@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# archive-hd.sh — drive video_optimizer through scan/plan/apply for HD TV.
+# archive.sh — drive video_optimizer through scan/plan/apply for a preset.
 #
-# Encodes the top-N HD candidates under SCAN_PATH using the hd-archive
-# preset, leaves new files in their original directories (mode=replace),
-# and atomically moves originals into the NAS recycle bin preserving
-# source hierarchy.
+# Encodes the top-N candidates under SCAN_PATH using the selected preset
+# (hd-archive or uhd-archive), leaves new files in their original
+# directories (mode=replace), and atomically moves originals into the
+# NAS recycle bin preserving source hierarchy.
 #
-# Usage:  ./archive-hd.sh [--limit N] [--path DIR] [--dry-run]
-#                         [--skip-scan] [--yes]
+# Usage:  ./archive.sh [--preset hd|uhd] [--limit N] [--path DIR]
+#                      [--dry-run] [--skip-scan] [--yes]
 
 set -euo pipefail
 
 # --- Defaults (edit here for site-specific paths) ---------------------------
-SCAN_PATH="/mnt/nas/media/TV"
+SCAN_PATH="/mnt/nas/media"
 SOURCE_ROOT="/mnt/nas/media"
 RECYCLE_TO="/mnt/nas/media/@Recycle"
 LIMIT=50
 TARGET="av1+mkv"
+PRESET="hd"
 
 # --- CLI overrides ----------------------------------------------------------
 DRY_RUN=0
@@ -24,18 +25,25 @@ SKIP_SCAN=0
 YES=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --preset)    PRESET="$2";      shift 2 ;;
         --limit)     LIMIT="$2";       shift 2 ;;
         --path)      SCAN_PATH="$2";   shift 2 ;;
         --dry-run)   DRY_RUN=1;        shift ;;
         --skip-scan) SKIP_SCAN=1;      shift ;;
         --yes|-y)    YES=1;            shift ;;
         -h|--help)
-            sed -n '2,9p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,10p' "$0" | sed 's/^# //; s/^#//'
             exit 0
             ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+case "$PRESET" in
+    hd|uhd) ;;
+    *) echo "error: --preset must be 'hd' or 'uhd' (got: $PRESET)" >&2; exit 2 ;;
+esac
+PRESET_CMD="${PRESET}-archive"
 
 # --- Pre-flight -------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -48,7 +56,8 @@ command -v ffmpeg  >/dev/null || { echo "error: ffmpeg not in PATH" >&2; exit 1;
 command -v ffprobe >/dev/null || { echo "error: ffprobe not in PATH" >&2; exit 1; }
 
 cat <<EOF
-==> archive-hd.sh
+==> archive.sh
+    preset:        $PRESET_CMD
     scan path:     $SCAN_PATH
     source root:   $SOURCE_ROOT
     recycle to:    $RECYCLE_TO
@@ -80,7 +89,7 @@ fi
 echo
 
 # --- [3/3] apply ------------------------------------------------------------
-echo "==> [3/3] apply: hd-archive will process the top $LIMIT pending candidates"
+echo "==> [3/3] apply: $PRESET_CMD will process the top $LIMIT pending candidates"
 echo "    new files written alongside originals (mode=replace, codec rewrite ON)"
 echo "    originals moved to: $RECYCLE_TO/<rel-path-from-source-root>"
 (( DRY_RUN )) && echo "    DRY RUN — ffmpeg invocations printed, no encodes"
@@ -94,7 +103,7 @@ if (( ! YES )); then
 fi
 
 APPLY_ARGS=(
-    hd-archive
+    "$PRESET_CMD"
     --auto
     --mode replace
     --source-root "$SOURCE_ROOT"
