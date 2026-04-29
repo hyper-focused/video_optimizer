@@ -67,6 +67,35 @@ why.
 
 ## Encoding
 
+- [ ] **Investigate AVC-remux multi-language stall pattern**. The
+      two-strikes list shows a strong correlation between av1_qsv
+      stalls and a specific source shape: AVC (H.264) Blu-ray remuxes
+      with 4–7 parallel language audio tracks. As of v0.5.14 the
+      8-title two-strikes list is dominated by `BEN.THE.MEN` releases
+      (Indiana Jones: Dial of Destiny, Last Crusade; Star Wars
+      Episodes I, II, IV) and the Mission: Impossible AVC-remux
+      cluster (III, Fallout, Rogue Nation). All 1080p AVC, all
+      multi-lang, all stall on av1_qsv either at frame 0 or partway
+      through. Successful encodes in the same batches are typically
+      single-language or HEVC sources.
+
+      Hypothesis: the decode side (qsv-accelerated H.264 decoder
+      consuming a stream interleaved across many audio mappings) is
+      what wedges, not the AV1 encoder itself. Worth checking by:
+        1. Re-running one stalled title with `--hwaccel none` (sw
+           decode → hw encode) — if it completes, the QSV decoder
+           is the culprit.
+        2. Re-running with all but one audio track stripped — if it
+           completes, the demuxer / mapping interaction is implicated.
+        3. Checking ffmpeg `-loglevel debug` for the last decoded
+           PTS before the stall.
+
+      Not blocking — the watchdog + two-strikes auto-skip already
+      contains the damage. But identifying the root cause might
+      yield a workaround (e.g. force sw decode for AVC sources with
+      >3 audio streams, or a probe-time flag that routes them to a
+      different encoder path).
+
 - [ ] **Drop `-look_ahead 1` from `_qsv_args`** (low priority,
       cosmetic). Every encode produces this warning:
       `Codec AVOption look_ahead (Use VBR algorithm with look ahead)
