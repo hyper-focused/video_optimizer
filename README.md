@@ -81,7 +81,7 @@ preset hard-codes.
 
 | Preset | Target | Quality (AV1 CQ) | Size target | Resolution gate | HW decode | Filename rewrite | REENCODE tag | Audio kept |
 |--------|--------|------------------|-------------|-----------------|-----------|------------------|--------------|-----------|
-| `hd-archive` | `av1+mkv` | 22 | ~5 GB/hr | height < 1440 | off | yes (dotted) | yes | `en,und` |
+| `hd-archive` | `av1+mkv` | 21 | ~5 GB/hr | height < 1440 | off | yes (dotted) | yes | `en,und` |
 | `uhd-archive` | `av1+mkv` | 15 | ~12 GB/hr | height ≥ 1440 | off | yes (dotted) | yes | `en,und` |
 
 Both run `av1_qsv -preset veryslow` with the archive-tuned QSV flag set
