@@ -23,6 +23,7 @@ def make_probe(
     color_transfer: str | None = None,
     color_space: str | None = None,
     video_bitrate: int = 20_000_000,
+    dv_profile: int | None = None,
 ) -> ProbeResult:
     """Construct a synthetic ProbeResult.
 
@@ -52,6 +53,7 @@ def make_probe(
         is_hdr=is_hdr,
         audio_tracks=audio or [],
         subtitle_tracks=subs or [],
+        dv_profile=dv_profile,
     )
 
 

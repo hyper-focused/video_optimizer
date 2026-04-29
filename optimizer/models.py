@@ -75,6 +75,13 @@ class ProbeResult:
 
     creation_time: _dt.datetime | None = None
 
+    # Dolby Vision profile, parsed from the stream's DOVI configuration
+    # record side data. None when the source is not DV. Profile 7 (BL+EL)
+    # and Profile 8 (single-layer + RPU) reliably wedge av1_qsv on this
+    # driver — plan filters DV sources out of the queue.
+    # Default keeps cache JSON written before this field round-trips.
+    dv_profile: int | None = None
+
     # ---- convenience -------------------------------------------------------
 
     @property

@@ -431,9 +431,13 @@ in `TODO.md` instead.
 - **`apply` runs sequentially** — one ffmpeg at a time. See `TODO.md` for
   the parallel-apply roadmap; encode itself is GPU-bound on Battlemage at
   preset veryslow, so the win comes from concurrency on multi-engine GPUs.
-- **Dolby Vision metadata is not preserved** — DV-on-HDR10 sources are
-  transcoded as HDR10 (the base layer); DV-only sources will lose DV.
-  HDR10 metadata (mastering display + MaxCLL) *is* preserved end-to-end
-  via libavcodec → av1_qsv → matroska muxer.
+- **Dolby Vision sources are skipped at plan time** — `av1_qsv` reliably
+  wedges on DV-tagged HEVC streams (Profile 7 stalls at frame 0;
+  Profile 8 stalls partway in), so `plan` drops any source where the
+  ffprobe `DOVI configuration record` side-data is present. The skip
+  shows up in the plan summary as `dv_blocked: N`. HDR10 metadata
+  (mastering display + MaxCLL) *is* preserved end-to-end via
+  libavcodec → av1_qsv → matroska muxer for non-DV HDR sources. See
+  `TODO.md` ("DV-aware encode path") for the planned permanent fix.
 - **Some hardware encoders may not preserve display rotation metadata**
   from phone-recorded sources (notably `av1_qsv`).

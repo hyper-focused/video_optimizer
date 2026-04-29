@@ -50,6 +50,8 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     )
     r.add_argument("path", type=Path)
     r.add_argument("--no-recursive", action="store_true")
+    r.add_argument("--workers", type=int, default=None,
+                   help="Parallel ffprobe workers (default: min(8, CPU count)).")
     r.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(r)
 
@@ -398,6 +400,35 @@ def cmd_reprobe(args: argparse.Namespace) -> int:
     return cmd_scan(args, force=True)
 
 
+def _plan_probe_gate(db: Database, pr) -> str:
+    """Pre-rule filter for one probe.
+
+    Returns one of:
+      "missing" — source no longer on disk; cache rows dropped here.
+      "stalled" — two-strikes auto-skip (av1_qsv watchdog twice).
+      "dv"      — Dolby Vision source; av1_qsv wedges on DV (Profile 7
+                  stalls at frame 0; Profile 8 partway in). Awaiting a
+                  DV-aware encode path (RPU strip / BL extraction).
+      "ok"      — admit to rule evaluation.
+    """
+    if not Path(pr.path).exists():
+        # Decisions FK back to files with default RESTRICT; delete
+        # dependent decisions first or the files DELETE fails.
+        db.conn.execute("DELETE FROM decisions WHERE path = ?", (pr.path,))
+        db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
+        return "missing"
+    stall_count = db.conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE path = ? "
+        "AND status = 'failed' AND error LIKE '%encoder stalled%'",
+        (pr.path,),
+    ).fetchone()[0]
+    if stall_count >= 2:
+        return "stalled"
+    if pr.dv_profile is not None:
+        return "dv"
+    return "ok"
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Run the rules engine over the probe cache; record pending decisions."""
     enabled = [s.strip() for s in args.rules.split(",")] if args.rules else None
@@ -411,41 +442,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
+        counts = {"missing": 0, "stalled": 0, "dv": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
-        pruned = 0
-        stall_blocked = 0
         for pr in list(db.iter_probes()):
-            if not Path(pr.path).exists():
-                # Source moved (recycle-to) or deleted out-of-band since
-                # the last scan. Drop the cache row so we stop queueing
-                # files that won't open at apply time. A subsequent scan
-                # of the new location will re-populate as needed.
-                #
-                # Decisions reference files via FK with default RESTRICT;
-                # delete dependent decisions first or the DELETE fails
-                # with sqlite3.IntegrityError. Audit history for
-                # already-recycled files is acceptable to lose — the
-                # source is gone, the record has nothing to anchor to.
-                db.conn.execute("DELETE FROM decisions WHERE path = ?", (pr.path,))
-                db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
-                pruned += 1
-                continue
-            # Two-strikes rule for av1_qsv encoder stalls: once a source
-            # has hit the watchdog twice with the same `encoder stalled`
-            # reason, it's deterministically broken on this driver.
-            # Re-queueing a third time just burns another 5 minutes per
-            # run for the same predictable failure. Files that hit this
-            # case live in `replace-list` — operator's signal to grab a
-            # different release of the same title.
-            stall_count = db.conn.execute(
-                "SELECT COUNT(*) FROM decisions "
-                "WHERE path = ? AND status = 'failed' "
-                "AND error LIKE '%encoder stalled%'",
-                (pr.path,),
-            ).fetchone()[0]
-            if stall_count >= 2:
-                stall_blocked += 1
+            verdict = _plan_probe_gate(db, pr)
+            if verdict != "ok":
+                counts[verdict] += 1
                 continue
             cand = engine.evaluate(pr)
             if cand is None:
@@ -457,12 +460,18 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 projected_savings_mb=cand.total_projected_savings_mb,
             )
             candidates.append(cand)
+        pruned = counts["missing"]
+        stall_blocked = counts["stalled"]
+        dv_blocked = counts["dv"]
         if pruned:
             db.conn.commit()
             print(f"pruned {pruned} stale cache rows (source moved or deleted)")
         if stall_blocked:
             print(f"skipped {stall_blocked} files with 2+ stall failures "
                   f"(see `./video_optimizer.py replace-list` for the list)")
+        if dv_blocked:
+            print(f"skipped {dv_blocked} Dolby Vision sources "
+                  f"(av1_qsv stalls on DV; awaiting DV-aware encode path)")
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -473,7 +482,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
         summary = {"cleared_pending": cleared,
                    "candidates": len(candidates),
-                   "pruned_stale_rows": pruned}
+                   "pruned_stale_rows": pruned,
+                   "stall_blocked": stall_blocked,
+                   "dv_blocked": dv_blocked}
         db.end_run(run_id, summary)
     return 0
 

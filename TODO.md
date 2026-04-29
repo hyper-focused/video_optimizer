@@ -96,6 +96,48 @@ why.
       >3 audio streams, or a probe-time flag that routes them to a
       different encoder path).
 
+- [ ] **DV-aware encode path for av1_qsv** (replaces the v0.5.15
+      plan-time skip). v0.5.15 detects `dv_profile` from the ffprobe
+      `DOVI configuration record` side-data and drops every DV source
+      from the queue, because av1_qsv consistently wedges on them:
+      Profile 7 (BL+EL, dual-layer) stalls at frame 0; Profile 8
+      (single-layer + RPU) makes initial progress and stalls partway
+      in. Confirmed against five titles in the run-3 / run-6 archive
+      logs (LOTR x265-NAHOM trilogy → P7, The Housemaid 2025 → P7,
+      Hobbit Desolation of Smaug → P8). The skip rule keeps the queue
+      moving but means DV sources are never re-encoded — a permanent
+      gap until this work lands.
+
+      Two viable paths, both worth prototyping on a single P7 title
+      first to confirm the encoder accepts the modified bitstream:
+
+      1. **Bitstream-filter strip** — prepend `-bsf:v
+         'filter_units=remove_types=62'` (Dolby Vision EL NAL type for
+         HEVC) before `-c:v av1_qsv`. Cheapest fix if the QSV pipeline
+         is happy with a BL-only HEVC frame stream. P7 → strip EL +
+         RPU; P8 → strip RPU only. Risk: the BL alone may still carry
+         RPU-side-data references that confuse the encoder.
+
+      2. **External `dovi_tool` pre-pass** — `ffmpeg -i src -c copy -bsf
+         hevc_mp4toannexb -f hevc - | dovi_tool remove --rpu-out /dev/null
+         - -o bl.hevc`, then re-mux + encode bl.hevc. Canonical fix for
+         Profile 7 but adds an external dependency (`dovi_tool` from
+         GitHub releases, not in apt). Also doubles the I/O — read
+         source twice on every encode.
+
+      Whichever path lands: keep the plan-time skip behind a flag
+      (`--allow-dv` opt-in) so users on machines without the workaround
+      don't get the stall pattern back. Update `replace-list` to also
+      surface DV sources (alongside two-strikes failures). Worth
+      probing whether `hevc_vaapi` or libsvtav1 handles DV cleanly —
+      if so, route DV sources to a software fallback rather than
+      av1_qsv.
+
+      Outstanding research: capture an `ffmpeg -loglevel debug`
+      transcript of one stalled DV encode to identify exactly which
+      NAL/RPU sequence wedges the av1_qsv intake. Without that, we're
+      guessing about which NAL types to strip.
+
 - [ ] **Drop `-look_ahead 1` from `_qsv_args`** (low priority,
       cosmetic). Every encode produces this warning:
       `Codec AVOption look_ahead (Use VBR algorithm with look ahead)

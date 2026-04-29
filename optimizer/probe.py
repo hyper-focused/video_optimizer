@@ -47,6 +47,23 @@ def _bit_depth_from_pix_fmt(pix_fmt: str) -> int:
     return 8
 
 
+def _dv_profile(video_stream: dict) -> int | None:
+    """Return Dolby Vision profile from side_data_list, or None.
+
+    Default ffprobe -show_streams JSON includes a "DOVI configuration record"
+    side-data entry on DV-tagged HEVC streams; its dv_profile field is the
+    canonical 5/7/8/etc. profile number. None means the source is not DV.
+    """
+    for sd in video_stream.get("side_data_list") or ():
+        if sd.get("side_data_type") == "DOVI configuration record":
+            v = sd.get("dv_profile")
+            try:
+                return int(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
 def _is_hdr(color_transfer: str | None,
             color_primaries: str | None,
             color_space: str | None,
@@ -249,4 +266,5 @@ def probe_file(path: Path) -> ProbeResult:
         audio_tracks=audio_tracks,
         subtitle_tracks=subtitle_tracks,
         creation_time=_parse_creation_time(fmt.get("tags")),
+        dv_profile=_dv_profile(video_stream),
     )
