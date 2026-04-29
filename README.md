@@ -97,19 +97,45 @@ the cap-and-floor pair acts as a hard ceiling instead of a peak buffer
 and produces dramatically smaller files than CQ alone. 10-bit sources are
 pinned to `-pix_fmt p010le` so they don't silently downconvert through
 QSV's default pipeline; 8-bit sources are left to the encoder default.
-Decode pipeline is preset-dependent: `hd-archive` defaults to CPU decode →
-QSV encode (1080p HEVC decodes at 20–30× realtime on a modern CPU, so
-the encode is the only real bottleneck and CPU decode keeps the HDR
-side-data path simple). `uhd-archive` defaults to QSV decode → QSV
-encode (`-hwaccel qsv -hwaccel_output_format qsv`) since v0.5.16: at
-2160p the SW HEVC decoder takes 4–6 cores on high-bitrate sources and
-starts competing with audio re-encode + I/O for headroom, observed as
-fps decay during long batches. The hardware-decode path needs the
-v0.5.15 DV skip filter in place to be reliable — the QSV HEVC decoder
-wedges on Dolby Vision streams. Override per run with `--no-hw-decode`
-(or `--hw-decode` to force on for `hd-archive`). Source color metadata
-(BT.709 vs BT.2020/PQ) is passed through to the output rather than
-forced.
+**Decode pipeline is preset-dependent and the asymmetry is measured, not
+historical.**
+
+`uhd-archive` defaults to QSV decode → QSV encode
+(`-hwaccel qsv -hwaccel_output_format qsv`) since v0.5.16. At 2160p
+the SW HEVC decoder takes 4–6 cores on high-bitrate sources (50–80
+Mbps Blu-ray remuxes) and competes with libopus 5.1 + AAC 2.0
+re-encode for cores; the encoder asic ends up decode-starved, observed
+as fps decay during long batches. Routing decode to the asic frees the
+CPU and runs the encoder at its actual ceiling — measured ~50%
+wall-clock improvement on representative UHD HDR sources.
+
+`hd-archive` defaults to CPU decode → QSV encode and **flipping it to
+HW decode actively slows the workload down**. Three reasons:
+
+1. **Media-engine contention** — QSV decode and QSV encode share the
+   same fixed-function blocks. With both running on the asic, each
+   frame the decoder produces makes the encoder wait its turn (and
+   vice versa). SW decode runs on a separate substrate, so the
+   encoder asic gets uninterrupted throughput.
+2. **Surface-pipeline negotiation cost** — the qsv-surface path sets
+   up a frame pool, negotiates formats, and synchronizes between
+   decode and encode contexts. For a workload where the actual decode
+   work is tiny (1080p H.264 SW-decodes at ~1500 fps single-threaded
+   on a modern CPU, ≥60× the rate the encoder consumes frames), that
+   setup cost is a meaningful fraction of per-frame time.
+3. **Asic latency vs throughput** — GPU decoders are tuned for
+   sustained throughput, not single-frame latency. SW decode finishes
+   each frame faster end-to-end when the work comfortably fits on
+   1–2 cores.
+
+So the lesson generalises: HW decode is worth it only when SW decode
+is *competing* with the encoder for cores. When SW decode has plenty
+of headroom (HD H.264, single-engine GPU, no parallel apply), it's
+the faster path. The hardware-decode path also needs the v0.5.15 DV
+skip filter in place to be reliable — the QSV HEVC decoder wedges on
+Dolby Vision streams. Override per run with `--no-hw-decode` /
+`--hw-decode`. Source color metadata (BT.709 vs BT.2020/PQ) is passed
+through to the output rather than forced.
 
 **Resolution gate:** when pointing a preset at a mixed-resolution library,
 the gate skips files outside the preset's resolution band and **leaves them
