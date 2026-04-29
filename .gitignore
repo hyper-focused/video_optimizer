@@ -33,3 +33,4 @@ archive-*.log
 clear.py
 cleanup.py
 fix_*.py
+audit_*.py

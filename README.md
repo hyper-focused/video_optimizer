@@ -24,7 +24,9 @@ scan PATH    →    plan    →    apply  (or hd-archive / uhd-archive preset)
 
 1. **`scan PATH`** — recursively walk a directory, probe every video file with
    `ffprobe`, store the result in the SQLite cache. Re-running is cheap: files
-   whose size+mtime match a cached row are skipped.
+   whose size+mtime match a cached row are skipped. Probe runs in parallel
+   (`--workers N`, default `min(8, cpu_count())`); cap at 8 on Synology / QNAP
+   NFS exports that throttle concurrent reads.
 2. **`plan`** — run the rules engine over the probe cache, list candidates
    with reasons and projected savings, and record pending decisions.
 3. **`apply`** — encode pending decisions. Per-file confirmation by default;

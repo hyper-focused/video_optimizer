@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -31,6 +33,11 @@ def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
                    help="Do not descend into subdirectories.")
     s.add_argument("--no-probe-cache", action="store_true",
                    help="Re-probe even if a cached entry matches size+mtime.")
+    s.add_argument("--workers", type=int, default=None,
+                   help="Parallel ffprobe workers for uncached files. "
+                        "Default: min(8, CPU count). Use 1 for sequential. "
+                        "ffprobe is I/O-bound, so workers >> NFS server's "
+                        "concurrent-read ceiling don't help.")
     s.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(s)
 
@@ -292,48 +299,94 @@ def _build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------- #
 
 
+def _probe_one_safe(fp: Path) -> tuple[str, Path, object]:
+    """Worker wrapper around probe.probe_file that won't raise.
+
+    Returns ('ok', fp, ProbeResult) on success, ('err', fp, exception)
+    otherwise. The caller (main thread) does the SQLite write — workers
+    must not touch the db.
+    """
+    try:
+        return ("ok", fp, probe.probe_file(fp))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, ValueError, OSError) as e:
+        return ("err", fp, e)
+
+
+def _scan_walk_phase(args: argparse.Namespace, db: Database, force: bool,
+                     ) -> tuple[int, int, int, list[Path]]:
+    """Tree walk + cache filter. Returns (seen, cached, errors, uncached)."""
+    seen = cached = errors = 0
+    uncached: list[Path] = []
+    for fp in crawler.crawl(args.path, recursive=not args.no_recursive):
+        seen += 1
+        try:
+            st = fp.stat()
+        except OSError as e:
+            print(f"skip {fp}: {e}", file=sys.stderr)
+            errors += 1
+            continue
+        use_cache = not (force or args.no_probe_cache)
+        if use_cache and db.get_cached_probe(str(fp), st.st_size, st.st_mtime):
+            cached += 1
+            if args.verbose:
+                print(f"cache  {fp}")
+            continue
+        uncached.append(fp)
+    return seen, cached, errors, uncached
+
+
+def _scan_probe_phase(args: argparse.Namespace, db: Database,
+                      uncached: list[Path], workers: int) -> tuple[int, int]:
+    """Parallel ffprobe of the uncached set. Returns (probed, errors).
+
+    SQLite writes stay on the main thread (single-writer). Workers
+    return results; this loop applies them in completion order.
+    """
+    if not uncached:
+        return 0, 0
+    if workers > 1:
+        print(f"probing {len(uncached)} new file(s) with {workers} workers...")
+    probed = errors = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_probe_one_safe, fp) for fp in uncached]
+        for fut in concurrent.futures.as_completed(futures):
+            kind, fp, res = fut.result()
+            if kind == "err":
+                print(f"probe failed: {fp}: {res}", file=sys.stderr)
+                errors += 1
+                continue
+            db.upsert_probe(res)
+            probed += 1
+            if args.verbose:
+                print(f"probe  {fp}  ({res.video_codec} "
+                      f"{res.width}x{res.height} "
+                      f"{res.video_bitrate / 1_000_000:.1f} Mbps)")
+    return probed, errors
+
+
 def cmd_scan(args: argparse.Namespace, force: bool = False) -> int:
-    """Crawl args.path, probe each video, upsert into the SQLite cache."""
+    """Crawl args.path, probe each video, upsert into the SQLite cache.
+
+    The probe step is parallelised across `--workers` threads because
+    ffprobe is I/O-bound (subprocess fork + NFS read). Cache hits stay
+    on the main thread (no upside to threading a sqlite point lookup).
+    SQLite writes also stay on the main thread — workers return
+    ProbeResult, the main loop calls upsert_probe.
+    """
     if not args.path.exists():
         print(f"error: path not found: {args.path}", file=sys.stderr)
         return 2
-
+    workers = args.workers if args.workers is not None else min(8, os.cpu_count() or 4)
+    workers = max(1, workers)
     with Database(args.db) as db:
         run_id = db.start_run("scan", str(args.path), _args_dict(args))
-        seen = probed = cached = errors = 0
-
-        for fp in crawler.crawl(args.path, recursive=not args.no_recursive):
-            seen += 1
-            try:
-                st = fp.stat()
-            except OSError as e:
-                print(f"skip {fp}: {e}", file=sys.stderr)
-                errors += 1
-                continue
-
-            use_cache = not (force or args.no_probe_cache)
-            if use_cache and db.get_cached_probe(str(fp), st.st_size, st.st_mtime):
-                cached += 1
-                if args.verbose:
-                    print(f"cache  {fp}")
-                continue
-
-            try:
-                pr = probe.probe_file(fp)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                    json.JSONDecodeError, ValueError, OSError) as e:
-                print(f"probe failed: {fp}: {e}", file=sys.stderr)
-                errors += 1
-                continue
-
-            db.upsert_probe(pr)
-            probed += 1
-            if args.verbose:
-                print(f"probe  {fp}  ({pr.video_codec} {pr.width}x{pr.height} "
-                      f"{pr.video_bitrate / 1_000_000:.1f} Mbps)")
-
+        seen, cached, walk_errors, uncached = _scan_walk_phase(args, db, force)
+        probed, probe_errors = _scan_probe_phase(args, db, uncached, workers)
+        errors = walk_errors + probe_errors
         summary = {"seen": seen, "probed": probed,
-                   "cache_hits": cached, "errors": errors}
+                   "cache_hits": cached, "errors": errors,
+                   "workers": workers}
         db.end_run(run_id, summary)
         print(f"scan done: {seen} files seen, {probed} probed, "
               f"{cached} cached, {errors} errors")
