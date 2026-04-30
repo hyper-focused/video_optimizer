@@ -784,6 +784,7 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
 
 
 _OUT_TIME_RE = re.compile(r"^out_time_ms=(\d+)$")
+_FRAME_RE = re.compile(r"^frame=\s*(\d+)$")
 _FPS_RE = re.compile(r"^fps=\s*([\d.]+)$")
 _SPEED_RE = re.compile(r"^speed=\s*([\d.]+)x$")
 _PROGRESS_RE = re.compile(r"^progress=(\w+)$")
@@ -794,6 +795,7 @@ class _ProgressState:
     """Live state pulled from ffmpeg's -progress feed during one encode."""
 
     current_seconds: float = 0.0   # encoded position in source timeline
+    frames: int = 0                # decoder-side frame count (liveness signal)
     fps: float = 0.0               # frames/second the encoder is running at
     speed: float = 0.0             # speed multiplier vs realtime (e.g. 1.8x)
 
@@ -823,6 +825,13 @@ def _parse_progress_line(line: str, state: _ProgressState,
     m = _OUT_TIME_RE.match(line)
     if m:
         state.current_seconds = int(m.group(1)) / 1_000_000.0
+        return state
+    m = _FRAME_RE.match(line)
+    if m:
+        try:
+            state.frames = int(m.group(1))
+        except ValueError:
+            pass
         return state
     m = _FPS_RE.match(line)
     if m:
@@ -860,6 +869,8 @@ def _render_progress(state: _ProgressState, duration_seconds: float, *,
     if is_tty:
         line = (f"\r{label}{_format_bar(frac)} {frac * 100:5.1f}%  "
                 f"{state.current_seconds:7.1f}s/{duration_seconds:7.1f}s")
+        if state.frames > 0 and state.current_seconds == 0:
+            line += f"  f={state.frames}"
         if state.fps > 0:
             line += f"  {state.fps:5.1f}fps"
         if state.speed > 0:
@@ -872,6 +883,8 @@ def _render_progress(state: _ProgressState, duration_seconds: float, *,
     else:
         parts = [f"{label}{frac * 100:5.1f}% "
                  f"{state.current_seconds:.0f}/{duration_seconds:.0f}s"]
+        if state.frames > 0 and state.current_seconds == 0:
+            parts.append(f"f={state.frames}")
         if state.fps > 0:
             parts.append(f"{state.fps:.1f}fps")
         if state.speed > 0:
@@ -903,22 +916,28 @@ def _stream_progress_until_done(proc: subprocess.Popen,
     # at a few thousand lines per multi-hour encode rather than 7,200/hour.
     render_interval = 0.5 if is_tty else 30.0
     last_render = 0.0
-    # Stall detection: if `out_time` (encoded position) doesn't advance
-    # for `stall_seconds` of wall-clock, the encoder is hung. Catches
-    # av1_qsv stalls on certain sources where the pipeline reads frames
-    # but never produces output — observed on a Guardians of the Galaxy
-    # 2014 1080p remux that consumed 4+ hours at 0.0% before manual
-    # interrupt. The wall-clock timeout (6× duration) is too generous
-    # to catch these.
-    last_progress_seconds = 0.0
+    # Stall detection: if neither the encoded position (`out_time_ms`) nor
+    # the decoder-side frame count (`frame=`) advances for `stall_seconds`
+    # of wall-clock, the pipeline is genuinely hung. Both signals are
+    # required because av1_qsv with deep lookahead (depth=100, refs=5)
+    # buffers ~150 frames before any presentation timestamp surfaces to
+    # the muxer, so `out_time_ms` can stay at 0 for several minutes on a
+    # working encode (Avengers: Infinity War 2160p remux pinned this
+    # against the v0.5.17 5-min watchdog while writing 441s of clean AV1
+    # to disk). `frame=` advances on every decoded frame, so a real stall
+    # — input queue starvation, hardware deadlock — flatlines both.
+    last_out_seconds = 0.0
+    last_frames = 0
     stall_anchor_wall = start
     state = _ProgressState()
     assert proc.stdout is not None
     for line in proc.stdout:
         state = _parse_progress_line(line.strip(), state, duration_seconds)
         now = time.monotonic()
-        if state.current_seconds > last_progress_seconds:
-            last_progress_seconds = state.current_seconds
+        if (state.current_seconds > last_out_seconds
+                or state.frames > last_frames):
+            last_out_seconds = state.current_seconds
+            last_frames = state.frames
             stall_anchor_wall = now
         if now - last_render >= render_interval:
             _render_progress(state, duration_seconds,
@@ -926,8 +945,8 @@ def _stream_progress_until_done(proc: subprocess.Popen,
             last_render = now
         if now - stall_anchor_wall > stall_seconds:
             return True, (f"encoder stalled — no progress for "
-                          f"{stall_seconds}s (out_time stuck at "
-                          f"{last_progress_seconds:.0f}s)")
+                          f"{stall_seconds}s (out_time={last_out_seconds:.0f}s, "
+                          f"frame={last_frames})")
         if timeout_active and now - start > timeout_seconds:
             return True, f"timeout after {timeout_seconds}s"
     return False, ""
