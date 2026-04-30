@@ -464,6 +464,74 @@ def _subtitle_map_args(probe: ProbeResult, langs: set[str],
     return args
 
 
+def _kept_audio_indices(probe: ProbeResult, langs: set[str],
+                        *, add_compat: bool = True) -> set[int]:
+    """Source audio indices that survive into the output ladder.
+
+    All synth tiers (Opus 5.1, AAC 2.0) read from the s0 source, so the
+    kept set is a strict subset of {ladder.src_idx}. Used by the discard
+    pre-strip to tell the demuxer which audio streams it can drop before
+    they enter the per-stream packet queues.
+    """
+    if not probe.audio_tracks:
+        return set()
+    eligible = _eligible_tracks(probe, langs)
+    if not eligible:
+        return set()
+    if not add_compat:
+        s0_idx, _ = max(eligible, key=lambda it: _track_quality_key(it[1]))
+        return {s0_idx}
+    ladder = _build_audio_ladder(probe, langs)
+    return {src_idx for _, src_idx, _ in ladder}
+
+
+def _kept_subtitle_indices(probe: ProbeResult, langs: set[str],
+                           target_container: str) -> set[int]:
+    """Source subtitle indices that survive into the output (mirrors the
+    filter inside `_subtitle_map_args` so we can pre-strip the rest)."""
+    kept: set[int] = set()
+    for i, s in enumerate(probe.subtitle_tracks):
+        lang = (s.language or "").lower()
+        if lang not in langs:
+            continue
+        if target_container == "mp4" and s.codec in _IMAGE_SUB_CODECS:
+            continue
+        kept.add(i)
+    return kept
+
+
+def _input_discard_args(probe: ProbeResult, keep_langs: list[str],
+                        target_container: str,
+                        *, add_compat_audio: bool = True) -> list[str]:
+    """Per-input `-discard:<spec> all` flags for streams we won't use.
+
+    Why: ffmpeg's demuxer interleaves packets for every active stream by
+    container timestamp before any decoder sees them. On sources with
+    many parallel audio tracks (8+ language dubs is common on Blu-ray
+    remuxes), the QSV video decoder's input queue can starve through the
+    narrow windows between audio packets and deadlock at frame 0 — the
+    classic multi-language stall pattern. CPU decode survives on more
+    headroom but isn't immune (the older AVC-multilang stall list also
+    pre-dates hw_decode). `-discard:<spec> all` is applied at demux time,
+    so dropped streams never enter the packet queue and never compete
+    for scheduler attention. Must precede `-i`.
+
+    Discard preserves source-side indexing — `-map 0:a:1?` still resolves
+    to the original audio stream 1 even when audio stream 0 is discarded.
+    """
+    langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
+    kept_a = _kept_audio_indices(probe, langs, add_compat=add_compat_audio)
+    kept_s = _kept_subtitle_indices(probe, langs, target_container)
+    args: list[str] = []
+    for i in range(len(probe.audio_tracks)):
+        if i not in kept_a:
+            args += [f"-discard:a:{i}", "all"]
+    for i in range(len(probe.subtitle_tracks)):
+        if i not in kept_s:
+            args += [f"-discard:s:{i}", "all"]
+    return args
+
+
 def build_stream_map_args(probe: ProbeResult, keep_langs: list[str],
                           target_container: str,
                           *, add_compat_audio: bool = True) -> list[str]:
@@ -644,8 +712,10 @@ def build_remux_command(probe: ProbeResult, output_path: Path,
                         target_container: str, keep_langs: list[str],
                         *, add_compat_audio: bool = True) -> list[str]:
     """Return ffmpeg argv that stream-copies into target_container."""
-    cmd: list[str] = [
-        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+    cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    cmd += _input_discard_args(probe, keep_langs, target_container,
+                               add_compat_audio=add_compat_audio)
+    cmd += [
         "-i", probe.path,
         "-map_metadata", "0",
         "-map_metadata:s", "-1",
@@ -685,6 +755,8 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
         cmd += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
     if encoder.endswith("_vaapi"):
         cmd += ["-vaapi_device", _VAAPI_DEVICE]
+    cmd += _input_discard_args(probe, keep_langs, target_container,
+                               add_compat_audio=add_compat_audio)
     cmd += ["-i", probe.path,
             "-map_metadata", "0", "-map_metadata:s", "-1",
             "-map_chapters", "0"]

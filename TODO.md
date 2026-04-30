@@ -67,6 +67,36 @@ why.
 
 ## Encoding
 
+- [x] **Multi-language stall pattern (AVC + HEVC)** — landed in
+      v0.5.17 as a demuxer-side pre-strip via `_input_discard_args`.
+      Diagnosis: hypothesis (2) from the original entry was correct.
+      The wedge is upstream of the decoder choice — ffmpeg's matroska
+      demuxer interleaves packets for every active stream by container
+      timestamp, and on sources with 7+ parallel audio tracks the
+      windows between audio packets get tight enough that the QSV
+      video decoder's input queue starves and deadlocks at frame 0.
+      CPU decode survives on more headroom but isn't immune (the AVC
+      remux list — Indiana Jones, MI3, Star Wars episodes — pre-dated
+      the v0.5.16 hw_decode flip and stalled on CPU decode too).
+
+      Pinned by Avengers: Infinity War in run 16 of the v0.5.16
+      uhd-archive trial — HEVC Main10 + 8 audio tracks (TrueHD, DTS-HD
+      MA, 4× AC3/EAC3 in eng/fre/spa/jpn), stalled at frame 0 with
+      hw_decode=True. Confirmed the mechanism.
+
+      Fix: emit `-discard:a:N all` / `-discard:s:N all` for every audio
+      and subtitle stream not selected by `_build_audio_ladder` /
+      `_subtitle_map_args`. The discards apply at demux time so dropped
+      streams never enter the packet queue. Source-side indexing is
+      preserved (discard doesn't renumber), so existing `-map 0:a:N?`
+      references stay valid. Resolves both AVC and HEVC variants in
+      one shot — they were always the same root cause.
+
+      Existing two-strikes auto-skip and watchdog stay as belt-and-
+      braces. Replace-list still surfaces any future stall pattern.
+
+*Original entry retained for context:*
+
 - [ ] **Investigate AVC-remux multi-language stall pattern**. The
       two-strikes list shows a strong correlation between av1_qsv
       stalls and a specific source shape: AVC (H.264) Blu-ray remuxes

@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import unittest
 
-from optimizer.encoder import _build_audio_ladder, _expand_langs
-from tests._fixtures import aud, make_probe
+from optimizer.encoder import (
+    _build_audio_ladder,
+    _expand_langs,
+    _input_discard_args,
+)
+from tests._fixtures import aud, make_probe, sub
 
 
 class AudioLadderTests(unittest.TestCase):
@@ -147,6 +151,106 @@ class AudioLadderTests(unittest.TestCase):
             ],
             expected=[("copy", 0), ("opus51", 0), ("aac20", 0)],
         )
+
+
+class InputDiscardTests(unittest.TestCase):
+    """Pre-strip multi-language audio at demux time (v0.5.17).
+
+    Sources with many parallel audio tracks (Blu-ray remuxes carrying
+    7-8 language dubs) wedge the QSV video decoder at frame 0: the
+    demuxer's interleaving cadence starves the QSV input queue between
+    audio packets. `_input_discard_args` emits `-discard:a:N all` for
+    every audio stream we won't use, so dropped streams never enter the
+    packet queue. Pinned by the Avengers: Infinity War failure in the
+    v0.5.16 trial run.
+    """
+
+    KEEP = ["en", "und"]
+
+    def _discards(self, audio=None, subs=None, container="mkv",
+                  add_compat=True):
+        probe = make_probe(audio=audio or [], subs=subs or [])
+        return _input_discard_args(
+            probe, self.KEEP, container, add_compat_audio=add_compat,
+        )
+
+    def test_infinity_war_shape_keeps_only_chosen_audio(self):
+        """The exact source layout that failed run 16: 8 audio streams,
+        4 languages. Ladder picks TrueHD (s0=0), DD 5.1 (s1=2), DD 2.0
+        (s2=3); discards target the other 5 audio indices."""
+        discards = self._discards(audio=[
+            aud(0, "truehd", "eng", 8, title="TrueHD 7.1 Atmos", default=True),
+            aud(1, "dts",    "eng", 8, title="DTS-HD MA 7.1"),
+            aud(2, "ac3",    "eng", 6, title="DD 5.1"),
+            aud(3, "ac3",    "eng", 2, title="DD 2.0"),
+            aud(4, "ac3",    "fre", 6, title="DD 5.1 fr"),
+            aud(5, "eac3",   "spa", 8, title="DDP 7.1 es"),
+            aud(6, "eac3",   "jpn", 8, title="DDP 7.1 jp"),
+            aud(7, "ac3",    "ger", 6, title="DD 5.1 de"),
+        ])
+        self.assertIn("-discard:a:1", discards)  # DTS-HD MA dropped
+        self.assertIn("-discard:a:4", discards)  # French
+        self.assertIn("-discard:a:5", discards)  # Spanish
+        self.assertIn("-discard:a:6", discards)  # Japanese
+        self.assertIn("-discard:a:7", discards)  # German
+        self.assertNotIn("-discard:a:0", discards)  # TrueHD kept
+        self.assertNotIn("-discard:a:2", discards)  # DD 5.1 kept
+        self.assertNotIn("-discard:a:3", discards)  # DD 2.0 kept
+
+    def test_single_audio_source_emits_no_audio_discards(self):
+        """The successful UHD run-16 shape: one English FLAC 7.1. Nothing
+        to strip — no discard flags emitted, ffmpeg argv stays clean."""
+        discards = self._discards(audio=[
+            aud(0, "flac", "eng", 8, title="FLAC 7.1", default=True),
+        ])
+        self.assertEqual(
+            [d for d in discards if d.startswith("-discard:a:")], [],
+        )
+
+    def test_subtitle_pre_strip_filters_foreign_langs(self):
+        """Subtitles are sparser packet-wise but the principle is the
+        same: drop unused source streams at demux time. Mirrors the
+        keep set computed in `_subtitle_map_args`."""
+        discards = self._discards(subs=[
+            sub(0, "subrip",   "eng"),
+            sub(1, "subrip",   "fre"),
+            sub(2, "hdmv_pgs_subtitle", "eng"),  # PGS image subs survive on mkv
+            sub(3, "subrip",   "spa"),
+        ])
+        self.assertIn("-discard:s:1", discards)  # French dropped
+        self.assertIn("-discard:s:3", discards)  # Spanish dropped
+        self.assertNotIn("-discard:s:0", discards)  # English subrip kept
+        self.assertNotIn("-discard:s:2", discards)  # English PGS kept
+
+    def test_pgs_subs_are_discarded_when_targeting_mp4(self):
+        """mp4 can't carry image-format subtitles; `_subtitle_map_args`
+        already drops them from output. The discard pre-strip keeps the
+        demuxer aligned with that decision."""
+        discards = self._discards(
+            subs=[
+                sub(0, "subrip",   "eng"),
+                sub(1, "hdmv_pgs_subtitle", "eng"),
+            ],
+            container="mp4",
+        )
+        self.assertIn("-discard:s:1", discards)
+        self.assertNotIn("-discard:s:0", discards)
+
+    def test_no_compat_audio_path_keeps_only_s0(self):
+        """`--no-compat-audio` collapses the ladder to just s0; the discard
+        list expands to every other audio stream including ones the full
+        ladder would have used as native s1/s2."""
+        discards = self._discards(
+            audio=[
+                aud(0, "truehd", "eng", 8, title="TrueHD 7.1"),
+                aud(1, "ac3",    "eng", 6, title="DD 5.1"),
+                aud(2, "ac3",    "eng", 2, title="DD 2.0"),
+            ],
+            add_compat=False,
+        )
+        self.assertIn("-discard:a:1", discards)
+        self.assertIn("-discard:a:2", discards)
+        self.assertNotIn("-discard:a:0", discards)
 
 
 if __name__ == "__main__":
