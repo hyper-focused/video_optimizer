@@ -685,7 +685,8 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
     ok, err = encoder.run_ffmpeg(cmd, pr.duration_seconds,
                                  timeout_seconds=timeout,
                                  verbose=args.verbose,
-                                 label=label)
+                                 label=label,
+                                 source_fps=pr.frame_rate)
     if not ok:
         print(f"    FAIL: {err}")
         # Clean up partial output so re-runs don't trip on it.

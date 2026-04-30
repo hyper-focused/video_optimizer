@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import unittest
 
-from optimizer.encoder import _parse_progress_line, _ProgressState
+from optimizer.encoder import (
+    _effective_position,
+    _effective_speed,
+    _parse_progress_line,
+    _ProgressState,
+)
 
 
 def feed(state: _ProgressState, lines: list[str],
@@ -89,6 +94,45 @@ class StallSignalTests(unittest.TestCase):
             "progress=continue",
         ])
         self.assertFalse(self._is_alive(before, after))
+
+
+class HybridDisplayTests(unittest.TestCase):
+    """v0.5.19: when out_time_ms stalls (av1_qsv deep B-frame buffering on
+    Captain America 2160p pinned it at 241s for an entire hour while the
+    encode finished cleanly), display falls back to frame-count-derived
+    position. Both signals start at 0; whichever advances faster wins.
+    """
+
+    def test_frame_position_dominates_when_out_time_stalled(self):
+        # 1 hour into a 2h film, out_time stuck at 241s but frames at
+        # ~85k advanced through a 24fps source → ~3540s of real position.
+        s = _ProgressState(current_seconds=241.0, frames=84960, fps=23.6)
+        eff = _effective_position(s, source_fps=24.0)
+        self.assertAlmostEqual(eff, 3540.0, places=1)
+
+    def test_out_time_dominates_when_ahead(self):
+        # If ffmpeg's out_time is genuinely tracking and frames are
+        # under-reported (rare), pick the larger of the two.
+        s = _ProgressState(current_seconds=500.0, frames=1000, fps=24.0)
+        eff = _effective_position(s, source_fps=24.0)
+        self.assertEqual(eff, 500.0)
+
+    def test_zero_source_fps_falls_back_to_out_time(self):
+        s = _ProgressState(current_seconds=120.0, frames=2880)
+        self.assertEqual(_effective_position(s, source_fps=0.0), 120.0)
+
+    def test_speed_derived_from_fps_when_source_fps_known(self):
+        # 57.5 fps decode of 24 fps source = 2.4x realtime. ffmpeg's
+        # `speed` field would have been a misleading 0.08x while
+        # out_time was stuck.
+        s = _ProgressState(fps=57.5, speed=0.08)
+        self.assertAlmostEqual(
+            _effective_speed(s, source_fps=24.0), 2.396, places=2,
+        )
+
+    def test_speed_falls_back_to_ffmpeg_when_no_source_fps(self):
+        s = _ProgressState(fps=57.5, speed=2.4)
+        self.assertEqual(_effective_speed(s, source_fps=0.0), 2.4)
 
 
 if __name__ == "__main__":

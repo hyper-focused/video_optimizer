@@ -853,8 +853,38 @@ def _parse_progress_line(line: str, state: _ProgressState,
     return state
 
 
+def _effective_position(state: _ProgressState, source_fps: float) -> float:
+    """Source-timeline seconds elapsed, derived from whichever signal is ahead.
+
+    `out_time_ms` is ffmpeg's most-recent-muxed-packet PTS. With av1_qsv
+    holding many frames in lookahead + B-frame buffers, the muxer can go
+    long stretches with the same PTS visible while the decoder advances
+    frames steadily — Captain America 2160p run pinned `out_time` at 241s
+    for an hour while the encode actually completed. The frame counter
+    advances on every decoded frame and is the more reliable signal in
+    that regime, so take whichever position is further along.
+    """
+    if source_fps > 0 and state.frames > 0:
+        return max(state.current_seconds, state.frames / source_fps)
+    return state.current_seconds
+
+
+def _effective_speed(state: _ProgressState, source_fps: float) -> float:
+    """Realtime multiplier, derived from fps when source_fps is known.
+
+    ffmpeg's `speed` field is `out_time / wall_clock`; it collapses to
+    near-zero when out_time stalls even on a healthy encode. fps-derived
+    speed (`current_fps / source_fps`) tracks real throughput and stays
+    accurate when out_time is misbehaving. Falls back to ffmpeg's value
+    when source_fps is unknown (e.g. variable-rate sources)."""
+    if source_fps > 0 and state.fps > 0:
+        return state.fps / source_fps
+    return state.speed
+
+
 def _render_progress(state: _ProgressState, duration_seconds: float, *,
-                     label: str = "", is_tty: bool = True) -> None:
+                     label: str = "", is_tty: bool = True,
+                     source_fps: float = 0.0) -> None:
     """Write a progress update to stderr.
 
     TTY mode: in-place line with `\\r`, redrawn frequently — the
@@ -864,34 +894,35 @@ def _render_progress(state: _ProgressState, duration_seconds: float, *,
     "what's running now". Caller is responsible for throttling the
     non-TTY path.
     """
-    frac = (state.current_seconds / duration_seconds
+    effective = _effective_position(state, source_fps)
+    speed = _effective_speed(state, source_fps)
+    frac = (effective / duration_seconds
             if duration_seconds > 0 else 0.0)
+    remaining = duration_seconds - effective
     if is_tty:
         line = (f"\r{label}{_format_bar(frac)} {frac * 100:5.1f}%  "
-                f"{state.current_seconds:7.1f}s/{duration_seconds:7.1f}s")
-        if state.frames > 0 and state.current_seconds == 0:
+                f"{effective:7.1f}s/{duration_seconds:7.1f}s")
+        if state.frames > 0:
             line += f"  f={state.frames}"
         if state.fps > 0:
             line += f"  {state.fps:5.1f}fps"
-        if state.speed > 0:
-            line += f"  {state.speed:4.2f}x"
-            remaining = duration_seconds - state.current_seconds
+        if speed > 0:
+            line += f"  {speed:4.2f}x"
             if remaining > 0:
-                line += f"  ETA {_format_secs(remaining / state.speed)}"
+                line += f"  ETA {_format_secs(remaining / speed)}"
         # Pad to clear leftover characters from a shorter previous render.
         sys.stderr.write(line.ljust(120))
     else:
         parts = [f"{label}{frac * 100:5.1f}% "
-                 f"{state.current_seconds:.0f}/{duration_seconds:.0f}s"]
-        if state.frames > 0 and state.current_seconds == 0:
+                 f"{effective:.0f}/{duration_seconds:.0f}s"]
+        if state.frames > 0:
             parts.append(f"f={state.frames}")
         if state.fps > 0:
             parts.append(f"{state.fps:.1f}fps")
-        if state.speed > 0:
-            parts.append(f"{state.speed:.2f}x")
-            remaining = duration_seconds - state.current_seconds
+        if speed > 0:
+            parts.append(f"{speed:.2f}x")
             if remaining > 0:
-                parts.append(f"ETA {_format_secs(remaining / state.speed)}")
+                parts.append(f"ETA {_format_secs(remaining / speed)}")
         sys.stderr.write(" ".join(parts) + "\n")
     sys.stderr.flush()
 
@@ -902,6 +933,7 @@ def _stream_progress_until_done(proc: subprocess.Popen,
                                 start: float,
                                 *, label: str = "",
                                 stall_seconds: int = 300,
+                                source_fps: float = 0.0,
                                 ) -> tuple[bool, str]:
     """Pump ffmpeg progress lines until EOF.
 
@@ -941,7 +973,8 @@ def _stream_progress_until_done(proc: subprocess.Popen,
             stall_anchor_wall = now
         if now - last_render >= render_interval:
             _render_progress(state, duration_seconds,
-                             label=label, is_tty=is_tty)
+                             label=label, is_tty=is_tty,
+                             source_fps=source_fps)
             last_render = now
         if now - stall_anchor_wall > stall_seconds:
             return True, (f"encoder stalled — no progress for "
@@ -956,13 +989,19 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
                timeout_seconds: int | None = 3600,
                stall_seconds: int = 300,
                verbose: bool = False,
-               label: str = "") -> tuple[bool, str]:
+               label: str = "",
+               source_fps: float = 0.0) -> tuple[bool, str]:
     """Run ffmpeg with single-line progress; enforce wall-clock + stall caps.
 
     timeout_seconds: positive int caps wall-clock; 0 or None disables the cap.
-    stall_seconds: kill if `out_time` doesn't advance for this many wall-
-    clock seconds. Catches encoder hangs that the wall-clock cap is too
-    generous to notice (the adaptive default is 6× source duration).
+    stall_seconds: kill if neither out_time nor frame= advances for this many
+    wall-clock seconds. Catches genuine encoder hangs while letting deep-
+    lookahead buffering pass. The adaptive default is 6× source duration —
+    this is the tighter check.
+    source_fps: source video frame rate (frames/second). Enables a
+    frame-count-derived progress fallback for sources where ffmpeg's
+    out_time_ms field stalls under deep B-frame buffering. Pass 0 to use
+    only out_time.
     label: prefix written on each progress update.
     Returns (success, error_message).
     """
@@ -982,6 +1021,7 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
         should_kill, reason = _stream_progress_until_done(
             proc, duration_seconds, timeout_seconds, start,
             label=label, stall_seconds=stall_seconds,
+            source_fps=source_fps,
         )
         if should_kill:
             proc.kill()
