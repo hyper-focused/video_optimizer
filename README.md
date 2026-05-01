@@ -573,6 +573,24 @@ A frame-zero stall (`frame=121` after 5 minutes) usually means the source
 trips the encoder at startup; a mid-encode stall (`frame=78104` mid-file)
 usually means a specific bitstream pattern wedges it.
 
+### Already-encoded files are skipped permanently
+
+Any file whose name contains the `REENCODE` token (the marker
+`--reencode-tag` inserts) is treated as one of this tool's own outputs
+and skipped at plan time. Without this gate, an `--in-place` run with
+`--recycle-to` (or `--backup`) preserves the original *and* writes the
+new file alongside it, and the next `plan` would happily re-queue both —
+producing `...AV1.REENCODE.REENCODE.mkv` and burning hours on a no-op
+re-encode.
+
+The skip appears in the plan summary as `reencoded_blocked: N`. To
+intentionally re-encode an already-tagged file (e.g. trying a different
+CQ), pass `--allow-reencoded` on `plan`.
+
+```bash
+./video_optimizer.py plan --allow-reencoded   # re-queue prior outputs
+```
+
 ### Two-strikes auto-skip
 
 A file that has hit the watchdog **twice** is auto-skipped on subsequent
@@ -746,6 +764,16 @@ the Arr app's library polling while the run is in progress.
 ### `doctor` flags
 
 - `--probe PATH` — additional sample probe of a video file
+
+### `plan` flags
+
+- `--rules R1,R2` — restrict the rule set
+- `--target TARGET` — codec + container (default `av1+mkv`)
+- `--keep-langs LANGS` — advisory list (default `en,und`)
+- `--allow-reencoded` — re-queue files whose names carry the `REENCODE`
+  marker. Default behavior is to skip them permanently. See
+  [Already-encoded files are skipped permanently](#already-encoded-files-are-skipped-permanently).
+- `--json` — emit JSON instead of the text report
 
 ### `scan` / `reprobe` flags
 

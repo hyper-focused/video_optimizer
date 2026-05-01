@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -130,6 +131,12 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                          "(advisory only here).")
     pl.add_argument("--json", action="store_true",
                     help="Emit JSON candidate list instead of text report.")
+    pl.add_argument("--allow-reencoded", action="store_true",
+                    help="Re-queue files whose names carry the REENCODE marker "
+                         "(prior outputs of this tool). Default behavior is to "
+                         "skip them permanently. Use this when intentionally "
+                         "re-running an already-encoded file (e.g. trying a "
+                         "different CQ).")
     _add_common_db_arg(pl)
 
 
@@ -574,16 +581,36 @@ def cmd_reprobe(args: argparse.Namespace) -> int:
     return cmd_scan(args, force=True)
 
 
-def _plan_probe_gate(db: Database, pr) -> str:
+_REENCODED_MARKER_RE = re.compile(r"\bREENCODE\b", re.IGNORECASE)
+
+
+def _is_reencoded_filename(path: str) -> bool:
+    """True if `path` looks like one of our prior re-encode outputs.
+
+    Matches the `REENCODE` token inserted by `--reencode-tag` (case
+    insensitive, word-boundary). Used to keep the plan gate from queueing
+    a file we've already processed — without this, an in-place run that
+    chose a non-deletable disposal mode (recycle / backup) would surface
+    its own outputs back into a future plan and re-encode them, doubling
+    the marker (`...AV1.REENCODE.REENCODE.mkv`) and burning hours.
+    """
+    return _REENCODED_MARKER_RE.search(Path(path).stem) is not None
+
+
+def _plan_probe_gate(db: Database, pr,
+                     *, allow_reencoded: bool = False) -> str:
     """Pre-rule filter for one probe.
 
     Returns one of:
-      "missing" — source no longer on disk; cache rows dropped here.
-      "stalled" — two-strikes auto-skip (av1_qsv watchdog twice).
-      "dv"      — Dolby Vision source; av1_qsv wedges on DV (Profile 7
-                  stalls at frame 0; Profile 8 partway in). Awaiting a
-                  DV-aware encode path (RPU strip / BL extraction).
-      "ok"      — admit to rule evaluation.
+      "missing"    — source no longer on disk; cache rows dropped here.
+      "stalled"    — two-strikes auto-skip (av1_qsv watchdog twice).
+      "dv"         — Dolby Vision source; av1_qsv wedges on DV (Profile 7
+                     stalls at frame 0; Profile 8 partway in). Awaiting a
+                     DV-aware encode path (RPU strip / BL extraction).
+      "reencoded"  — filename carries the REENCODE marker (output of a
+                     prior run); skipped permanently unless caller passes
+                     allow_reencoded=True (`plan --allow-reencoded`).
+      "ok"         — admit to rule evaluation.
     """
     if not Path(pr.path).exists():
         # Decisions FK back to files with default RESTRICT; delete
@@ -600,6 +627,8 @@ def _plan_probe_gate(db: Database, pr) -> str:
         return "stalled"
     if pr.dv_profile is not None:
         return "dv"
+    if not allow_reencoded and _is_reencoded_filename(pr.path):
+        return "reencoded"
     return "ok"
 
 
@@ -612,15 +641,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    allow_reencoded = bool(getattr(args, "allow_reencoded", False))
     with Database(args.db) as db:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
-        counts = {"missing": 0, "stalled": 0, "dv": 0}
+        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
-            verdict = _plan_probe_gate(db, pr)
+            verdict = _plan_probe_gate(db, pr, allow_reencoded=allow_reencoded)
             if verdict != "ok":
                 counts[verdict] += 1
                 continue
@@ -637,6 +667,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         pruned = counts["missing"]
         stall_blocked = counts["stalled"]
         dv_blocked = counts["dv"]
+        reencoded_blocked = counts["reencoded"]
         if pruned:
             db.conn.commit()
             print(f"pruned {pruned} stale cache rows (source moved or deleted)")
@@ -646,6 +677,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
         if dv_blocked:
             print(f"skipped {dv_blocked} Dolby Vision sources "
                   f"(av1_qsv stalls on DV; awaiting DV-aware encode path)")
+        if reencoded_blocked:
+            print(f"skipped {reencoded_blocked} files already tagged "
+                  f"REENCODE (prior outputs of this tool; pass "
+                  f"--allow-reencoded to re-queue)")
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -658,7 +693,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                    "candidates": len(candidates),
                    "pruned_stale_rows": pruned,
                    "stall_blocked": stall_blocked,
-                   "dv_blocked": dv_blocked}
+                   "dv_blocked": dv_blocked,
+                   "reencoded_blocked": reencoded_blocked}
         db.end_run(run_id, summary)
     return 0
 
@@ -1201,7 +1237,9 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     print("==> [2/4] plan: evaluating rules against probe cache...")
     plan_ns = argparse.Namespace(
         cmd="plan", rules=None, target="av1+mkv", json=False,
-        keep_langs=args.keep_langs or "en,und", db=args.db,
+        keep_langs=args.keep_langs or "en,und",
+        allow_reencoded=False,
+        db=args.db,
     )
     rc = cmd_plan(plan_ns)
     if rc != 0:
