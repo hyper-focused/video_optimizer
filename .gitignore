@@ -19,6 +19,7 @@ env/
 .vscode/
 .idea/
 .DS_Store
+.claude/
 
 # Project state (created at runtime by the tool)
 .video_optimizer/
@@ -26,8 +27,9 @@ state.db
 state.db-wal
 state.db-shm
 
-# Run logs from archive-hd.sh (e.g. archive-20260427.log)
-archive-*.log
+# Run logs (archive.sh, optimize, ad-hoc test runs — all .log in this repo
+# are run output, never source).
+*.log
 
 # Local one-shot recovery scripts (not project code)
 clear.py
