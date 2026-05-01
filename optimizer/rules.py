@@ -182,7 +182,7 @@ class HdrAdvisoryRule(Rule):
         if not probe.is_hdr:
             return _miss(self.name)
 
-        reason = "HDR source; transcode disabled unless --allow-hdr-transcode"
+        reason = "HDR source; metadata will pass through to AV1 output"
         return RuleVerdict(
             rule=self.name,
             fired=True,

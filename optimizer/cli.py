@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -16,13 +17,70 @@ from typing import Any
 from . import crawler, encoder, naming, probe, report, rules
 from .db import DEFAULT_DB_PATH, Database
 from .models import ProbeResult, probe_from_dict
-from .presets import PRESETS
+from .presets import MIN_PROBE_SIZE_BYTES, PRESETS
+
+_SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+
+
+def _parse_size(value: str) -> int:
+    """Parse `1G`, `500M`, `1024`, `0` etc. into a byte count.
+
+    Used by `--min-size`. Returns a non-negative int. Suffixes are
+    case-insensitive and binary (1K = 1024). A bare integer is bytes.
+    `0` disables the gate.
+    """
+    s = value.strip().lower()
+    if not s:
+        msg = "empty size value"
+        raise argparse.ArgumentTypeError(msg)
+    suffix = s[-1]
+    if suffix in _SIZE_SUFFIXES:
+        try:
+            n = float(s[:-1])
+        except ValueError as e:
+            msg = f"invalid size: {value!r}"
+            raise argparse.ArgumentTypeError(msg) from e
+        return int(n * _SIZE_SUFFIXES[suffix])
+    try:
+        n_int = int(s)
+    except ValueError as e:
+        msg = f"invalid size: {value!r} (use bytes or K/M/G/T suffix)"
+        raise argparse.ArgumentTypeError(msg) from e
+    if n_int < 0:
+        msg = f"size must be non-negative: {value!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return n_int
+
+
+def _format_size(n: int) -> str:
+    """Inverse of _parse_size for human-readable summaries (binary)."""
+    if n <= 0:
+        return "0"
+    for suffix, scale in (("T", 1024 ** 4), ("G", 1024 ** 3),
+                          ("M", 1024 ** 2), ("K", 1024)):
+        if n >= scale:
+            return f"{n / scale:.1f}{suffix}"
+    return f"{n}B"
 
 
 def _add_common_db_arg(p: argparse.ArgumentParser) -> None:
     """Attach the --db argument shared by every subcommand."""
     p.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
                    help=f"SQLite state file (default: {DEFAULT_DB_PATH})")
+
+
+def _add_min_size_arg(p: argparse.ArgumentParser) -> None:
+    """Attach --min-size, the scan-time probe-eligibility threshold."""
+    default_human = _format_size(MIN_PROBE_SIZE_BYTES)
+    p.add_argument(
+        "--min-size", type=_parse_size, default=MIN_PROBE_SIZE_BYTES,
+        metavar="SIZE",
+        help=f"Skip files smaller than SIZE at scan time (default: "
+             f"{default_human}). Accepts bytes or a K/M/G/T suffix "
+             f"(e.g. '500M', '1G'). '0' disables the gate. Skipped files "
+             f"are recorded in the skipped_files cache so they don't get "
+             f"re-probed; if a file later grows above the threshold, the "
+             f"next scan will probe it normally.")
 
 
 def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
@@ -38,6 +96,7 @@ def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
                         "Default: min(8, CPU count). Use 1 for sequential. "
                         "ffprobe is I/O-bound, so workers >> NFS server's "
                         "concurrent-read ceiling don't help.")
+    _add_min_size_arg(s)
     s.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(s)
 
@@ -52,6 +111,7 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     r.add_argument("--no-recursive", action="store_true")
     r.add_argument("--workers", type=int, default=None,
                    help="Parallel ffprobe workers (default: min(8, CPU count)).")
+    _add_min_size_arg(r)
     r.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(r)
 
@@ -76,11 +136,13 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
 def _add_apply_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `apply` subcommand and all its encode/output flags."""
     ap = sub.add_parser("apply", help="Encode pending candidates.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print planned ffmpeg commands and exit without "
+                         "encoding. Use this to preview what would happen "
+                         "before committing to a run.")
     _add_apply_workflow_args(ap)
     _add_apply_encoding_args(ap)
     _add_apply_naming_args(ap)
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Print planned commands; encode nothing.")
     ap.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(ap)
 
@@ -106,6 +168,11 @@ def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
                          "target are on the same filesystem (typical NAS share "
                          "with @Recycle / #recycle). Mutually exclusive with "
                          "--backup.")
+    ap.add_argument("--allow-hard-delete", action="store_true",
+                    help="Required to combine --mode replace with --auto when "
+                         "neither --backup nor --recycle-to is set. Acknowledges "
+                         "that originals will be permanently deleted after each "
+                         "successful encode (encode-then-unlink, no copy).")
     ap.add_argument("--limit", type=int, default=0,
                     help="Process at most N candidates (0 = no limit).")
     ap.add_argument("--min-height", type=int, default=None,
@@ -124,10 +191,6 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
                              "software", "none"],
                     default="auto")
     ap.add_argument("--keep-langs", default="en,und")
-    ap.add_argument("--allow-hdr-transcode", action="store_true",
-                    help="Permit transcoding HDR sources (off by default).")
-    ap.add_argument("--skip-hdr", action="store_true",
-                    help="Explicit no-op flag; HDR is skipped by default anyway.")
     ap.add_argument("--timeout", type=int, default=None,
                     help="Per-file ffmpeg wall-clock cap in seconds. "
                          "0 disables. Default adapts to source duration "
@@ -196,6 +259,90 @@ def _add_replace_list_parser(sub: "argparse._SubParsersAction") -> None:
     _add_common_db_arg(rl)
 
 
+def _add_doctor_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `doctor` preflight subcommand."""
+    dr = sub.add_parser(
+        "doctor",
+        help="Run preflight checks: ffmpeg/ffprobe, encoders, GPU device, "
+             "database. Exits nonzero if anything's wrong; run before your "
+             "first encode to surface setup problems early.",
+    )
+    dr.add_argument("--probe", type=Path, default=None, metavar="PATH",
+                    help="Optional video file path; runs a real probe to "
+                         "verify ffprobe and the source readability.")
+    _add_common_db_arg(dr)
+
+
+def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `optimize` one-shot pipeline subcommand."""
+    op = sub.add_parser(
+        "optimize",
+        help="One-shot scan+plan+apply for a library. Auto-runs the UHD "
+             "preset on 2160p sources and the HD preset on 1080p-and-below, "
+             "with safe defaults. The friendliest entry point for new users.",
+        description=(
+            "Run scan, plan, and apply against PATH in a single command, "
+            "using calibrated presets for each resolution tier (CQ 15 for "
+            "UHD, CQ 21 for HD). Pick exactly one of --output (writes new "
+            "files to a separate tree, leaves originals untouched) or "
+            "--in-place (writes alongside originals and atomically moves "
+            "the originals into a recycle directory)."
+        ),
+    )
+    op.add_argument("path", type=Path, help="Library directory to optimize.")
+    op.add_argument("--dry-run", action="store_true",
+                    help="Print planned ffmpeg commands and exit. Combine "
+                         "with --limit 1 to preview a single encode.")
+
+    out = op.add_mutually_exclusive_group(required=True)
+    out.add_argument("--output", type=Path, metavar="DIR",
+                     help="Side mode: write new files under DIR mirroring "
+                          "PATH's structure. Originals are untouched. The "
+                          "safest first-time choice.")
+    out.add_argument("--in-place", action="store_true",
+                     help="Replace mode: write new files alongside originals "
+                          "and move the originals into a recycle directory "
+                          "(see --recycle-to). Atomic when source and "
+                          "recycle dir are on the same filesystem.")
+
+    op.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
+                    help="With --in-place: recycle directory for displaced "
+                         "originals. If omitted, an existing @Recycle / "
+                         "#recycle / .Trash under PATH is used; otherwise "
+                         "<PATH>/.@Recycle is created.")
+    op.add_argument("--auto", action="store_true",
+                    help="Skip per-file confirmation prompts.")
+    op.add_argument("--limit", type=int, default=0, metavar="N",
+                    help="Process at most N candidates per tier "
+                         "(0 = no limit). Useful with --dry-run to preview "
+                         "the first encode that would run.")
+    op.add_argument("--quality", type=int, default=None,
+                    help="Override the preset CQ (HD default: 21, "
+                         "UHD default: 15). Lower = better quality + larger.")
+    op.add_argument("--keep-langs", default=None,
+                    help="Override languages kept on apply (default: en,und).")
+    op.add_argument("--hwaccel",
+                    choices=["auto", "qsv", "nvenc", "vaapi",
+                             "videotoolbox", "software", "none"],
+                    default="auto",
+                    help="Encoder hardware backend (default: auto).")
+    hwd = op.add_mutually_exclusive_group()
+    hwd.add_argument("--hw-decode", action="store_true", default=None,
+                     help="Force zero-copy QSV decode->encode on both tiers.")
+    hwd.add_argument("--no-hw-decode", action="store_false",
+                     dest="hw_decode",
+                     help="Force CPU decode->QSV encode on both tiers.")
+    op.add_argument("--skip-scan", action="store_true",
+                    help="Reuse the existing probe cache; skip the scan "
+                         "phase. Fine when PATH hasn't changed since the "
+                         "last optimize/scan run.")
+    op.add_argument("--workers", type=int, default=8,
+                    help="Parallel workers for the scan phase (default: 8).")
+    _add_min_size_arg(op)
+    op.add_argument("--verbose", "-v", action="store_true")
+    _add_common_db_arg(op)
+
+
 def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
     """Register one subcommand per entry in PRESETS, sharing a narrow flag set."""
     for name, cfg in PRESETS.items():
@@ -203,6 +350,10 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
             name,
             help=f"Apply pending decisions with the {cfg['label']} preset.",
         )
+        p.add_argument("--dry-run", action="store_true",
+                       help="Print planned ffmpeg commands and exit without "
+                            "encoding. Use this to preview what would happen "
+                            "before committing to a run.")
         # Workflow knobs (mirror _add_apply_workflow_args, narrowed).
         p.add_argument("--auto", action="store_true",
                        help="Skip per-file confirmation.")
@@ -217,6 +368,10 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
                        help="For --mode replace: atomically move originals into "
                             "this dir (e.g. /mnt/nas/<share>/@Recycle). Preserves "
                             "source hierarchy. Mutually exclusive with --backup.")
+        p.add_argument("--allow-hard-delete", action="store_true",
+                       help="Required to combine --mode replace with --auto when "
+                            "neither --backup nor --recycle-to is set. Originals "
+                            "are permanently deleted after each successful encode.")
         p.add_argument("--limit", type=int, default=0,
                        help="Process at most N candidates (0 = no limit).")
         p.add_argument("--min-height", type=int, default=None,
@@ -235,10 +390,6 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
                        choices=["auto", "qsv", "nvenc", "vaapi",
                                 "videotoolbox", "software", "none"],
                        default="auto")
-        p.add_argument("--allow-hdr-transcode", action="store_true",
-                       help="Permit transcoding HDR sources (off by default).")
-        p.add_argument("--skip-hdr", action="store_true",
-                       help="Explicit no-op flag; HDR is skipped by default anyway.")
         p.add_argument("--timeout", type=int, default=None,
                        help="Per-file ffmpeg wall-clock cap in seconds. "
                             "0 disables.")
@@ -269,8 +420,6 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
                        help="Free-form trailing append; runs after preset rename.")
         p.add_argument("--reencode-tag-value", default="REENCODE",
                        help="Override the REENCODE marker token (default: REENCODE).")
-        p.add_argument("--dry-run", action="store_true",
-                       help="Print planned commands; encode nothing.")
         p.add_argument("--verbose", "-v", action="store_true")
         _add_common_db_arg(p)
 
@@ -289,6 +438,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_status_parser(sub)
     _add_list_encoders_parser(sub)
     _add_replace_list_parser(sub)
+    _add_doctor_parser(sub)
+    _add_optimize_parser(sub)
     _add_preset_parsers(sub)
     return p
 
@@ -313,9 +464,20 @@ def _probe_one_safe(fp: Path) -> tuple[str, Path, object]:
 
 
 def _scan_walk_phase(args: argparse.Namespace, db: Database, force: bool,
-                     ) -> tuple[int, int, int, list[Path]]:
-    """Tree walk + cache filter. Returns (seen, cached, errors, uncached)."""
-    seen = cached = errors = 0
+                     ) -> tuple[int, int, int, int, list[Path]]:
+    """Tree walk + cache filter + size gate.
+
+    Returns (seen, cached, size_skipped, errors, uncached). The size gate
+    is checked first, before the probe cache: a file under the threshold
+    is recorded in `skipped_files` and any prior probe row is evicted, so
+    a file that shrinks below the threshold (or a threshold raised since
+    the last scan) is consistently treated as skipped.
+
+    Files in `skipped_files` that have grown to >= threshold get their
+    skip row cleared and fall through to the normal cache-or-probe path.
+    """
+    min_size = max(0, getattr(args, "min_size", MIN_PROBE_SIZE_BYTES))
+    seen = cached = size_skipped = errors = 0
     uncached: list[Path] = []
     for fp in crawler.crawl(args.path, recursive=not args.no_recursive):
         seen += 1
@@ -325,14 +487,25 @@ def _scan_walk_phase(args: argparse.Namespace, db: Database, force: bool,
             print(f"skip {fp}: {e}", file=sys.stderr)
             errors += 1
             continue
+        path_str = str(fp)
+        if min_size > 0 and st.st_size < min_size:
+            db.record_size_skip(path_str, st.st_size, st.st_mtime)
+            size_skipped += 1
+            if args.verbose:
+                print(f"skip   {fp}  ({st.st_size / 1024 / 1024:.1f} MB "
+                      f"< min {_format_size(min_size)})")
+            continue
+        # File is large enough; if it was previously skipped, lift the
+        # skip row so the next branches treat it as a normal candidate.
+        db.clear_size_skip(path_str)
         use_cache = not (force or args.no_probe_cache)
-        if use_cache and db.get_cached_probe(str(fp), st.st_size, st.st_mtime):
+        if use_cache and db.get_cached_probe(path_str, st.st_size, st.st_mtime):
             cached += 1
             if args.verbose:
                 print(f"cache  {fp}")
             continue
         uncached.append(fp)
-    return seen, cached, errors, uncached
+    return seen, cached, size_skipped, errors, uncached
 
 
 def _scan_probe_phase(args: argparse.Namespace, db: Database,
@@ -380,15 +553,19 @@ def cmd_scan(args: argparse.Namespace, force: bool = False) -> int:
     workers = max(1, workers)
     with Database(args.db) as db:
         run_id = db.start_run("scan", str(args.path), _args_dict(args))
-        seen, cached, walk_errors, uncached = _scan_walk_phase(args, db, force)
+        seen, cached, size_skipped, walk_errors, uncached = _scan_walk_phase(
+            args, db, force)
         probed, probe_errors = _scan_probe_phase(args, db, uncached, workers)
         errors = walk_errors + probe_errors
         summary = {"seen": seen, "probed": probed,
-                   "cache_hits": cached, "errors": errors,
-                   "workers": workers}
+                   "cache_hits": cached, "size_skipped": size_skipped,
+                   "errors": errors, "workers": workers}
         db.end_run(run_id, summary)
+        skip_note = (f", {size_skipped} skipped (< "
+                     f"{_format_size(getattr(args, 'min_size', MIN_PROBE_SIZE_BYTES))})"
+                     if size_skipped else "")
         print(f"scan done: {seen} files seen, {probed} probed, "
-              f"{cached} cached, {errors} errors")
+              f"{cached} cached{skip_note}, {errors} errors")
     return 0
 
 
@@ -535,6 +712,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if getattr(args, "recycle_to", None) and args.mode != "replace":
         print("error: --recycle-to only applies to --mode replace "
               "(side mode never deletes originals)", file=sys.stderr)
+        return 2
+    if not _confirm_hard_delete_if_needed(args):
         return 2
 
     keep_langs = [s.strip() for s in args.keep_langs.split(",") if s.strip()]
@@ -756,6 +935,282 @@ def _split_encoders_by_availability(codec_key: str,
     return present, missing
 
 
+def _tool_version(name: str) -> str:
+    """Best-effort one-line version string from `tool -version`. Empty on failure."""
+    try:
+        result = subprocess.run([name, "-version"],
+                                capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    line = (result.stdout.splitlines() or [""])[0]
+    return line.strip()[:80]
+
+
+def _doctor_check_tools(issues: list[str]) -> dict[str, str | None]:
+    print("External tools")
+    print("==============")
+    tools = encoder.check_external_tools()
+    for name, path in tools.items():
+        if path is None:
+            print(f"  {name}: MISSING — install ffmpeg "
+                  f"(provides both ffmpeg and ffprobe)")
+            issues.append(f"{name} not on PATH")
+            continue
+        ver = _tool_version(name) or "(version unavailable)"
+        print(f"  {name}: {path}")
+        print(f"    {ver}")
+    return tools
+
+
+def _doctor_check_encoders(tools: dict[str, str | None],
+                           issues: list[str]) -> None:
+    print("\nVideo encoders")
+    print("==============")
+    if not all(tools.values()):
+        print("  (skipped: ffmpeg not on PATH)")
+        return
+    available = encoder.get_available_encoders()
+    if not available:
+        print("  no video encoders detected — check the ffmpeg build")
+        issues.append("no video encoders available")
+        return
+    for codec_label, codec_key in (("AV1", "av1"),
+                                   ("HEVC", "hevc"),
+                                   ("H.264", "h264")):
+        present, _missing = _split_encoders_by_availability(codec_key, available)
+        mark = "OK" if present else "missing"
+        joined = ", ".join(present) or "(none)"
+        print(f"  {codec_label:6s} [{mark:7s}]  {joined}")
+    print("\n  Encoder picked with --hwaccel auto:")
+    for target in encoder.TARGETS:
+        try:
+            chosen = encoder.select_encoder(target, "auto")
+            print(f"    {target:9s} -> {chosen}")
+        except RuntimeError as e:
+            first_line = str(e).splitlines()[0]
+            print(f"    {target:9s} -> NONE ({first_line})")
+            issues.append(f"no encoder for target {target}")
+
+
+def _doctor_check_vaapi() -> None:
+    print("\nGPU / VAAPI")
+    print("===========")
+    vaapi = "/dev/dri/renderD128"
+    if Path(vaapi).exists():
+        print(f"  {vaapi}: present")
+    else:
+        print(f"  {vaapi}: absent")
+        print("    (VAAPI encoders won't run; QSV/NVENC are independent)")
+
+
+def _doctor_check_db(db_path: Path, issues: list[str]) -> None:
+    print("\nDatabase")
+    print("========")
+    try:
+        with Database(db_path) as db:
+            files_n = db.conn.execute(
+                "SELECT COUNT(*) FROM files").fetchone()[0]
+            pending_n = db.conn.execute(
+                "SELECT COUNT(*) FROM decisions WHERE status='pending'"
+            ).fetchone()[0]
+        print(f"  {db_path}: ok")
+        print(f"    {files_n} files cached, {pending_n} pending decisions")
+    except sqlite3.Error as e:
+        print(f"  {db_path}: ERROR ({e})")
+        issues.append("database unreachable")
+
+
+def _doctor_sample_probe(probe_path: Path, issues: list[str]) -> None:
+    print(f"\nSample probe: {probe_path}")
+    print("=" * 60)
+    if not probe_path.exists():
+        print("  path does not exist")
+        issues.append(f"probe path missing: {probe_path}")
+        return
+    try:
+        pr = probe.probe_file(probe_path)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"  probe failed: {e}")
+        issues.append(f"probe failed for {probe_path}")
+        return
+    hdr_label = "yes" if pr.is_hdr else "no"
+    dv_label = (f"profile {pr.dv_profile}"
+                if pr.dv_profile is not None else "no")
+    br_mbps = pr.video_bitrate / 1e6
+    print(f"  duration:    {pr.duration_seconds:.1f}s")
+    print(f"  resolution:  {pr.width}x{pr.height} "
+          f"({pr.resolution_class})")
+    print(f"  codec:       {pr.video_codec}, "
+          f"container={pr.container}")
+    print(f"  bit depth:   {pr.bit_depth}, hdr={hdr_label}, "
+          f"dolby vision={dv_label}")
+    print(f"  bitrate:     {br_mbps:.2f} Mbps")
+    print(f"  audio:       {len(pr.audio_tracks)} tracks, "
+          f"subs: {len(pr.subtitle_tracks)}")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run preflight checks; exit 0 if everything's healthy, 1 otherwise.
+
+    Designed to be the first command a new user runs. Each section either
+    reports green or names a concrete remediation step. The summary line at
+    the end gives a fast yes/no answer.
+    """
+    issues: list[str] = []
+    tools = _doctor_check_tools(issues)
+    _doctor_check_encoders(tools, issues)
+    _doctor_check_vaapi()
+    _doctor_check_db(args.db, issues)
+    if args.probe is not None:
+        _doctor_sample_probe(args.probe, issues)
+
+    print()
+    if issues:
+        print(f"FAIL: {len(issues)} issue(s) found")
+        for x in issues:
+            print(f"  - {x}")
+        return 1
+    print("OK: all checks passed")
+    return 0
+
+
+_RECYCLE_DIR_NAMES: tuple[str, ...] = ("@Recycle", ".@Recycle", "#recycle", ".Trash")
+
+
+def _resolve_recycle_dir(path: Path, override: Path | None) -> Path:
+    """Return the recycle directory to use for `optimize --in-place`.
+
+    Resolution order: explicit override > existing recycle-named directory
+    inside `path` > newly created `path/.@Recycle`. The new dir is created
+    on first use; the rename into it must stay on the same filesystem to
+    be atomic, which is why we anchor under `path` rather than $HOME.
+    """
+    if override is not None:
+        override.mkdir(parents=True, exist_ok=True)
+        return override
+    for name in _RECYCLE_DIR_NAMES:
+        candidate = path / name
+        if candidate.is_dir():
+            return candidate
+    default = path / ".@Recycle"
+    default.mkdir(parents=True, exist_ok=True)
+    return default
+
+
+def _optimize_resolve_paths(
+    args: argparse.Namespace,
+) -> tuple[bool, Path | None, Path, Path | None] | int:
+    """Return (in_place, output_root, source_root, recycle_to) or an exit code."""
+    in_place = bool(args.in_place)
+    if in_place:
+        return (True, None, args.path,
+                _resolve_recycle_dir(args.path, args.recycle_to))
+    if args.recycle_to is not None:
+        print("error: --recycle-to only applies to --in-place", file=sys.stderr)
+        return 2
+    return (False, args.output, args.path, None)
+
+
+def _optimize_run_apply(
+    args: argparse.Namespace,
+    in_place: bool,
+    output_root: Path | None,
+    source_root: Path,
+    recycle_to: Path | None,
+) -> int:
+    aggregate_rc = 0
+    presets_to_run = ("uhd-archive", "hd-archive")
+    for step, preset_name in enumerate(presets_to_run, start=3):
+        cfg = PRESETS[preset_name]
+        print(f"==> [{step}/4] apply: {preset_name} ({cfg['label']})")
+        preset_ns = argparse.Namespace(
+            cmd=preset_name,
+            auto=args.auto,
+            mode="replace" if in_place else "side",
+            output_root=output_root,
+            source_root=source_root,
+            backup=None,
+            recycle_to=recycle_to,
+            allow_hard_delete=False,
+            limit=args.limit,
+            min_height=None,
+            max_height=None,
+            quality=args.quality,
+            keep_langs=args.keep_langs,
+            hwaccel=args.hwaccel,
+            timeout=None,
+            hw_decode=args.hw_decode,
+            compat_audio=True,
+            no_dotted=False,
+            name_suffix="",
+            reencode_tag_value="REENCODE",
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            db=args.db,
+        )
+        rc = cmd_preset(preset_ns)
+        if rc != 0:
+            aggregate_rc = rc
+        print()
+    return aggregate_rc
+
+
+def cmd_optimize(args: argparse.Namespace) -> int:
+    """One-shot scan+plan+apply pipeline using calibrated presets.
+
+    Sequences UHD then HD so the higher-savings tier ships first; each
+    preset's resolution gate (min_height / max_height in PRESETS) keeps
+    the two from clobbering each other's queue.
+    """
+    if not args.path.exists():
+        print(f"error: path not found: {args.path}", file=sys.stderr)
+        return 2
+    if not args.path.is_dir():
+        print(f"error: optimize expects a directory: {args.path}", file=sys.stderr)
+        return 2
+
+    resolved = _optimize_resolve_paths(args)
+    if isinstance(resolved, int):
+        return resolved
+    in_place, output_root, source_root, recycle_to = resolved
+
+    print(f"==> optimize: {args.path}")
+    print(f"    output mode: {'replace (in-place)' if in_place else 'side'}")
+    print(f"    recycle to:  {recycle_to}" if in_place
+          else f"    output root: {output_root}")
+    if args.dry_run:
+        print("    DRY RUN (no encodes will run)")
+    print()
+
+    if args.skip_scan:
+        print("==> [1/4] scan: skipped (--skip-scan)")
+    else:
+        print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
+        scan_ns = argparse.Namespace(
+            cmd="scan", path=args.path, no_recursive=False,
+            no_probe_cache=False, workers=args.workers,
+            min_size=args.min_size,
+            verbose=args.verbose, db=args.db,
+        )
+        rc = cmd_scan(scan_ns)
+        if rc != 0:
+            return rc
+    print()
+
+    print("==> [2/4] plan: evaluating rules against probe cache...")
+    plan_ns = argparse.Namespace(
+        cmd="plan", rules=None, target="av1+mkv", json=False,
+        keep_langs=args.keep_langs or "en,und", db=args.db,
+    )
+    rc = cmd_plan(plan_ns)
+    if rc != 0:
+        return rc
+    print()
+
+    return _optimize_run_apply(args, in_place, output_root, source_root, recycle_to)
+
+
 def cmd_preset(args: argparse.Namespace) -> int:
     """Fill in preset values for missing args, then dispatch to cmd_apply."""
     cfg = PRESETS[args.cmd]
@@ -873,6 +1328,38 @@ def _confirm(prompt: str) -> bool:
     if ans == "q":
         raise SystemExit(0)
     return ans.startswith("y")
+
+
+def _confirm_hard_delete_if_needed(args: argparse.Namespace) -> bool:
+    """Gate `--mode replace` runs that have no original-preserving option.
+
+    Returns True if the run is allowed to proceed, False if it should abort.
+    Side and replace+backup and replace+recycle-to all return True without
+    prompting. Replace with neither requires either an explicit
+    --allow-hard-delete flag (under --auto) or a typed-yes confirmation
+    (interactive). Prints an error/warning to stderr explaining the situation.
+    """
+    if args.mode != "replace":
+        return True
+    if args.backup or getattr(args, "recycle_to", None):
+        return True
+    msg = ("WARNING: --mode replace without --backup or --recycle-to permanently "
+           "deletes each source file after its encode succeeds. There is no undo.\n"
+           "  prefer --recycle-to <dir> (atomic move into a recycle directory) "
+           "or --backup <dir> (copy before delete).")
+    if args.auto:
+        if getattr(args, "allow_hard_delete", False):
+            print(msg, file=sys.stderr)
+            print("  (proceeding because --allow-hard-delete was set)",
+                  file=sys.stderr)
+            return True
+        print(msg, file=sys.stderr)
+        print("  refusing to run with --auto; pass --allow-hard-delete to "
+              "acknowledge, or add --recycle-to / --backup to preserve originals.",
+              file=sys.stderr)
+        return False
+    print(msg, file=sys.stderr)
+    return _confirm("  proceed? [y/N]: ")
 
 
 def _is_advisory(rule_name: str) -> bool:
@@ -1056,10 +1543,36 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
 # --------------------------------------------------------------------------- #
 
 
+_FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
+    "scan", "reprobe", "apply", "list-encoders", "optimize",
+})
+
+
+def _assert_external_tools_available(cmd: str) -> None:
+    """Exit with a clear error if a subcommand needs ffmpeg/ffprobe but they
+    aren't on PATH. plan, status, and replace-list work purely against the
+    cached probe data and don't need either binary."""
+    needs_tools = cmd in _FFMPEG_DEPENDENT_CMDS or cmd in PRESETS
+    if not needs_tools:
+        return
+    tools = encoder.check_external_tools()
+    missing = [name for name, path in tools.items() if path is None]
+    if missing:
+        joined = ", ".join(missing)
+        sys.exit(
+            f"error: required external tool(s) not on PATH: {joined}\n"
+            f"  install ffmpeg (provides both ffmpeg and ffprobe) and retry.\n"
+            f"  debian/ubuntu: sudo apt install ffmpeg\n"
+            f"  macos (homebrew): brew install ffmpeg\n"
+            f"  arch: sudo pacman -S ffmpeg"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Dispatches to the chosen subcommand handler."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _assert_external_tools_available(args.cmd)
 
     handlers = {
         "scan": cmd_scan,
@@ -1069,6 +1582,8 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "list-encoders": cmd_list_encoders,
         "replace-list": cmd_replace_list,
+        "doctor": cmd_doctor,
+        "optimize": cmd_optimize,
     }
     # Preset subcommands all dispatch to the same wrapper.
     for preset_name in PRESETS:
