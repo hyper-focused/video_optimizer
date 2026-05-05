@@ -158,7 +158,8 @@ def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
     """Attach apply-mode flags governing confirmation, output layout, limits."""
     ap.add_argument("--auto", action="store_true",
                     help="Skip per-file confirmation.")
-    ap.add_argument("--mode", choices=["side", "replace"], default="side")
+    ap.add_argument("--mode", choices=["beside", "side", "replace"],
+                    default="side")
     ap.add_argument("--output-root", type=Path,
                     help="Required for --mode side. Mirrored output tree.")
     ap.add_argument("--source-root", type=Path,
@@ -290,64 +291,79 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
         description=(
             "Run scan, plan, and apply against PATH in a single command, "
             "using calibrated presets for each resolution tier (CQ 15 for "
-            "UHD, CQ 21 for HD). Pick exactly one of --output (writes new "
-            "files to a separate tree, leaves originals untouched) or "
-            "--in-place (writes alongside originals and atomically moves "
-            "the originals into a recycle directory)."
+            "UHD, CQ 21 for HD). The default output mode is 'beside': new "
+            "files land alongside the source and originals stay untouched "
+            "(see the optional `cleanup` subcommand for removing them). "
+            "Pass --output DIR to mirror outputs into a separate tree, or "
+            "--in-place to recycle the originals."
         ),
     )
     op.add_argument("path", type=Path, help="Library directory to optimize.")
-    op.add_argument("--dry-run", action="store_true",
-                    help="Print planned ffmpeg commands and exit. Combine "
-                         "with --limit 1 to preview a single encode.")
+    op.add_argument("--mode", choices=["beside", "side", "replace"],
+                    default=None,
+                    help="Output mode. 'beside' writes alongside the source "
+                         "and leaves originals untouched (default when "
+                         "neither --output nor --in-place is set). 'side' "
+                         "mirrors output into a separate tree (--output). "
+                         "'replace' writes alongside originals and moves "
+                         "the originals into a recycle directory (--in-place).")
 
-    out = op.add_mutually_exclusive_group(required=True)
+    out = op.add_mutually_exclusive_group()
     out.add_argument("--output", type=Path, metavar="DIR",
                      help="Side mode: write new files under DIR mirroring "
-                          "PATH's structure. Originals are untouched. The "
-                          "safest first-time choice.")
+                          "PATH's structure. Originals are untouched.")
     out.add_argument("--in-place", action="store_true",
                      help="Replace mode: write new files alongside originals "
                           "and move the originals into a recycle directory "
-                          "(see --recycle-to). Atomic when source and "
-                          "recycle dir are on the same filesystem.")
+                          "(see --recycle-to).")
 
     op.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
                     help="With --in-place: recycle directory for displaced "
                          "originals. If omitted, an existing @Recycle / "
                          "#recycle / .Trash under PATH is used; otherwise "
                          "<PATH>/.@Recycle is created.")
-    op.add_argument("--auto", action="store_true",
-                    help="Skip per-file confirmation prompts.")
     op.add_argument("--limit", type=int, default=0, metavar="N",
                     help="Process at most N candidates per tier "
                          "(0 = no limit). Useful with --dry-run to preview "
                          "the first encode that would run.")
-    op.add_argument("--quality", type=int, default=None,
-                    help="Override the preset CQ (HD default: 21, "
-                         "UHD default: 15). Lower = better quality + larger.")
+    op.add_argument("--dry-run", action="store_true",
+                    help="Print planned ffmpeg commands and exit. Combine "
+                         "with --limit 1 to preview a single encode.")
+    op.add_argument("--confirm", action="store_true",
+                    help="Prompt per-file before encoding. Overrides the "
+                         "auto-yes default of the bare invocation.")
+    op.add_argument("--cleanup-after", action="store_true",
+                    help="After a successful run, prompt to remove the "
+                         "originals of completed encodes.")
+    op.add_argument("--verbose", "-v", action="store_true")
+
+    # Hidden / advanced flags below — still functional, just not in --help.
+    op.add_argument("--auto", action="store_true",
+                    help=argparse.SUPPRESS)
+    op.add_argument("--workers", type=int, default=8,
+                    help=argparse.SUPPRESS)
     op.add_argument("--keep-langs", default=None,
-                    help="Override languages kept on apply (default: en,und).")
+                    help=argparse.SUPPRESS)
     op.add_argument("--hwaccel",
                     choices=["auto", "qsv", "nvenc", "vaapi",
                              "videotoolbox", "software", "none"],
                     default="auto",
-                    help="Encoder hardware backend (default: auto).")
+                    help=argparse.SUPPRESS)
     hwd = op.add_mutually_exclusive_group()
     hwd.add_argument("--hw-decode", action="store_true", default=None,
-                     help="Force zero-copy QSV decode->encode on both tiers.")
+                     help=argparse.SUPPRESS)
     hwd.add_argument("--no-hw-decode", action="store_false",
                      dest="hw_decode",
-                     help="Force CPU decode->QSV encode on both tiers.")
-    op.add_argument("--skip-scan", action="store_true",
-                    help="Reuse the existing probe cache; skip the scan "
-                         "phase. Fine when PATH hasn't changed since the "
-                         "last optimize/scan run.")
-    op.add_argument("--workers", type=int, default=8,
-                    help="Parallel workers for the scan phase (default: 8).")
-    _add_min_size_arg(op)
-    op.add_argument("--verbose", "-v", action="store_true")
-    _add_common_db_arg(op)
+                     help=argparse.SUPPRESS)
+    op.add_argument("--quality", type=int, default=None,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--min-size", type=_parse_size,
+                    default=MIN_PROBE_SIZE_BYTES,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--bare-invocation", action="store_true", default=False,
+                    help=argparse.SUPPRESS)
 
 
 def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
@@ -364,7 +380,8 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         # Workflow knobs (mirror _add_apply_workflow_args, narrowed).
         p.add_argument("--auto", action="store_true",
                        help="Skip per-file confirmation.")
-        p.add_argument("--mode", choices=["side", "replace"], default="side")
+        p.add_argument("--mode", choices=["beside", "side", "replace"],
+                       default="side")
         p.add_argument("--output-root", type=Path,
                        help="Required for --mode side. Mirrored output tree.")
         p.add_argument("--source-root", type=Path,
@@ -431,6 +448,25 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         _add_common_db_arg(p)
 
 
+def _add_cleanup_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `cleanup` subcommand (forward-declared stub for Task #6)."""
+    cl = sub.add_parser(
+        "cleanup",
+        help="Remove originals of successfully-encoded files from a prior run "
+             "(stub; full implementation lands in Task #6).",
+    )
+    _add_common_db_arg(cl)
+
+
+def _add_wizard_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `wizard` subcommand (forward-declared stub for Task #8)."""
+    wz = sub.add_parser(
+        "wizard",
+        help="Interactive guided run (stub; full implementation lands in Task #8).",
+    )
+    _add_common_db_arg(wz)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all subcommands wired up."""
     p = argparse.ArgumentParser(
@@ -448,6 +484,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_doctor_parser(sub)
     _add_optimize_parser(sub)
     _add_preset_parsers(sub)
+    _add_cleanup_parser(sub)
+    _add_wizard_parser(sub)
     return p
 
 
@@ -740,6 +778,10 @@ def cmd_apply(args: argparse.Namespace) -> int:
     """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
     if args.mode == "side" and not args.output_root:
         print("error: --mode side requires --output-root", file=sys.stderr)
+        return 2
+    if args.mode == "beside" and getattr(args, "output_root", None):
+        print("error: --mode beside is incompatible with --output-root "
+              "(beside writes alongside the source)", file=sys.stderr)
         return 2
     if args.backup and getattr(args, "recycle_to", None):
         print("error: --backup and --recycle-to are mutually exclusive "
@@ -1136,21 +1178,49 @@ def _resolve_recycle_dir(path: Path, override: Path | None) -> Path:
 
 def _optimize_resolve_paths(
     args: argparse.Namespace,
-) -> tuple[bool, Path | None, Path, Path | None] | int:
-    """Return (in_place, output_root, source_root, recycle_to) or an exit code."""
-    in_place = bool(args.in_place)
-    if in_place:
-        return (True, None, args.path,
+) -> tuple[str, Path | None, Path, Path | None] | int:
+    """Return (mode, output_root, source_root, recycle_to) or an exit code.
+
+    mode is one of "beside", "side", "replace". Resolution order:
+    explicit --mode wins; else --in-place → replace; else --output → side;
+    else default to beside.
+    """
+    if args.mode is not None:
+        mode = args.mode
+    elif args.in_place:
+        mode = "replace"
+    elif args.output is not None:
+        mode = "side"
+    else:
+        mode = "beside"
+
+    if mode == "replace":
+        return (mode, None, args.path,
                 _resolve_recycle_dir(args.path, args.recycle_to))
+    if mode == "side":
+        if args.output is None:
+            print("error: --mode side requires --output DIR", file=sys.stderr)
+            return 2
+        if args.recycle_to is not None:
+            print("error: --recycle-to only applies to --mode replace",
+                  file=sys.stderr)
+            return 2
+        return (mode, args.output, args.path, None)
+    # beside
     if args.recycle_to is not None:
-        print("error: --recycle-to only applies to --in-place", file=sys.stderr)
+        print("error: --recycle-to only applies to --mode replace",
+              file=sys.stderr)
         return 2
-    return (False, args.output, args.path, None)
+    if args.output is not None:
+        print("error: --mode beside is incompatible with --output "
+              "(beside writes alongside the source)", file=sys.stderr)
+        return 2
+    return (mode, None, args.path, None)
 
 
 def _optimize_run_apply(
     args: argparse.Namespace,
-    in_place: bool,
+    mode: str,
     output_root: Path | None,
     source_root: Path,
     recycle_to: Path | None,
@@ -1163,7 +1233,7 @@ def _optimize_run_apply(
         preset_ns = argparse.Namespace(
             cmd=preset_name,
             auto=args.auto,
-            mode="replace" if in_place else "side",
+            mode=mode,
             output_root=output_root,
             source_root=source_root,
             backup=None,
@@ -1192,6 +1262,24 @@ def _optimize_run_apply(
     return aggregate_rc
 
 
+def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
+    """Flip auto/mode/verbose defaults when invoked via the bare-path rewrite.
+
+    `--bare-invocation` is a sentinel flag set by `_preprocess_argv` when
+    the user typed `./video_optimizer.py PATH` with no subcommand. We then
+    flip a few defaults so that point-and-shoot UX is point-and-shoot. We
+    only flip values the user didn't explicitly set elsewhere.
+    """
+    if not getattr(args, "bare_invocation", False):
+        return
+    if not args.auto:
+        args.auto = True
+    if args.mode is None and not args.in_place and args.output is None:
+        args.mode = "beside"
+    if not args.verbose:
+        args.verbose = True
+
+
 def cmd_optimize(args: argparse.Namespace) -> int:
     """One-shot scan+plan+apply pipeline using calibrated presets.
 
@@ -1199,6 +1287,13 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     preset's resolution gate (min_height / max_height in PRESETS) keeps
     the two from clobbering each other's queue.
     """
+    _apply_bare_invocation_defaults(args)
+
+    # --confirm is the explicit opt-out from auto-yes; it wins over the
+    # bare-invocation default. (Outside the bare path it's a regular flag.)
+    if getattr(args, "confirm", False):
+        args.auto = False
+
     if not args.path.exists():
         print(f"error: path not found: {args.path}", file=sys.stderr)
         return 2
@@ -1209,29 +1304,31 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     resolved = _optimize_resolve_paths(args)
     if isinstance(resolved, int):
         return resolved
-    in_place, output_root, source_root, recycle_to = resolved
+    mode, output_root, source_root, recycle_to = resolved
 
     print(f"==> optimize: {args.path}")
-    print(f"    output mode: {'replace (in-place)' if in_place else 'side'}")
-    print(f"    recycle to:  {recycle_to}" if in_place
-          else f"    output root: {output_root}")
+    if mode == "beside":
+        print("    output mode: beside (alongside source; originals untouched)")
+    elif mode == "replace":
+        print("    output mode: replace (in-place)")
+        print(f"    recycle to:  {recycle_to}")
+    else:
+        print("    output mode: side (mirrored output tree)")
+        print(f"    output root: {output_root}")
     if args.dry_run:
         print("    DRY RUN (no encodes will run)")
     print()
 
-    if args.skip_scan:
-        print("==> [1/4] scan: skipped (--skip-scan)")
-    else:
-        print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
-        scan_ns = argparse.Namespace(
-            cmd="scan", path=args.path, no_recursive=False,
-            no_probe_cache=False, workers=args.workers,
-            min_size=args.min_size,
-            verbose=args.verbose, db=args.db,
-        )
-        rc = cmd_scan(scan_ns)
-        if rc != 0:
-            return rc
+    print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
+    scan_ns = argparse.Namespace(
+        cmd="scan", path=args.path, no_recursive=False,
+        no_probe_cache=False, workers=args.workers,
+        min_size=args.min_size,
+        verbose=args.verbose, db=args.db,
+    )
+    rc = cmd_scan(scan_ns)
+    if rc != 0:
+        return rc
     print()
 
     print("==> [2/4] plan: evaluating rules against probe cache...")
@@ -1246,7 +1343,9 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return rc
     print()
 
-    return _optimize_run_apply(args, in_place, output_root, source_root, recycle_to)
+    rc = _optimize_run_apply(args, mode, output_root, source_root, recycle_to)
+    # TODO Task #7: invoke cleanup logic when args.cleanup_after
+    return rc
 
 
 def cmd_preset(args: argparse.Namespace) -> int:
@@ -1459,6 +1558,12 @@ def _compute_output_path(pr: ProbeResult, args: argparse.Namespace,
     if args.mode == "replace":
         return src.with_name(new_name)
 
+    if args.mode == "beside":
+        # beside mode: write next to the source; originals stay put. The
+        # collision-safety guarantee comes from --rewrite-codec +
+        # --reencode-tag producing e.g. foo.AV1.REENCODE.mkv from foo.mkv.
+        return src.with_name(new_name)
+
     # side mode: place under --output-root, preserving relative structure.
     if args.source_root:
         try:
@@ -1507,6 +1612,71 @@ def _recycle_destination(src: Path, recycle_to: Path,
         counter += 1
 
 
+def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
+                               args: argparse.Namespace, db: Database,
+                               dec: dict, actual_mb: float) -> str | None:
+    """Run the replace-mode disposal (recycle, backup, unlink original).
+
+    Returns None on success or a status string ("recycled"/"backed-up"/etc.)
+    when the disposal completed without further work; returns the string
+    "done" when the caller should mark the decision and return without
+    additional processing because the helper already wrote a partial-error
+    completion row.
+    """
+    recycle_to = getattr(args, "recycle_to", None)
+    if recycle_to:
+        # Atomic move into recycle-bin instead of copy-then-delete. Wins
+        # over --backup for NAS targets: no doubled disk use, no I/O
+        # cost beyond a directory entry rename when source and target
+        # share a filesystem.
+        dst = _recycle_destination(Path(pr.path), recycle_to,
+                                   getattr(args, "source_root", None))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(pr.path), str(dst))
+        except OSError as e:
+            print(f"    WARN: recycle move failed: {e}; "
+                  f"keeping output and original intact")
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"recycle move failed: {e}")
+            return "done"
+        # Original is now at `dst`; nothing more to delete.
+        return None
+    if args.backup:
+        args.backup.mkdir(parents=True, exist_ok=True)
+        backup_path = args.backup / Path(pr.path).name
+        counter = 1
+        while backup_path.exists():
+            backup_path = args.backup / (
+                f"{Path(pr.path).stem}_backup{counter}{Path(pr.path).suffix}"
+            )
+            counter += 1
+        try:
+            shutil.copy2(pr.path, backup_path)
+        except OSError as e:
+            print(f"    WARN: backup failed: {e}; "
+                  f"keeping output and original intact")
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"backup failed: {e}")
+            return "done"
+    # When --recycle-to is set the move above already removed the
+    # original; otherwise unlink it now (after the optional backup copy).
+    if Path(pr.path) != output_path:
+        try:
+            Path(pr.path).unlink()
+        except OSError as e:
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"original not removed: {e}")
+            return "done"
+    return None
+
+
 def _finalize_output(pr: ProbeResult, output_path: Path,
                      args: argparse.Namespace, db: Database,
                      dec: dict) -> float:
@@ -1517,58 +1687,20 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
         out_size = 0
     actual_mb = (pr.size - out_size) / (1024 * 1024)
 
-    if args.mode == "replace":
-        recycle_to = getattr(args, "recycle_to", None)
-        if recycle_to:
-            # Atomic move into recycle-bin instead of copy-then-delete. Wins
-            # over --backup for NAS targets: no doubled disk use, no I/O
-            # cost beyond a directory entry rename when source and target
-            # share a filesystem.
-            dst = _recycle_destination(Path(pr.path), recycle_to,
-                                       getattr(args, "source_root", None))
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.move(str(pr.path), str(dst))
-            except OSError as e:
-                print(f"    WARN: recycle move failed: {e}; "
-                      f"keeping output and original intact")
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"recycle move failed: {e}")
-                return actual_mb
-            # Original is now at `dst`; nothing more to delete.
-        elif args.backup:
-            args.backup.mkdir(parents=True, exist_ok=True)
-            backup_path = args.backup / Path(pr.path).name
-            counter = 1
-            while backup_path.exists():
-                backup_path = args.backup / (
-                    f"{Path(pr.path).stem}_backup{counter}{Path(pr.path).suffix}"
-                )
-                counter += 1
-            try:
-                shutil.copy2(pr.path, backup_path)
-            except OSError as e:
-                print(f"    WARN: backup failed: {e}; "
-                      f"keeping output and original intact")
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"backup failed: {e}")
-                return actual_mb
+    if args.mode == "beside":
+        # beside mode never touches the original — the whole point is that
+        # the user (or a follow-up cleanup step) decides when to delete
+        # them. Skip every disposal branch and record the success.
+        db.mark_decision(dec["id"], "completed",
+                         output_path=str(output_path),
+                         actual_savings_mb=actual_mb)
+        return actual_mb
 
-        # When --recycle-to is set the move above already removed the
-        # original; otherwise unlink it now (after the optional backup copy).
-        if not recycle_to and Path(pr.path) != output_path:
-            try:
-                Path(pr.path).unlink()
-            except OSError as e:
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"original not removed: {e}")
-                return actual_mb
+    if args.mode == "replace":
+        outcome = _finalize_replace_disposal(pr, output_path, args, db,
+                                             dec, actual_mb)
+        if outcome == "done":
+            return actual_mb
 
     db.mark_decision(dec["id"], "completed",
                      output_path=str(output_path),
@@ -1584,6 +1716,51 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
 _FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
     "scan", "reprobe", "apply", "list-encoders", "optimize",
 })
+
+
+# Single source of truth for argv preprocessing (see main()). Includes
+# forward-declared subcommands (cleanup, wizard) so the dispatch logic
+# doesn't need re-editing when their full handlers land.
+KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
+    "scan", "reprobe", "plan", "apply", "status",
+    "list-encoders", "replace-list", "doctor",
+    "optimize", "cleanup", "wizard",
+}) | frozenset(PRESETS.keys())
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Stub for the cleanup subcommand (full implementation in Task #6)."""
+    print("cleanup not yet implemented")
+    return 0
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Stub for the wizard subcommand (full implementation in Task #8)."""
+    print("wizard not yet implemented")
+    return 0
+
+
+def _preprocess_argv(argv: list[str]) -> list[str]:
+    """Rewrite a bare `<path>` invocation to `optimize <path> --bare-invocation`.
+
+    Predicate, evaluated in order (first match wins):
+      - argv has zero positional args  → no rewrite (top-level help).
+      - argv[1] is -h / --help         → no rewrite.
+      - argv[1] starts with `-`        → no rewrite (let argparse handle).
+      - argv[1] is a known subcommand  → no rewrite.
+      - otherwise                      → rewrite to optimize-with-sentinel.
+    """
+    if len(argv) <= 1:
+        return argv
+    first = argv[1]
+    if first in {"-h", "--help"}:
+        return argv
+    if first.startswith("-"):
+        return argv
+    if first in KNOWN_SUBCOMMANDS:
+        return argv
+    # Preserve argv[0] (prog name) so the caller's argv[1:] slice still works.
+    return [argv[0], "optimize", first, *argv[2:], "--bare-invocation"]
 
 
 def _assert_external_tools_available(cmd: str) -> None:
@@ -1608,8 +1785,11 @@ def _assert_external_tools_available(cmd: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Dispatches to the chosen subcommand handler."""
+    if argv is None:
+        argv = sys.argv
+    argv = _preprocess_argv(argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv[1:])
     _assert_external_tools_available(args.cmd)
 
     handlers = {
@@ -1622,6 +1802,8 @@ def main(argv: list[str] | None = None) -> int:
         "replace-list": cmd_replace_list,
         "doctor": cmd_doctor,
         "optimize": cmd_optimize,
+        "cleanup": cmd_cleanup,
+        "wizard": cmd_wizard,
     }
     # Preset subcommands all dispatch to the same wrapper.
     for preset_name in PRESETS:
