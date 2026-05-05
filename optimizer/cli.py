@@ -454,12 +454,24 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
 
 
 def _add_cleanup_parser(sub: "argparse._SubParsersAction") -> None:
-    """Register the `cleanup` subcommand (forward-declared stub for Task #6)."""
+    """Register the `cleanup` subcommand for removing post-encode originals.
+
+    Defaults to a dry-run listing keyed on the most-recent run with at
+    least one completed decision. `--apply` actually unlinks the source
+    files, gated by a 3-check guard (output exists, non-empty, distinct
+    from source) applied per-decision in `cmd_cleanup`.
+    """
     cl = sub.add_parser(
         "cleanup",
-        help="Remove originals of successfully-encoded files from a prior run "
-             "(stub; full implementation lands in Task #6).",
+        help="Remove originals of successfully-encoded files from a prior run.",
     )
+    cl.add_argument("--run", type=int, default=None, metavar="N",
+                    help="Target a specific run id. If omitted, the most "
+                         "recent run with at least one completed decision "
+                         "is used.")
+    cl.add_argument("--apply", action="store_true",
+                    help="Actually remove the originals. Without this flag, "
+                         "cleanup prints a dry-run listing and exits.")
     _add_common_db_arg(cl)
 
 
@@ -1316,6 +1328,27 @@ def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
         args.verbose = True
 
 
+def _print_optimize_banner(
+    args: argparse.Namespace,
+    mode: str,
+    output_root: Path | None,
+    recycle_to: Path | None,
+) -> None:
+    """Print the `==> optimize:` header for a `cmd_optimize` run."""
+    print(f"==> optimize: {args.path}")
+    if mode == "beside":
+        print("    output mode: beside (alongside source; originals untouched)")
+    elif mode == "replace":
+        print("    output mode: replace (in-place)")
+        print(f"    recycle to:  {recycle_to}")
+    else:
+        print("    output mode: side (mirrored output tree)")
+        print(f"    output root: {output_root}")
+    if args.dry_run:
+        print("    DRY RUN (no encodes will run)")
+    print()
+
+
 def cmd_optimize(args: argparse.Namespace) -> int:
     """One-shot scan+plan+apply pipeline using calibrated presets.
 
@@ -1342,18 +1375,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return resolved
     mode, output_root, source_root, recycle_to = resolved
 
-    print(f"==> optimize: {args.path}")
-    if mode == "beside":
-        print("    output mode: beside (alongside source; originals untouched)")
-    elif mode == "replace":
-        print("    output mode: replace (in-place)")
-        print(f"    recycle to:  {recycle_to}")
-    else:
-        print("    output mode: side (mirrored output tree)")
-        print(f"    output root: {output_root}")
-    if args.dry_run:
-        print("    DRY RUN (no encodes will run)")
-    print()
+    _print_optimize_banner(args, mode, output_root, recycle_to)
 
     print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
     scan_ns = argparse.Namespace(
@@ -1380,8 +1402,58 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     print()
 
     rc = _optimize_run_apply(args, mode, output_root, source_root, recycle_to)
-    # TODO Task #7: invoke cleanup logic when args.cleanup_after
+    if rc == 0 and getattr(args, "cleanup_after", False):
+        _invoke_cleanup_after(args)
     return rc
+
+
+def _invoke_cleanup_after(args: argparse.Namespace) -> None:
+    """Chain `cmd_cleanup --apply` after a successful optimize run.
+
+    Called when `--cleanup-after` is set and the apply phase returned 0.
+    Resolves the target run id (most-recent run with completions) so
+    the user-facing confirmation prompt can name it. Under `--auto`
+    (which the bare invocation flips on) we skip the prompt — the user
+    opted into chained cleanup already. Otherwise we ask once; on
+    anything other than `y` we print the equivalent `cleanup` command
+    so the user can run it deliberately later.
+    """
+    with Database(args.db) as db:
+        target_run = db.latest_run_with_completions()
+    if target_run is None:
+        print("--cleanup-after: no completed encodes to clean up.")
+        return
+
+    # Count completions just so the prompt is informative.
+    with Database(args.db) as db:
+        decisions = [
+            d for d in db.decisions_for_run(target_run)
+            if d.get("status") == "completed"
+        ]
+    n = len(decisions)
+
+    if not args.auto:
+        try:
+            ans = input(
+                f"Run --cleanup-after will permanently delete {n} originals "
+                f"from run #{target_run}. Continue? [y/N]: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = ""
+        if not ans.startswith("y"):
+            print(f"skipped cleanup; run "
+                  f"'./video_optimizer.py cleanup --run {target_run} --apply' "
+                  f"later if you change your mind")
+            return
+
+    cleanup_ns = argparse.Namespace(
+        cmd="cleanup",
+        run=None,
+        apply=True,
+        db=args.db,
+    )
+    cmd_cleanup(cleanup_ns)
 
 
 def cmd_preset(args: argparse.Namespace) -> int:
@@ -1797,10 +1869,142 @@ KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
 }) | frozenset(PRESETS.keys())
 
 
-def cmd_cleanup(args: argparse.Namespace) -> int:  # noqa: ARG001
-    """Stub for the cleanup subcommand (full implementation in Task #6)."""
-    print("cleanup not yet implemented")
-    return 0
+def _classify_cleanup_decision(dec: dict) -> tuple[str, int, str | None]:
+    """Apply the cleanup 3-check guard to one completed decision.
+
+    Returns ``(source_path, size_bytes, reason_or_None)``. A non-None
+    reason means the decision is **not** cleanable and should be
+    reported as SKIP; size_bytes is meaningful only when reason is None.
+
+    The 3-check guard:
+      (a) decisions.output_path exists on disk,
+      (b) output is non-empty (stat().st_size > 0),
+      (c) output_path != source_path (paranoid; beside mode makes them
+          siblings, not the same).
+    Plus a sanity check that the source still exists — a no-op cleanup
+    on a vanished source is silent noise we'd rather log explicitly.
+    """
+    source_path = dec.get("path") or ""
+    output_path = dec.get("output_path") or ""
+
+    if not output_path:
+        return source_path, 0, "no output_path recorded"
+    # Guard (c) first — paranoid same-path check.
+    if output_path == source_path:
+        return source_path, 0, "output_path == source_path"
+    out = Path(output_path)
+    # Guard (a) — output must exist.
+    if not out.exists():
+        return source_path, 0, f"output missing: {output_path}"
+    # Guard (b) — non-empty.
+    try:
+        out_size = out.stat().st_size
+    except OSError as e:
+        return source_path, 0, f"stat failed: {e}"
+    if out_size <= 0:
+        return source_path, 0, "output zero-byte"
+
+    src = Path(source_path)
+    if not src.exists():
+        return source_path, 0, "source already removed"
+    try:
+        src_size = src.stat().st_size
+    except OSError as e:
+        return source_path, 0, f"source stat failed: {e}"
+    return source_path, src_size, None
+
+
+def _cleanup_apply_unlinks(cleanable: list[tuple[str, int]]) -> tuple[int, int]:
+    """Unlink each cleanable source. Returns (removed_count, freed_bytes)."""
+    removed = 0
+    freed_bytes = 0
+    for source_path, sz in cleanable:
+        try:
+            Path(source_path).unlink()
+        except OSError as e:
+            print(f"warning: could not remove {source_path}: {e}",
+                  file=sys.stderr)
+            continue
+        removed += 1
+        freed_bytes += sz
+    return removed, freed_bytes
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """Remove originals of successfully-encoded files from a prior run.
+
+    Default mode is dry-run: print which originals *would* be removed,
+    sized. `--apply` actually `unlink()`s the source files in Python
+    (not via shell `rm`) after the 3-check guard in
+    `_classify_cleanup_decision`. Skipped sources are reported as SKIP
+    and never unlinked. Frames the work in a `start_run`/`end_run`
+    pair so `runs` captures the audit trail.
+    """
+    with Database(args.db) as db:
+        run_id = args.run
+        if run_id is None:
+            run_id = db.latest_run_with_completions()
+        if run_id is None:
+            print("no completed encodes in run None "
+                  "(or no run found); nothing to clean up")
+            return 0
+
+        cleanup_run_id = db.start_run(
+            "cleanup", None,
+            {"target_run": run_id, "apply": bool(args.apply)},
+        )
+        decisions = [
+            d for d in db.decisions_for_run(run_id)
+            if d.get("status") == "completed"
+        ]
+        if not decisions:
+            print(f"no completed encodes in run {run_id} "
+                  f"(or no run found); nothing to clean up")
+            db.end_run(cleanup_run_id,
+                       {"target_run": run_id, "removed": 0,
+                        "freed_bytes": 0, "skipped": 0})
+            return 0
+
+        cleanable: list[tuple[str, int]] = []
+        skipped: list[tuple[str, str]] = []
+        for dec in decisions:
+            source_path, sz, reason = _classify_cleanup_decision(dec)
+            if reason is None:
+                cleanable.append((source_path, sz))
+            else:
+                skipped.append((source_path, reason))
+
+        for source_path, reason in skipped:
+            print(f"SKIP {reason}  {source_path}")
+
+        if not args.apply:
+            total_bytes = sum(sz for _, sz in cleanable)
+            for source_path, sz in cleanable:
+                print(f"would remove  {_format_bytes(sz)}  {source_path}")
+            print(
+                f"summary: {len(cleanable)} cleanable, "
+                f"{_format_bytes(total_bytes)} total. "
+                f"Re-run with --apply to actually remove."
+            )
+            db.end_run(cleanup_run_id, {
+                "target_run": run_id,
+                "cleanable": len(cleanable),
+                "skipped": len(skipped),
+                "freed_bytes": 0,
+                "dry_run": True,
+            })
+            return 0
+
+        removed, freed_bytes = _cleanup_apply_unlinks(cleanable)
+        print(f"removed {removed} originals, "
+              f"freed {_format_bytes(freed_bytes)}")
+        db.end_run(cleanup_run_id, {
+            "target_run": run_id,
+            "removed": removed,
+            "freed_bytes": freed_bytes,
+            "skipped": len(skipped),
+        })
+        return 0
 
 
 def cmd_wizard(args: argparse.Namespace) -> int:  # noqa: ARG001

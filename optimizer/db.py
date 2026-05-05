@@ -318,3 +318,19 @@ class Database:
             (limit,),
         )
         return [dict(row) for row in cur]
+
+    def latest_run_with_completions(self) -> int | None:
+        """Return the id of the most recent run with ≥1 completed decision.
+
+        Used by `cmd_cleanup` to default `--run` when the caller omits it.
+        Returns None if no run has any rows in `decisions` with
+        `status='completed'`.
+        """
+        row = self.conn.execute(
+            "SELECT r.id FROM runs r "
+            "JOIN decisions d ON d.run_id = r.id "
+            "WHERE d.status = 'completed' "
+            "GROUP BY r.id "
+            "ORDER BY r.started_at DESC LIMIT 1"
+        ).fetchone()
+        return int(row["id"]) if row else None
