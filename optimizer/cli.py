@@ -151,6 +151,11 @@ def _add_apply_parser(sub: "argparse._SubParsersAction") -> None:
     _add_apply_encoding_args(ap)
     _add_apply_naming_args(ap)
     ap.add_argument("--verbose", "-v", action="store_true")
+    # Suppress the post-run report. Hidden in --help; this is for users with
+    # piped output / cron contexts who genuinely don't want the summary or
+    # the persisted ~/.video_optimizer/reports/run-N.txt file.
+    ap.add_argument("--no-report", action="store_true",
+                    help=argparse.SUPPRESS)
     _add_common_db_arg(ap)
 
 
@@ -700,6 +705,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 rules_fired=[v.rule for v in cand.fired if not _is_advisory(v.rule)],
                 target=cand.target,
                 projected_savings_mb=cand.total_projected_savings_mb,
+                run_id=run_id,
             )
             candidates.append(cand)
         pruned = counts["missing"]
@@ -774,8 +780,8 @@ def _prefilter_resolution_gate(db: Database, pending: list[dict],
     return eligible
 
 
-def cmd_apply(args: argparse.Namespace) -> int:
-    """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
+def _validate_apply_args(args: argparse.Namespace) -> int:
+    """Pre-flight checks for cmd_apply. Returns 0 on ok, nonzero exit code."""
     if args.mode == "side" and not args.output_root:
         print("error: --mode side requires --output-root", file=sys.stderr)
         return 2
@@ -793,11 +799,24 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 2
     if not _confirm_hard_delete_if_needed(args):
         return 2
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
+    rc = _validate_apply_args(args)
+    if rc != 0:
+        return rc
 
     keep_langs = [s.strip() for s in args.keep_langs.split(",") if s.strip()]
 
     with Database(args.db) as db:
         run_id = db.start_run("apply", None, _args_dict(args))
+        # Stashed on the namespace so downstream helpers (_apply_one,
+        # _execute_encode, _finalize_output) can stamp every mark_decision
+        # with the apply run id without growing every signature. The
+        # post-run report (`_emit_run_report`) keys on this run id.
+        args._apply_run_id = run_id  # noqa: SLF001
         pending = db.list_pending_decisions()
         pending = _prefilter_resolution_gate(db, pending, args)
 
@@ -809,16 +828,19 @@ def cmd_apply(args: argparse.Namespace) -> int:
             db.end_run(run_id, {"applied": 0})
             return 0
 
-        counts = {"applied": 0, "skipped": 0, "failed": 0, "deferred": 0}
+        counts = {"applied": 0, "skipped": 0, "failed": 0,
+                  "deferred": 0, "dry_run": 0}
         bytes_saved = 0
         for i, dec in enumerate(pending, 1):
             status, saved = _apply_one(db, dec, args, keep_langs, i, len(pending))
-            # Only count terminal statuses; "dry_run" is a no-op for counters.
+            # Count every terminal/observable status so the report knows
+            # whether ≥1 decision was processed (dry_run included).
             if status in counts:
                 counts[status] += 1
             bytes_saved += saved
 
-        summary = {**counts, "approx_bytes_saved": bytes_saved}
+        summary = {k: v for k, v in counts.items() if k != "dry_run"}
+        summary["approx_bytes_saved"] = bytes_saved
         db.end_run(run_id, summary)
         deferred_note = (f", {counts['deferred']} deferred (resolution gate)"
                          if counts["deferred"] else "")
@@ -826,17 +848,24 @@ def cmd_apply(args: argparse.Namespace) -> int:
               f"{counts['skipped']} skipped, {counts['failed']} failed"
               f"{deferred_note}; "
               f"~{_format_bytes(bytes_saved)} saved")
+
+        touched = (counts["applied"] + counts["skipped"] + counts["failed"]
+                   + counts["dry_run"])
+        if touched and not getattr(args, "no_report", False):
+            _emit_run_report(db, run_id)
     return 0
 
 
 def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
                keep_langs: list[str], idx: int, total: int) -> tuple[str, int]:
     """Process a single pending decision. Returns (status, bytes_saved)."""
+    run_id = getattr(args, "_apply_run_id", None)
     pr = _load_probe_for_decision(db, dec)
     if pr is None:
         print(f"[{idx}/{total}] {dec['path']}: probe missing, skipping")
         db.mark_decision(dec["id"], "skipped",
-                         error="probe missing in cache (rerun scan)")
+                         error="probe missing in cache (rerun scan)",
+                         run_id=run_id)
         return "skipped", 0
 
     # Defense in depth: catch sources that disappeared between plan and
@@ -846,7 +875,8 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     if not Path(pr.path).exists():
         print(f"[{idx}/{total}] {pr.path}: source no longer exists, skipping")
         db.mark_decision(dec["id"], "skipped",
-                         error="source no longer exists at apply time")
+                         error="source no longer exists at apply time",
+                         run_id=run_id)
         return "skipped", 0
 
     _print_decision_header(dec, pr, idx, total)
@@ -874,7 +904,8 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
 
     if not args.auto and not args.dry_run:
         if not _confirm("    encode this file? [y/N/q]: "):
-            db.mark_decision(dec["id"], "skipped", error="user declined")
+            db.mark_decision(dec["id"], "skipped", error="user declined",
+                             run_id=run_id)
             return "skipped", 0
 
     target = dec["target"]
@@ -885,7 +916,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         enc_name = encoder.select_encoder(target, args.hwaccel)
     except RuntimeError as e:
         print(f"    FAIL: {e}")
-        db.mark_decision(dec["id"], "failed", error=str(e))
+        db.mark_decision(dec["id"], "failed", error=str(e), run_id=run_id)
         return "failed", 0
 
     cmd, desc = _build_apply_command(dec, pr, output_path, target_container,
@@ -894,6 +925,10 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     if args.dry_run:
         print(f"    DRY RUN ({desc}) → {output_path}")
         print("    " + " ".join(cmd))
+        # Stamp the apply run on the row so the post-run report finds it.
+        # Status stays 'pending' — re-running apply without --dry-run should
+        # still process the row.
+        db.stamp_decision_run(dec["id"], run_id)
         return "dry_run", 0
 
     label = f"[{idx}/{total}] {Path(pr.path).name}: "
@@ -952,7 +987,8 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                 output_path.unlink()
             except OSError:
                 pass
-        db.mark_decision(dec["id"], "failed", error=err[:1000])
+        db.mark_decision(dec["id"], "failed", error=err[:1000],
+                         run_id=getattr(args, "_apply_run_id", None))
         return "failed", 0
 
     actual_mb = _finalize_output(pr, output_path, args, db, dec)
@@ -1440,6 +1476,32 @@ def cmd_replace_list(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+_REPORT_DIR = Path.home() / ".video_optimizer" / "reports"
+
+
+def _emit_run_report(db: Database, run_id: int) -> None:
+    """Print + persist the post-apply report keyed on `run_id`.
+
+    Stdout always happens; persistence is best-effort and falls back to a
+    one-line stderr warning if `~/.video_optimizer/reports/` isn't writable
+    (read-only home, OSError on mkdir, etc.).
+    """
+    decisions = db.decisions_for_run(run_id)
+    runs_row = db.get_run(run_id) or {"id": run_id}
+    if not decisions:
+        return
+    stdout_text, persist_text = report.format_run_report(decisions, runs_row)
+    print()
+    print(stdout_text)
+
+    try:
+        _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = _REPORT_DIR / f"run-{run_id}.txt"
+        report_path.write_text(persist_text)
+    except OSError as e:
+        print(f"warning: could not persist run report: {e}", file=sys.stderr)
+
+
 def _format_bytes(n: int) -> str:
     """Adaptive byte formatter: bytes / KB / MB / GB / TB."""
     n_abs = abs(n)
@@ -1614,7 +1676,8 @@ def _recycle_destination(src: Path, recycle_to: Path,
 
 def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
                                args: argparse.Namespace, db: Database,
-                               dec: dict, actual_mb: float) -> str | None:
+                               dec: dict, actual_mb: float,
+                               run_id: int | None) -> str | None:
     """Run the replace-mode disposal (recycle, backup, unlink original).
 
     Returns None on success or a status string ("recycled"/"backed-up"/etc.)
@@ -1640,7 +1703,8 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
             db.mark_decision(dec["id"], "completed",
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
-                             error=f"recycle move failed: {e}")
+                             error=f"recycle move failed: {e}",
+                             run_id=run_id)
             return "done"
         # Original is now at `dst`; nothing more to delete.
         return None
@@ -1661,7 +1725,8 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
             db.mark_decision(dec["id"], "completed",
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
-                             error=f"backup failed: {e}")
+                             error=f"backup failed: {e}",
+                             run_id=run_id)
             return "done"
     # When --recycle-to is set the move above already removed the
     # original; otherwise unlink it now (after the optional backup copy).
@@ -1672,7 +1737,8 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
             db.mark_decision(dec["id"], "completed",
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
-                             error=f"original not removed: {e}")
+                             error=f"original not removed: {e}",
+                             run_id=run_id)
             return "done"
     return None
 
@@ -1681,6 +1747,7 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
                      args: argparse.Namespace, db: Database,
                      dec: dict) -> float:
     """Compute savings, run backup-or-recycle + remove-original, update db."""
+    run_id = getattr(args, "_apply_run_id", None)
     try:
         out_size = output_path.stat().st_size
     except OSError:
@@ -1693,18 +1760,20 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
         # them. Skip every disposal branch and record the success.
         db.mark_decision(dec["id"], "completed",
                          output_path=str(output_path),
-                         actual_savings_mb=actual_mb)
+                         actual_savings_mb=actual_mb,
+                         run_id=run_id)
         return actual_mb
 
     if args.mode == "replace":
         outcome = _finalize_replace_disposal(pr, output_path, args, db,
-                                             dec, actual_mb)
+                                             dec, actual_mb, run_id)
         if outcome == "done":
             return actual_mb
 
     db.mark_decision(dec["id"], "completed",
                      output_path=str(output_path),
-                     actual_savings_mb=actual_mb)
+                     actual_savings_mb=actual_mb,
+                     run_id=run_id)
     return actual_mb
 
 
