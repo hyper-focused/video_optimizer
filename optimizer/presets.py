@@ -10,6 +10,8 @@ Layout:
                            look_ahead_depth + GOP. (No maxrate/bufsize on
                            purpose — see comment below the table.)
   - AV1_QSV_BASE         — av1_qsv flags shared across tiers.
+  - MIN_PROBE_SIZE_BYTES — scan-time minimum file size; smaller files
+                           are recorded as skipped and never probed.
   - BITRATE_FLAG_TABLE   — rules engine's per-resolution
                            (target_mbps, flag_above_mbps) thresholds.
 
@@ -116,6 +118,18 @@ AV1_QSV_BASE: dict[str, str] = {
     "profile": "main",
 }
 
+
+# --------------------------------------------------------------------------- #
+# Probe-time size gate (consumed by cli._scan_walk_phase)
+# --------------------------------------------------------------------------- #
+
+# Files smaller than this are recorded in the `skipped_files` table at
+# scan time and never ffprobe'd or rule-evaluated. Filters out trailers,
+# extras, and sample files (Plex / Jellyfin download these into movie
+# folders) where the projected savings don't justify the encode.
+# Override per run with `scan --min-size <N>` (accepts `1G`, `500M`, `0`).
+# `0` disables the gate entirely.
+MIN_PROBE_SIZE_BYTES: int = 1024 ** 3   # 1 GB
 
 # --------------------------------------------------------------------------- #
 # Bitrate flag table (consumed by rules.OverBitratedRule)

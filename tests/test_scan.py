@@ -44,13 +44,15 @@ def _stub_probe(path: Path) -> ProbeResult:
 
 
 def _make_args(path: Path, db_path: Path, *, workers: int | None = None,
-               verbose: bool = False) -> argparse.Namespace:
+               verbose: bool = False,
+               min_size: int = 0) -> argparse.Namespace:
     return argparse.Namespace(
         path=path,
         db=db_path,
         no_recursive=False,
         no_probe_cache=False,
         workers=workers,
+        min_size=min_size,
         verbose=verbose,
         cmd="scan",
     )

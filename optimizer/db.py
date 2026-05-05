@@ -47,8 +47,17 @@ CREATE TABLE IF NOT EXISTS runs (
     summary_json  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS skipped_files (
+    path           TEXT PRIMARY KEY,
+    size           INTEGER NOT NULL,
+    mtime          REAL    NOT NULL,
+    reason         TEXT    NOT NULL,
+    last_seen_at   REAL    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
 CREATE INDEX IF NOT EXISTS idx_decisions_path   ON decisions(path);
+CREATE INDEX IF NOT EXISTS idx_skipped_reason   ON skipped_files(reason);
 """
 
 
@@ -107,6 +116,54 @@ class Database:
         cur = self.conn.execute("SELECT probe_json FROM files")
         for row in cur:
             yield models.probe_from_json(row["probe_json"])
+
+    # ---- size-skip cache ----------------------------------------------------
+
+    def record_size_skip(self, path: str, size: int, mtime: float,
+                         reason: str = "below_min_size") -> None:
+        """Mark `path` as skipped at scan time so it's not re-probed.
+
+        Also evicts any existing probe-cache row for the same path: a file
+        that fell below the threshold should no longer satisfy plan-time
+        rule evaluation.
+        """
+        self.conn.execute(
+            "INSERT INTO skipped_files (path, size, mtime, reason, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET "
+            "size=excluded.size, mtime=excluded.mtime, "
+            "reason=excluded.reason, last_seen_at=excluded.last_seen_at",
+            (path, size, mtime, reason, time.time()),
+        )
+        # If this path was previously above the threshold and probed, drop
+        # the stale probe row + any decisions that referenced it. Decisions
+        # have an FK back to files; delete them first.
+        self.conn.execute("DELETE FROM decisions WHERE path = ?", (path,))
+        self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+        self.conn.commit()
+
+    def clear_size_skip(self, path: str) -> bool:
+        """Remove the skip row for `path`. Returns True iff a row was deleted.
+
+        Called when a file that was previously below the threshold is now
+        above it (file grew, or threshold lowered) — caller will then
+        queue it for ffprobe via the normal scan path.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM skipped_files WHERE path = ?", (path,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def is_size_skipped(self, path: str) -> bool:
+        """Return True iff there's a skipped_files row for `path`."""
+        row = self.conn.execute(
+            "SELECT 1 FROM skipped_files WHERE path = ?", (path,)).fetchone()
+        return row is not None
+
+    def count_size_skipped(self) -> int:
+        """Return the number of files currently in the skip cache."""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM skipped_files").fetchone()[0]
 
     # ---- decisions ----------------------------------------------------------
 

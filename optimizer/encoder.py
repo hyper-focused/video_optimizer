@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -80,6 +81,19 @@ _IMAGE_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"
 _ENCODER_CACHE: set[str] | None = None
 
 
+REQUIRED_TOOLS: tuple[str, ...] = ("ffmpeg", "ffprobe")
+
+
+def check_external_tools() -> dict[str, str | None]:
+    """Return {tool: absolute_path_or_None} for the ffmpeg/ffprobe binaries.
+
+    A None value means the tool isn't on PATH. Used by the CLI for early
+    preflight so users hit a clear error rather than a confusing
+    FileNotFoundError deep inside scan or apply.
+    """
+    return {tool: shutil.which(tool) for tool in REQUIRED_TOOLS}
+
+
 def get_available_encoders() -> set[str]:
     """Return cached set of ffmpeg encoder names parsed from `ffmpeg -encoders`."""
     global _ENCODER_CACHE
@@ -122,8 +136,11 @@ def select_encoder(target: str, hwaccel: str = "auto") -> str:
             return enc
 
     raise RuntimeError(
-        f"No usable encoder for target={target} hwaccel={hwaccel}. "
-        f"Tried {candidates}. Available: {sorted(available)}"
+        f"No usable encoder for target={target} hwaccel={hwaccel}.\n"
+        f"  tried: {candidates}\n"
+        f"  available on this system: {sorted(available)}\n"
+        f"  run `./video_optimizer.py doctor` to diagnose, or "
+        f"`./video_optimizer.py list-encoders` for the full encoder list."
     )
 
 

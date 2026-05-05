@@ -51,6 +51,122 @@ why.
       etc. (11,168 rows of garbage gone, ~85 % of the cache).
       Test coverage: `tests/test_crawler.py`.
 
+- [ ] **Post-stall source-corruption probe + actionable error message**
+      (`optimizer/cli.py:_apply_one`, `optimizer/cli.py:cmd_replace_list`).
+      The current stall path records `error='encoder stalled — no
+      progress for 300s (out_time=Xs, frame=N)'` and the operator-facing
+      `replace-list` says "consider replacing with a different release"
+      with no explanation of *why* the source is bad.
+
+      Investigation in v0.6.1 found that the three "head scratcher"
+      stall candidates (Indiana Jones - Last Crusade, Guardians of the
+      Galaxy, Avengers Infinity War) all have source-side bitstream
+      corruption that the qsv hardware H.264/HEVC decoder honestly
+      refuses to handle: corrupt SPS (`sps_id 1 out of range`),
+      DTS-HD MA decode failures with concealed h264 macroblock errors,
+      and non-monotonic DTS timestamps respectively. CPU-side decode
+      (libavcodec h264) is permissive — interpolates over missing
+      macroblocks and corrects timestamps — which is why the same
+      source completed under av1_vaapi (CPU decode → GPU encode path)
+      but stalled under av1_qsv (zero-copy GPU pipeline). VAAPI
+      "succeeding" means producing output with concealed corruption,
+      so it's not a viable fallback — just a different failure mode.
+
+      Approach: on watchdog stall, before recording the failure, fire
+      a quick `ffmpeg -v error -i SRC -t 60 -c copy -f null /dev/null`
+      probe (cheap — copies packets, no decode). Capture the first
+      stderr line and store it in `decisions.error` alongside the
+      stall message:
+
+        `encoder stalled — no progress for 300s
+         (out_time=Xs, frame=N); source corruption detected: <line>`
+
+      `replace-list` then surfaces the corruption signature in its
+      output, so the user can tell "broken release, grab a different
+      one" apart from "qsv driver bug, try --hwaccel vaapi" (the
+      latter is rare-to-nonexistent on our current evidence, but
+      keeping the phrasing distinguishable is useful).
+
+      Caveat: this is post-stall-only — we don't want a 60-second
+      probe on every encode. And the probe itself can spuriously
+      report "noise" on technically-valid sources (some warnings are
+      benign), so the error string should be presented as a hint,
+      not a diagnosis. Probably also gate this behind `--verbose` or
+      a dedicated flag if the noise rate turns out to be high in
+      practice.
+
+- [ ] **`--rescue-mode` opt-in for irreplaceable corrupt sources**
+      (probably `optimizer/cli.py` apply path + a small `encoder.py`
+      branch). Companion to the post-stall corruption-probe TODO above:
+      that one *identifies* damaged sources; this one gives the user
+      an explicit escape hatch for the case where they can't replace
+      the source.
+
+      Motivating use case: someone's only copy of a wedding video lives
+      on a failing hard disk. The file decodes with concealed macroblock
+      errors. The current pipeline (qsv stall → two-strikes auto-skip →
+      "go grab a different release" message) is correct for the typical
+      pirated-Blu-ray case but actively unhelpful when the user has no
+      alternative source. We'd rather give them a recoverable AV1 file
+      with a few seconds of macroblock smear than refuse to encode.
+
+      The v0.6.1 VAAPI experiment confirmed the path works: SW H.264
+      decode + av1_vaapi encode completed Indiana Jones - Last Crusade
+      end-to-end despite source-side DTS-HD MA decode failures and
+      h264 macroblock errors that consistently wedged the qsv hardware
+      decoder. Output played the full 2h6m53s; corrupted regions were
+      silently interpolated by libavcodec's concealment, exactly the
+      behavior we want here.
+
+      Approach (sketched, not committed):
+      1. **New `rescue PATH` subcommand, single-file only.** Takes
+         exactly one file path (positional, no recursion, errors out if
+         given a directory). Does its own probe → encode → finalize for
+         the one file without ever touching the pending-decisions queue
+         that drives `apply` / `optimize`. Keeping it as a separate
+         subcommand — rather than a `--rescue-mode` flag on `apply` /
+         `optimize` — is deliberate: the workaround silently produces
+         output with concealed source corruption, and that's exactly
+         the kind of behavior you don't want to risk leaking into a
+         batch run. By construction, `rescue` can only apply to one
+         file at a time and the user has to invoke it deliberately per
+         file.
+      2. **Forces lenient-decode pipeline**: `--hwaccel software`
+         (libavcodec, the most permissive — interpolates over corrupt
+         macroblocks and corrects timestamps) decoding into either
+         `av1_vaapi` or `libsvtav1` for encode. QSV path is explicitly
+         disallowed for `rescue` because the qsv hardware decoder is
+         what wedges on this content in the first place. Stall
+         watchdog is disabled for the rescue subcommand — a slow
+         concealing decode on a heavily-damaged source can look like
+         a stall.
+      3. **Explicit warning + confirmation** at start: "RESCUE MODE:
+         source decode errors will be silently concealed; output may
+         contain macroblock corruption in damaged regions. Inspect the
+         result before relying on it." Interactively requires a typed
+         `y` to proceed; with `--auto` requires a `--confirm-rescue`
+         token so it can't trip from a stray flag in a script.
+      4. **Tag the resulting `decisions` row with `status='rescued'`**
+         (distinct from 'completed') so it surfaces separately in
+         `status` / `replace-list` outputs — the user will want to
+         re-evaluate these manually rather than treating them as
+         done-done. Also bypasses the two-strikes auto-skip for the
+         specific path being rescued (the whole point is overriding it).
+      5. **Optional sidecar**: `.rescue.txt` next to the output with
+         the ffmpeg stderr concealment lines (frame counts, offsets)
+         so the user knows where to look when reviewing the result.
+
+      Caveat / non-goals:
+      - **Never expose this as a flag on `apply` / `optimize` /
+        presets.** Single-file `rescue` subcommand only. The single-file
+        constraint is a load-bearing safety property, not a UX choice.
+      - Don't make rescue the default for any preset.
+      - Don't try to estimate "how corrupt is too corrupt" — let the
+        user decide after seeing the output.
+      - Don't try to reconstruct the missing data; libavcodec's
+        concealment is good enough and we're not in the business of
+        error-correction-coded video reconstruction.
+
 - [ ] **DB schema migration framework** (`optimizer/db.py`). Schema is
       created idempotently on every connect via `executescript(_SCHEMA)`,
       which only handles `CREATE TABLE IF NOT EXISTS`. Adding a column
