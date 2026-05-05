@@ -18,7 +18,7 @@ from typing import Any
 from . import crawler, encoder, naming, probe, report, rules
 from .db import DEFAULT_DB_PATH, Database
 from .models import ProbeResult, probe_from_dict
-from .presets import MIN_PROBE_SIZE_BYTES, PRESETS
+from .presets import EST_SECONDS_PER_FILE, MIN_PROBE_SIZE_BYTES, PRESETS
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
 
@@ -2007,23 +2007,338 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         return 0
 
 
-def cmd_wizard(args: argparse.Namespace) -> int:  # noqa: ARG001
-    """Stub for the wizard subcommand (full implementation in Task #8)."""
-    print("wizard not yet implemented")
+class _WizardAbort(Exception):
+    """Raised by `_prompt` on Ctrl-C / EOF to unwind cmd_wizard cleanly.
+
+    The outer try/except in `cmd_wizard` translates this into a single-line
+    "aborted" message + sys.exit(130), so the user never sees a traceback
+    just for closing the terminal mid-prompt.
+    """
+
+
+def _prompt(prompt: str, default: str | None = None,
+            choices: list[str] | None = None) -> str:
+    """input() wrapper used by the wizard. Tests patch builtins.input.
+
+    `default`: returned verbatim if the user just presses Enter.
+    `choices`: lowercased; the user's answer (lowercased) must match one
+    of them. On no-match, re-prompt with a "please choose: <list>" hint
+    (no retry cap — the user keeps typing until they pick one).
+
+    KeyboardInterrupt / EOFError are caught and re-raised as `_WizardAbort`
+    so the outer wizard loop can convert them into a clean exit-130.
+    """
+    if choices is not None:
+        lowered = [c.lower() for c in choices]
+    else:
+        lowered = None
+    while True:
+        try:
+            answer = input(prompt)
+        except (KeyboardInterrupt, EOFError) as exc:
+            raise _WizardAbort from exc
+        answer = answer.strip()
+        if not answer and default is not None:
+            return default
+        if lowered is not None:
+            if answer.lower() in lowered:
+                return answer.lower()
+            print(f"  please choose: {', '.join(choices or [])}")
+            continue
+        return answer
+
+
+def _wizard_estimate_seconds(decisions: list[dict],
+                             db: Database) -> tuple[int, int, int]:
+    """Return (uhd_count, hd_count, total_estimated_seconds) for `decisions`.
+
+    Each decision's height is read from its cached probe; tier is decided
+    against PRESETS' min_height/max_height bounds. Files that don't fit
+    any tier (e.g. 480p) contribute zero estimated seconds but are still
+    counted under HD for the user-facing summary (they ride the hd-archive
+    queue if anything).
+    """
+    uhd_count = 0
+    hd_count = 0
+    total_seconds = 0
+    uhd_min = PRESETS["uhd-archive"].get("min_height", 1440) or 1440
+    for dec in decisions:
+        pr = _load_probe_for_decision(db, dec)
+        height = pr.height if pr is not None else 0
+        if height and height >= uhd_min:
+            uhd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("uhd-archive", 0)
+        else:
+            hd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("hd-archive", 0)
+    return uhd_count, hd_count, total_seconds
+
+
+def _format_hours(seconds: int) -> str:
+    """Render a wall-clock estimate as ~Nh / ~Nm. Used by the wizard summary."""
+    if seconds <= 0:
+        return "~0m"
+    if seconds < 3600:
+        return f"~{max(1, seconds // 60)}m"
+    hours = seconds / 3600.0
+    if hours < 10:
+        return f"~{hours:.1f}h"
+    return f"~{int(round(hours))}h"
+
+
+def _wizard_pick_path(args: argparse.Namespace) -> Path | None:  # noqa: ARG001
+    """Prompt for the library path. Returns None if user gave an empty answer
+    (treated as a clean exit), or a validated Path. Re-prompts up to 3 times
+    on invalid paths before giving up via `_WizardAbort`."""
+    for _ in range(3):
+        raw = _prompt("Path to the directory you want to optimize: ",
+                      default="")
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        if candidate.is_dir():
+            return candidate
+        print(f"  not a directory: {candidate}")
+    print("  too many invalid paths; aborting", file=sys.stderr)
+    raise _WizardAbort
+
+
+def _wizard_pick_mode(
+    args: argparse.Namespace,  # noqa: ARG001
+    library: Path,
+) -> tuple[str, Path | None, Path | None]:
+    """Prompt for the output mode. Returns (mode, output_root, recycle_to)."""
+    print()
+    print("Where should the encoded files go?")
+    print("  [1] Next to the originals (originals untouched)              [default]")
+    print("  [2] Mirror into a separate output directory")
+    print("  [3] Replace originals (move them to a recycle directory)")
+    choice = _prompt("Choice [1]: ", default="1", choices=["1", "2", "3"])
+    if choice == "1":
+        return ("beside", None, None)
+    if choice == "2":
+        raw = _prompt("  Output directory: ", default="")
+        if not raw:
+            print("  no output directory given; aborting", file=sys.stderr)
+            raise _WizardAbort
+        return ("side", Path(raw).expanduser(), None)
+    # choice == "3"
+    raw = _prompt("  Recycle directory (blank = auto-detect under library): ",
+                  default="")
+    recycle_to = Path(raw).expanduser() if raw else None
+    return ("replace", None, recycle_to or _resolve_recycle_dir(library, None))
+
+
+def _wizard_apply_namespace(
+    args: argparse.Namespace,
+    library: Path,
+    mode: str,
+    output_root: Path | None,
+    recycle_to: Path | None,
+    limit: int,
+) -> argparse.Namespace:
+    """Build the Namespace cmd_optimize hands to its preset router.
+
+    Mirrors `_optimize_run_apply`'s shape (which is the proven recipe for
+    chaining the UHD + HD presets through one queue) but lets the wizard
+    inject its own `limit` and `mode`-derived paths.
+    """
+    return argparse.Namespace(
+        path=library,
+        auto=True,
+        mode=mode,
+        output=output_root,
+        in_place=(mode == "replace"),
+        recycle_to=recycle_to,
+        limit=limit,
+        dry_run=False,
+        confirm=False,
+        cleanup_after=False,
+        verbose=True,
+        workers=8,
+        keep_langs=None,
+        hwaccel="auto",
+        hw_decode=None,
+        quality=None,
+        min_size=MIN_PROBE_SIZE_BYTES,
+        db=args.db,
+        bare_invocation=False,
+    )
+
+
+def _wizard_doctor_preflight(args: argparse.Namespace) -> bool:
+    """Run cmd_doctor; return True iff the wizard should proceed."""
+    print("==> doctor: preflight checks")
+    doctor_ns = argparse.Namespace(probe=None, db=args.db)
+    rc = cmd_doctor(doctor_ns)
+    if rc == 0:
+        return True
+    ans = _prompt("doctor reported issues. continue anyway? [y/N]: ",
+                  default="n", choices=["y", "n"])
+    return ans == "y"
+
+
+def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
+    """Run scan + plan against `library`. Returns 0 on success, nonzero else."""
+    print()
+    print(f"==> scan: probing {library}")
+    scan_ns = argparse.Namespace(
+        cmd="scan", path=library, no_recursive=False,
+        no_probe_cache=False, workers=None,
+        min_size=MIN_PROBE_SIZE_BYTES,
+        verbose=False, db=args.db,
+    )
+    if cmd_scan(scan_ns) != 0:
+        print("scan failed; aborting", file=sys.stderr)
+        return 1
+    print()
+    print("==> plan: evaluating rules")
+    plan_ns = argparse.Namespace(
+        cmd="plan", rules=None, target="av1+mkv", json=False,
+        keep_langs="en,und", allow_reencoded=False, db=args.db,
+    )
+    if cmd_plan(plan_ns) != 0:
+        print("plan failed; aborting", file=sys.stderr)
+        return 1
     return 0
+
+
+def _wizard_pick_limit(pending: list[dict], db: Database) -> int | None:
+    """Print the plan summary and ask how many files to encode.
+
+    Returns the limit (0 == all), or None if the user chose to quit.
+    """
+    uhd, hd, est_seconds = _wizard_estimate_seconds(pending, db)
+    uhd_hours = _format_hours(uhd * EST_SECONDS_PER_FILE["uhd-archive"])
+    hd_hours = _format_hours(hd * EST_SECONDS_PER_FILE["hd-archive"])
+    print()
+    print(f"Found {len(pending)} candidate(s): "
+          f"{uhd} UHD ({uhd_hours}), {hd} HD ({hd_hours})")
+    print(f"Estimated total time: {_format_hours(est_seconds)} on "
+          "Intel Battlemage iGPU; your hardware may vary.")
+    print()
+    print("Encode all of them, or just the first N?")
+    print("  [a] All of them                                              "
+          "[default]")
+    print("  [n] First N (you'll be asked how many)")
+    print("  [q] Quit without encoding")
+    choice = _prompt("Choice [a]: ", default="a", choices=["a", "n", "q"])
+    if choice == "q":
+        return None
+    if choice == "a":
+        return 0
+    while True:
+        raw = _prompt("How many? ", default="")
+        try:
+            limit = int(raw)
+        except ValueError:
+            print("  please enter an integer")
+            continue
+        if limit <= 0:
+            print("  please enter a positive integer")
+            continue
+        return limit
+
+
+def _wizard_run_cleanup_prompt(args: argparse.Namespace) -> None:
+    """After apply, offer to remove originals if ≥1 file was encoded."""
+    with Database(args.db) as db:
+        recent = db.recent_runs(limit=1)
+    encoded = 0
+    saved_bytes = 0
+    if recent and recent[0].get("summary_json"):
+        try:
+            summary = json.loads(recent[0]["summary_json"])
+        except (TypeError, ValueError):
+            summary = {}
+        encoded = int(summary.get("applied", 0) or 0)
+        saved_bytes = int(summary.get("approx_bytes_saved", 0) or 0)
+    if encoded < 1:
+        return
+    print()
+    print(f"Run complete. {encoded} original(s) can be removed "
+          f"(saved {_format_bytes(saved_bytes)} total).")
+    ans = _prompt("Remove the originals now? [y/N]: ",
+                  default="n", choices=["y", "n"])
+    if ans == "y":
+        cmd_cleanup(argparse.Namespace(run=None, apply=True, db=args.db))
+    else:
+        print("keep 'em. Run "
+              "'./video_optimizer.py cleanup --run M --apply' "
+              "later when you're ready.")
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:
+    """Interactive prompt-based workflow.
+
+    Composes `cmd_doctor`, `cmd_scan`, `cmd_plan`, `cmd_optimize` (which
+    itself routes through `cmd_preset` → `cmd_apply`), and `cmd_cleanup`.
+    No new business logic — this is purely a Q&A surface for users who
+    don't want to read --help. See plan §6 / "Wizard prompt sequence".
+    """
+    try:
+        if not _wizard_doctor_preflight(args):
+            return 0
+        print()
+
+        library = _wizard_pick_path(args)
+        if library is None:
+            return 0
+
+        mode, output_root, recycle_to = _wizard_pick_mode(args, library)
+
+        rc = _wizard_run_scan_plan(args, library)
+        if rc != 0:
+            return rc
+
+        with Database(args.db) as db:
+            pending = db.list_pending_decisions()
+            if not pending:
+                print()
+                print("no candidates found. nothing to do.")
+                return 0
+            limit = _wizard_pick_limit(pending, db)
+        if limit is None:
+            return 0
+
+        print()
+        if _prompt("Proceed? [Y/n]: ",
+                   default="y", choices=["y", "n"]) != "y":
+            return 0
+
+        apply_ns = _wizard_apply_namespace(
+            args, library, mode, output_root, recycle_to, limit,
+        )
+    except (KeyboardInterrupt, EOFError, _WizardAbort):
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
+    rc = cmd_optimize(apply_ns)
+    try:
+        _wizard_run_cleanup_prompt(args)
+    except (KeyboardInterrupt, EOFError, _WizardAbort):
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
+    return rc
 
 
 def _preprocess_argv(argv: list[str]) -> list[str]:
     """Rewrite a bare `<path>` invocation to `optimize <path> --bare-invocation`.
 
     Predicate, evaluated in order (first match wins):
-      - argv has zero positional args  → no rewrite (top-level help).
+      - argv has zero positional args + stdin/stdout TTY → rewrite to wizard.
+      - argv has zero positional args (no TTY) → no rewrite (top-level help).
       - argv[1] is -h / --help         → no rewrite.
       - argv[1] starts with `-`        → no rewrite (let argparse handle).
       - argv[1] is a known subcommand  → no rewrite.
       - otherwise                      → rewrite to optimize-with-sentinel.
     """
     if len(argv) <= 1:
+        # Bare invocation with no args. If we're attached to a real terminal
+        # on both ends, drop into the interactive wizard; otherwise fall
+        # through to argparse's "subcommand required" error / top-level help
+        # so cron / piped contexts stay non-interactive.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return [argv[0], "wizard"]
         return argv
     first = argv[1]
     if first in {"-h", "--help"}:
