@@ -73,6 +73,33 @@ PRESETS: dict[str, dict[str, object]] = {
 
 
 # --------------------------------------------------------------------------- #
+# Per-tier wall-clock estimate per file (consumed by the wizard's plan summary)
+# --------------------------------------------------------------------------- #
+
+# Estimated wall-clock seconds to encode a single representative file in
+# each tier. Calibrated for the developer's hardware: Intel Battlemage
+# iGPU with QSV hw decode + av1_qsv encode, ffmpeg 7.x.
+#
+#   hd-archive:  ~15 min/file  — 1080p Blu-ray remux at ~220 fps
+#   uhd-archive: ~1 hour/file  — 2160p HDR Blu-ray remux at ~40–55 fps
+#
+# Older Intel iGPUs (Tiger Lake / Alder Lake), NVENC, VAAPI, or the
+# software fallback (libsvtav1) will land elsewhere — sometimes by an
+# order of magnitude. The wizard's plan summary should always print a
+# one-line caveat alongside any total it derives from these numbers
+# (something like: "based on Intel Battlemage; your hardware may vary").
+#
+# Single source of truth: if hardware throughput shifts materially
+# (driver update, new silicon, encoder retune), update the values here.
+# The wizard reads this dict — don't duplicate the numbers anywhere else.
+
+EST_SECONDS_PER_FILE: dict[str, int] = {
+    "hd-archive": 900,    # ~15 min — 1080p remux, Battlemage iGPU @ ~220 fps
+    "uhd-archive": 3600,  # ~1 hour — 2160p HDR remux, Battlemage iGPU @ ~40–55 fps
+}
+
+
+# --------------------------------------------------------------------------- #
 # av1_qsv per-tier tuning (consumed by encoder._qsv_args)
 # --------------------------------------------------------------------------- #
 
