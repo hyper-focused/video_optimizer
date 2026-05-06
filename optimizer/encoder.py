@@ -247,13 +247,17 @@ def build_dv_p7_extract_command(probe: ProbeResult) -> list[str]:
 def build_dv_p7_convert_command(p8_hevc_path: Path) -> list[str]:
     """Return dovi_tool argv: read HEVC on stdin, write P8 HEVC to file.
 
-    Mode 2 (`-m 2`) flattens Profile 7 (BL+EL+RPU) to Profile 8.1
-    (BL+RPU) by discarding the enhancement layer. The resulting HEVC
-    bitstream still carries DV RPU; the strip stage runs after this
-    on the re-muxed MKV to produce clean HDR10.
+    `--discard` drops the enhancement layer, flattening Profile 7
+    (BL+EL+RPU) to Profile 8.1 (BL+RPU). The resulting HEVC bitstream
+    still carries DV RPU; the strip stage runs after this on the
+    re-muxed MKV to produce clean HDR10.
+
+    Note: dovi_tool 2.x replaced the older `-m 2` mode flag with the
+    explicit `--discard`. The 1.x mode-flag form will fail with
+    "unexpected argument '-m'" on the newer CLI.
     """
     return [
-        "dovi_tool", "convert", "-m", "2",
+        "dovi_tool", "convert", "--discard",
         "-i", "-",
         "-o", str(p8_hevc_path),
     ]
