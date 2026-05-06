@@ -120,32 +120,45 @@ class OverBitratedRule(Rule):
 # --------------------------------------------------------------------------- #
 
 
+def _codec_set_verdict(probe: ProbeResult, name: str, *,
+                       codec_set: frozenset[str], savings_frac: float,
+                       severity: str, reason: str,
+                       height_band: tuple[int, int] | None = None,
+                       ) -> RuleVerdict:
+    """Shared evaluator for codec-membership rules. ``reason`` may use {codec}.
+    ``height_band=(low, high)`` gates on probe height in [low, high)."""
+    codec = (probe.video_codec or "").lower()
+    if codec not in codec_set:
+        return _miss(name)
+    h = probe.height or 0
+    if height_band and not (height_band[0] <= h < height_band[1]):
+        return _miss(name)
+    notes = {"codec": codec, "height": h} if height_band else {"codec": codec}
+    return RuleVerdict(
+        rule=name, fired=True, severity=severity,
+        reason=reason.format(codec=codec),
+        projected_savings_mb=max((probe.size or 0) * savings_frac / _MB, 0.0),
+        notes=notes,
+    )
+
+
 class LegacyCodecRule(Rule):
-    """Flag files using legacy/obsolete video codecs."""
+    """Flag files using legacy/obsolete video codecs (MPEG-2, VC-1, WMV, ...)."""
 
     name = "legacy_codec"
     advisory = False
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        """Fire when the source codec is on the legacy list (MPEG-2, VC-1, WMV, ...)."""
-        codec = (probe.video_codec or "").lower()
-        if codec not in _LEGACY_CODECS:
-            return _miss(self.name)
-
-        savings_mb = max((probe.size or 0) * 0.5 / _MB, 0.0)
-        reason = f"legacy codec {codec!r}; modern encode typically halves size"
-        return RuleVerdict(
-            rule=self.name,
-            fired=True,
-            reason=reason,
-            severity="high",
-            projected_savings_mb=savings_mb,
-            notes={"codec": codec},
+        return _codec_set_verdict(
+            probe, self.name,
+            codec_set=_LEGACY_CODECS,
+            savings_frac=0.5, severity="high",
+            reason="legacy codec {codec!r}; modern encode typically halves size",
         )
 
 
 # --------------------------------------------------------------------------- #
-# ContainerMigrationRule
+# InefficientCodecRule / ContainerMigrationRule
 # --------------------------------------------------------------------------- #
 
 
@@ -163,25 +176,14 @@ class InefficientCodecRule(Rule):
 
     name = "inefficient_codec"
     advisory = False
-    _HD_MIN_HEIGHT = 720
-    _UHD_MIN_HEIGHT = 1440
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        """Fire when an inefficient codec is sitting in the HD band."""
-        codec = (probe.video_codec or "").lower()
-        if codec not in _INEFFICIENT_CODECS:
-            return _miss(self.name)
-        height = probe.height or 0
-        if height < self._HD_MIN_HEIGHT or height >= self._UHD_MIN_HEIGHT:
-            return _miss(self.name)
-        savings_mb = max((probe.size or 0) * 0.30 / _MB, 0.0)
-        return RuleVerdict(
-            rule=self.name,
-            fired=True,
-            reason=f"{codec} at HD; AV1 transcode (CQ-preserved quality)",
-            severity="medium",
-            projected_savings_mb=savings_mb,
-            notes={"codec": codec, "height": height},
+        return _codec_set_verdict(
+            probe, self.name,
+            codec_set=_INEFFICIENT_CODECS,
+            savings_frac=0.30, severity="medium",
+            reason="{codec} at HD; AV1 transcode (CQ-preserved quality)",
+            height_band=(720, 1440),
         )
 
 
