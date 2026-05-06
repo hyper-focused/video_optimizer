@@ -20,6 +20,7 @@ from optimizer.cli import _plan_probe_gate, _should_apply_denoise
 from optimizer.db import Database
 from optimizer.rules import (
     InefficientCodecRule,
+    SdNonAv1Rule,
     UhdNonAv1Rule,
 )
 from tests._fixtures import make_probe
@@ -110,7 +111,41 @@ class UhdNonAv1RuleTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Plan-gate AV1 + SD skips
+# SdNonAv1Rule (any non-AV1 at SD)
+# --------------------------------------------------------------------------- #
+
+
+class SdNonAv1RuleTests(unittest.TestCase):
+    """SD non-AV1 fires; AV1 SD never fires; HD/UHD heights never fire."""
+
+    def setUp(self):
+        self.rule = SdNonAv1Rule()
+
+    def test_h264_at_480p_fires(self):
+        v = self.rule.evaluate(make_probe(codec="h264", height=480))
+        self.assertTrue(v.fired)
+        self.assertGreater(v.projected_savings_mb, 0)
+
+    def test_mpeg2_at_576p_fires(self):
+        v = self.rule.evaluate(make_probe(codec="mpeg2video", height=576))
+        self.assertTrue(v.fired)
+
+    def test_av1_at_480p_does_not_fire(self):
+        v = self.rule.evaluate(make_probe(codec="av1", height=480))
+        self.assertFalse(v.fired)
+
+    def test_h264_at_720p_does_not_fire(self):
+        # 720p is the HD floor; SdNonAv1 must stop short of it.
+        v = self.rule.evaluate(make_probe(codec="h264", height=720))
+        self.assertFalse(v.fired)
+
+    def test_h264_at_1080p_does_not_fire(self):
+        v = self.rule.evaluate(make_probe(codec="h264", height=1080))
+        self.assertFalse(v.fired)
+
+
+# --------------------------------------------------------------------------- #
+# Plan-gate AV1 + extras skips
 # --------------------------------------------------------------------------- #
 
 
@@ -159,36 +194,59 @@ class PlanGateAv1Tests(_GateTestBase):
 
 
 class PlanGateSdTests(_GateTestBase):
-    def test_sd_source_skipped_by_default(self):
+    """SD content is now first-class: admitted at the plan gate, processed
+    by the SdNonAv1Rule (or the SD preset, depending on the entry point)."""
+
+    def test_sd_admitted_to_rules(self):
         with Database(self.db_path) as db:
             self.assertEqual(
                 _plan_probe_gate(db, self._probe(height=480)),
-                "sd_source",
-            )
-
-    def test_sd_admitted_with_override(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(height=480),
-                                 allow_sd=True),
                 "ok",
             )
 
-    def test_720p_is_not_sd(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(height=720)),
-                "ok",
-            )
-
-    def test_av1_skip_takes_precedence_over_sd_skip(self):
-        # An SD AV1 source should report "av1_source" (the higher-
-        # information skip — AV1 means it's already optimised, even at
-        # SD), not "sd_source".
+    def test_av1_skip_takes_precedence_at_sd(self):
+        # An SD AV1 source should still report "av1_source" (already at
+        # the target codec, regardless of resolution).
         with Database(self.db_path) as db:
             self.assertEqual(
                 _plan_probe_gate(db, self._probe(codec="av1", height=480)),
                 "av1_source",
+            )
+
+
+class PlanGateExtrasTests(_GateTestBase):
+    """Extras-suffixed filenames (e.g. `Movie-trailer.mp4`) are skipped."""
+
+    def _probe_extras(self, name="Movie-trailer.mkv", **kwargs):
+        # Override the path to a file with an extras suffix.
+        extras_path = self.fake_file.parent / name
+        extras_path.write_bytes(b"x")
+        kwargs.setdefault("codec", "h264")
+        kwargs.setdefault("height", 1080)
+        p = make_probe(**kwargs)
+        p.path = str(extras_path)
+        return p
+
+    def test_trailer_suffix_skipped_by_default(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(db, self._probe_extras("Movie-trailer.mkv")),
+                "extras",
+            )
+
+    def test_extras_admitted_with_override(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(db, self._probe_extras("Movie-trailer.mkv"),
+                                 allow_extras=True),
+                "ok",
+            )
+
+    def test_non_extras_filename_unaffected(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(db, self._probe_extras("Movie.mkv")),
+                "ok",
             )
 
 

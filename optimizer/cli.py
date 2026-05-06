@@ -103,6 +103,11 @@ def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
                         "ffprobe is I/O-bound, so workers >> NFS server's "
                         "concurrent-read ceiling don't help.")
     _add_min_size_arg(s)
+    s.add_argument("--allow-extras", action="store_true",
+                   help="Include Plex-style extras (Trailers, Behind The "
+                        "Scenes, Featurettes, files with -trailer/-bts/etc. "
+                        "suffixes). Default: skip them — a library-scale "
+                        "tool shouldn't burn GPU time on add-ons.")
     s.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(s)
 
@@ -118,6 +123,8 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     r.add_argument("--workers", type=int, default=None,
                    help="Parallel ffprobe workers (default: min(8, CPU count)).")
     _add_min_size_arg(r)
+    r.add_argument("--allow-extras", action="store_true",
+                   help="Include Plex-style extras during the re-probe walk.")
     r.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(r)
 
@@ -146,11 +153,11 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                     help="Re-queue AV1 sources. Default behavior is to skip "
                          "AV1 entirely (it's already at the target codec; "
                          "re-encoding is wasteful and quality-lossy).")
-    pl.add_argument("--allow-sd", action="store_true",
-                    help="Re-queue sub-720p (SD) sources. Default behavior "
-                         "is to skip them (the modern AV1 tier targets HD "
-                         "and UHD; SD content rarely benefits and may "
-                         "actually grow).")
+    pl.add_argument("--allow-extras", action="store_true",
+                    help="Re-queue files matching Plex extras suffixes "
+                         "(`-trailer`, `-bts`, `-deleted`, …). Default "
+                         "skips them; the crawler also filters extras "
+                         "directories at walk time.")
     _add_common_db_arg(pl)
 
 
@@ -403,7 +410,7 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
                     help=argparse.SUPPRESS)
     op.add_argument("--allow-av1", action="store_true",
                     help=argparse.SUPPRESS)
-    op.add_argument("--allow-sd", action="store_true",
+    op.add_argument("--allow-extras", action="store_true",
                     help=argparse.SUPPRESS)
     op.add_argument("--bare-invocation", action="store_true", default=False,
                     help=argparse.SUPPRESS)
@@ -581,9 +588,11 @@ def _scan_walk_phase(args: argparse.Namespace, db: Database, force: bool,
     skip row cleared and fall through to the normal cache-or-probe path.
     """
     min_size = max(0, getattr(args, "min_size", MIN_PROBE_SIZE_BYTES))
+    skip_extras = not bool(getattr(args, "allow_extras", False))
     seen = cached = size_skipped = errors = 0
     uncached: list[Path] = []
-    for fp in crawler.crawl(args.path, recursive=not args.no_recursive):
+    for fp in crawler.crawl(args.path, recursive=not args.no_recursive,
+                            skip_extras=skip_extras):
         seen += 1
         try:
             st = fp.stat()
@@ -697,7 +706,7 @@ def _is_reencoded_filename(path: str) -> bool:
 def _plan_probe_gate(db: Database, pr,
                      *, allow_reencoded: bool = False,
                      allow_av1: bool = False,
-                     allow_sd: bool = False) -> str:
+                     allow_extras: bool = False) -> str:
     """Pre-rule filter for one probe.
 
     Returns one of:
@@ -712,10 +721,14 @@ def _plan_probe_gate(db: Database, pr,
       "av1_source" — source codec is AV1; re-encoding is wasteful by
                      default. Caller can pass allow_av1=True to override
                      (`plan --allow-av1`).
-      "sd_source"  — height < 720; SD content is skipped by default.
-                     Caller can pass allow_sd=True to override
-                     (`plan --allow-sd`).
-      "ok"         — admit to rule evaluation.
+      "extras"     — filename matches a Plex-style extras suffix
+                     (`-trailer`, `-bts`, etc.). Defensive: the crawler
+                     normally filters these at walk time, but a probe
+                     cache populated before extras filtering existed
+                     could surface them here. allow_extras=True overrides.
+      "ok"         — admit to rule evaluation. SD content (height < 720)
+                     is admitted; the per-tier presets pick which band
+                     they want.
     """
     if not Path(pr.path).exists():
         # Decisions FK back to files with default RESTRICT; delete
@@ -736,8 +749,8 @@ def _plan_probe_gate(db: Database, pr,
         return "reencoded"
     if not allow_av1 and (pr.video_codec or "").lower() == "av1":
         return "av1_source"
-    if not allow_sd and (pr.height or 0) < 720:
-        return "sd_source"
+    if not allow_extras and crawler.is_extras_filename(Path(pr.path)):
+        return "extras"
     return "ok"
 
 
@@ -753,8 +766,8 @@ _PLAN_SKIP_MESSAGES = (
     ("av1_source", "skipped {n} AV1 sources "
                    "(already at the target codec; pass --allow-av1 "
                    "to re-encode anyway)"),
-    ("sd_source",  "skipped {n} sub-720p sources "
-                   "(SD content is excluded by default; pass --allow-sd "
+    ("extras",     "skipped {n} extras "
+                   "(trailers / BTS / featurettes; pass --allow-extras "
                    "to include them)"),
 )
 
@@ -778,19 +791,19 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     allow_reencoded = bool(getattr(args, "allow_reencoded", False))
     allow_av1 = bool(getattr(args, "allow_av1", False))
-    allow_sd = bool(getattr(args, "allow_sd", False))
+    allow_extras = bool(getattr(args, "allow_extras", False))
     with Database(args.db) as db:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
         counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
-                  "av1_source": 0, "sd_source": 0}
+                  "av1_source": 0, "extras": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
             verdict = _plan_probe_gate(
                 db, pr, allow_reencoded=allow_reencoded,
-                allow_av1=allow_av1, allow_sd=allow_sd)
+                allow_av1=allow_av1, allow_extras=allow_extras)
             if verdict != "ok":
                 counts[verdict] += 1
                 continue
@@ -823,7 +836,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                    "dv_blocked": counts["dv"],
                    "reencoded_blocked": counts["reencoded"],
                    "av1_blocked": counts["av1_source"],
-                   "sd_blocked": counts["sd_source"]}
+                   "extras_blocked": counts["extras"]}
         db.end_run(run_id, summary)
     return 0
 
@@ -967,7 +980,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     _print_decision_header(dec, pr, idx, total)
 
     # Resolution gate: defer (leave pending) if outside the requested band.
-    # Used by hd-archive to skip UHD candidates and uhd-archive to skip HD.
+    # Used by HD/SD to skip UHD candidates and UHD to skip HD/SD, etc.
     min_h = getattr(args, "min_height", None)
     max_h = getattr(args, "max_height", None)
     if min_h is not None and pr.height < min_h:
@@ -1403,7 +1416,7 @@ def _optimize_run_apply(
     recycle_to: Path | None,
 ) -> int:
     aggregate_rc = 0
-    presets_to_run = ("uhd-archive", "hd-archive")
+    presets_to_run = ("UHD", "HD", "SD")
     for step, preset_name in enumerate(presets_to_run, start=3):
         cfg = PRESETS[preset_name]
         print(f"==> [{step}/4] apply: {preset_name} ({cfg['label']})")
@@ -1526,7 +1539,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         keep_langs=args.keep_langs or "en,und",
         allow_reencoded=False,
         allow_av1=getattr(args, "allow_av1", False),
-        allow_sd=getattr(args, "allow_sd", False),
+        allow_extras=getattr(args, "allow_extras", False),
         db=args.db,
     )
     rc = cmd_plan(plan_ns)
@@ -2182,29 +2195,29 @@ def _prompt(prompt: str, default: str | None = None,
 
 
 def _wizard_estimate_seconds(decisions: list[dict],
-                             db: Database) -> tuple[int, int, int]:
-    """Return (uhd_count, hd_count, total_estimated_seconds) for `decisions`.
+                             db: Database) -> tuple[int, int, int, int]:
+    """Return (uhd, hd, sd, total_estimated_seconds) for `decisions`.
 
-    Each decision's height is read from its cached probe; tier is decided
-    against PRESETS' min_height/max_height bounds. Files that don't fit
-    any tier (e.g. 480p) contribute zero estimated seconds but are still
-    counted under HD for the user-facing summary (they ride the hd-archive
-    queue if anything).
+    Tier is decided by probe height against the SD/HD/UHD preset bounds
+    (UHD ≥ 1440, HD 720..1439, SD < 720). Each tier's count multiplies
+    its `EST_SECONDS_PER_FILE` entry into the total estimate.
     """
-    uhd_count = 0
-    hd_count = 0
-    total_seconds = 0
-    uhd_min = PRESETS["uhd-archive"].get("min_height", 1440) or 1440
+    uhd_count = hd_count = sd_count = total_seconds = 0
+    uhd_min = PRESETS["UHD"].get("min_height", 1440) or 1440
+    hd_min = PRESETS["HD"].get("min_height", 720) or 720
     for dec in decisions:
         pr = _load_probe_for_decision(db, dec)
         height = pr.height if pr is not None else 0
-        if height and height >= uhd_min:
+        if height >= uhd_min:
             uhd_count += 1
-            total_seconds += EST_SECONDS_PER_FILE.get("uhd-archive", 0)
-        else:
+            total_seconds += EST_SECONDS_PER_FILE.get("UHD", 0)
+        elif height >= hd_min:
             hd_count += 1
-            total_seconds += EST_SECONDS_PER_FILE.get("hd-archive", 0)
-    return uhd_count, hd_count, total_seconds
+            total_seconds += EST_SECONDS_PER_FILE.get("HD", 0)
+        else:
+            sd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("SD", 0)
+    return uhd_count, hd_count, sd_count, total_seconds
 
 
 def _format_hours(seconds: int) -> str:
@@ -2329,7 +2342,7 @@ def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
     plan_ns = argparse.Namespace(
         cmd="plan", rules=None, target="av1+mkv", json=False,
         keep_langs="en,und", allow_reencoded=False,
-        allow_av1=False, allow_sd=False,
+        allow_av1=False, allow_extras=False,
         db=args.db,
     )
     if cmd_plan(plan_ns) != 0:
@@ -2343,12 +2356,14 @@ def _wizard_pick_limit(pending: list[dict], db: Database) -> int | None:
 
     Returns the limit (0 == all), or None if the user chose to quit.
     """
-    uhd, hd, est_seconds = _wizard_estimate_seconds(pending, db)
-    uhd_hours = _format_hours(uhd * EST_SECONDS_PER_FILE["uhd-archive"])
-    hd_hours = _format_hours(hd * EST_SECONDS_PER_FILE["hd-archive"])
+    uhd, hd, sd, est_seconds = _wizard_estimate_seconds(pending, db)
+    uhd_hours = _format_hours(uhd * EST_SECONDS_PER_FILE["UHD"])
+    hd_hours = _format_hours(hd * EST_SECONDS_PER_FILE["HD"])
+    sd_hours = _format_hours(sd * EST_SECONDS_PER_FILE["SD"])
     print()
     print(f"Found {len(pending)} candidate(s): "
-          f"{uhd} UHD ({uhd_hours}), {hd} HD ({hd_hours})")
+          f"{uhd} UHD ({uhd_hours}), {hd} HD ({hd_hours}), "
+          f"{sd} SD ({sd_hours})")
     print(f"Estimated total time: {_format_hours(est_seconds)} on "
           "Intel Battlemage iGPU; your hardware may vary.")
     print()

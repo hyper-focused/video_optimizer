@@ -80,10 +80,10 @@ class PreprocessArgvKnownSubcommandTest(unittest.TestCase):
         )
 
     def test_preset_subcommand_unchanged(self) -> None:
-        # Presets share the dispatcher — `hd-archive` is a subcommand too.
+        # Presets share the dispatcher — `HD` is a subcommand too.
         self.assertEqual(
-            _preprocess_argv(["bin", "hd-archive", "--mode", "beside"]),
-            ["bin", "hd-archive", "--mode", "beside"],
+            _preprocess_argv(["bin", "HD", "--mode", "beside"]),
+            ["bin", "HD", "--mode", "beside"],
         )
 
 
@@ -128,11 +128,12 @@ class KnownSubcommandsRegistryTest(unittest.TestCase):
         missing = set(PRESETS.keys()) - set(KNOWN_SUBCOMMANDS)
         self.assertFalse(missing, f"missing preset subcommands: {missing}")
 
-    def test_currently_includes_hd_and_uhd_archive(self) -> None:
+    def test_currently_includes_sd_hd_uhd(self) -> None:
         # Sanity check on the current preset set — if these go away or
         # rename, _preprocess_argv's dispatch table needs review too.
-        self.assertIn("hd-archive", KNOWN_SUBCOMMANDS)
-        self.assertIn("uhd-archive", KNOWN_SUBCOMMANDS)
+        self.assertIn("SD", KNOWN_SUBCOMMANDS)
+        self.assertIn("HD", KNOWN_SUBCOMMANDS)
+        self.assertIn("UHD", KNOWN_SUBCOMMANDS)
 
 
 if __name__ == "__main__":

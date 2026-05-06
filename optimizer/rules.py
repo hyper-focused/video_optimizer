@@ -162,16 +162,36 @@ class LegacyCodecRule(Rule):
 # --------------------------------------------------------------------------- #
 
 
+def _non_av1_verdict(probe: ProbeResult, name: str, *,
+                     height_band: tuple[int, int],
+                     savings_frac: float, severity: str,
+                     tier_label: str) -> RuleVerdict:
+    """Shared evaluator: fire when codec != av1 and height is in [low, high)."""
+    codec = (probe.video_codec or "").lower()
+    if codec == "av1":
+        return _miss(name)
+    h = probe.height or 0
+    if not (height_band[0] <= h < height_band[1]):
+        return _miss(name)
+    return RuleVerdict(
+        rule=name, fired=True,
+        reason=f"{codec} at {tier_label}; AV1 target codec for this tier",
+        severity=severity,
+        projected_savings_mb=max((probe.size or 0) * savings_frac / _MB, 0.0),
+        notes={"codec": codec, "height": h},
+    )
+
+
 class InefficientCodecRule(Rule):
     """Flag h.264 (and similar) at HD: always a transcode candidate.
 
     AV1 is materially more efficient than h.264 at HD perceptual
     quality. CQ-based encoding preserves quality even when the source
     is heavily compressed (the worst case is an output similar in
-    size to the source — never a perceptual regression). So fire
-    unconditionally for h.264 in the HD band; SD is excluded upstream
-    by the plan-time gate, and UHD is handled by UhdNonAv1Rule which
-    catches a wider codec set.
+    size to the source — never a perceptual regression). HEVC at HD
+    is left alone (its efficiency is close enough to AV1 that the
+    re-encode time isn't worth it); SD has its own rule, and UHD is
+    handled by UhdNonAv1Rule.
     """
 
     name = "inefficient_codec"
@@ -188,34 +208,39 @@ class InefficientCodecRule(Rule):
 
 
 class UhdNonAv1Rule(Rule):
-    """At UHD, anything other than AV1 is a re-encode candidate.
-
-    The savings deltas at 4K are large (HEVC→AV1 typically ~20-30%);
-    AV1 is the explicit target for the UHD library. AV1 sources are
-    excluded upstream by the plan-time gate, so this rule only sees
-    HEVC, h.264, VP9, etc. at UHD and fires on all of them.
-    """
+    """At UHD, anything other than AV1 is a re-encode candidate."""
 
     name = "uhd_non_av1"
     advisory = False
-    _UHD_MIN_HEIGHT = 1440
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        """Fire for non-AV1 codecs at UHD frame heights."""
-        codec = (probe.video_codec or "").lower()
-        if codec == "av1":
-            return _miss(self.name)
-        height = probe.height or 0
-        if height < self._UHD_MIN_HEIGHT:
-            return _miss(self.name)
-        savings_mb = max((probe.size or 0) * 0.25 / _MB, 0.0)
-        return RuleVerdict(
-            rule=self.name,
-            fired=True,
-            reason=f"{codec} at UHD; AV1 target codec for this tier",
-            severity="high",
-            projected_savings_mb=savings_mb,
-            notes={"codec": codec, "height": height},
+        return _non_av1_verdict(
+            probe, self.name,
+            height_band=(1440, 1_000_000),
+            savings_frac=0.25, severity="high",
+            tier_label="UHD",
+        )
+
+
+class SdNonAv1Rule(Rule):
+    """At SD (height < 720), anything other than AV1 is a re-encode candidate.
+
+    Most SD content in libraries is legacy (mpeg2 DVD rips, h.264
+    captures, divx-era downloads). Re-encoding to AV1 modernises the
+    format and shrinks the file with negligible quality risk on the
+    typical SD source. AV1 SD content is excluded upstream by the
+    plan-time gate.
+    """
+
+    name = "sd_non_av1"
+    advisory = False
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        return _non_av1_verdict(
+            probe, self.name,
+            height_band=(1, 720),
+            savings_frac=0.25, severity="medium",
+            tier_label="SD",
         )
 
 
@@ -283,6 +308,7 @@ RULES: dict[str, Rule] = {
     "legacy_codec":         LegacyCodecRule(),
     "inefficient_codec":    InefficientCodecRule(),
     "uhd_non_av1":          UhdNonAv1Rule(),
+    "sd_non_av1":           SdNonAv1Rule(),
     "container_migration":  ContainerMigrationRule(),
     "hdr_advisory":         HdrAdvisoryRule(),
 }

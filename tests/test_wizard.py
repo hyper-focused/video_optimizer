@@ -69,7 +69,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
                                return_value=0).start()
         # _wizard_estimate_seconds touches the probe cache; bypass it.
         patch.object(cli_mod, "_wizard_estimate_seconds",
-                     return_value=(1, 1, 7200)).start()
+                     return_value=(1, 1, 1, 7800)).start()
         # list_pending_decisions returns 2 candidates so the summary fires.
         list_pending = patch.object(
             cli_mod.Database, "list_pending_decisions",
