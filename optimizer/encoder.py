@@ -751,13 +751,21 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                          encoder: str, quality: int | None,
                          keep_langs: list[str], target_container: str,
                          *, hw_decode: bool = False,
-                         add_compat_audio: bool = True) -> list[str]:
+                         add_compat_audio: bool = True,
+                         denoise: bool = False) -> list[str]:
     """Return ffmpeg argv for a real re-encode using the given encoder.
 
     hw_decode=True with a QSV encoder enables zero-copy GPU decode→encode
     (`-hwaccel qsv -hwaccel_output_format qsv`). Saves CPU but can fail on
     legacy codecs that the QSV decoder doesn't support, so callers (apply)
     leave it off by default and the preset wrappers turn it on.
+
+    denoise=True inserts an `hqdn3d` software filter into the -vf chain.
+    Used by the apply layer for low-bitrate h.264 and SD content where
+    pre-cleaning the source helps AV1 allocate bits to real content
+    rather than h.264 macroblock noise. hqdn3d is CPU-only, so callers
+    that pass denoise=True must also disable hw_decode (the zero-copy
+    QSV pipeline can't host a software filter mid-stream).
     """
     q = quality if quality is not None else _quality_default(encoder)
     # 1440p is the cutoff: anything ≥ 1440p uses UHD-tuned encoder values
@@ -782,8 +790,19 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                        bit_depth=probe.bit_depth, hw_decode=hw_decode)
     cmd += _color_passthrough_args(probe)
 
+    # Compose video filter chain: denoise (CPU) → vaapi format/hwupload
+    # (when targeting vaapi). ffmpeg only honours one -vf flag, so build
+    # the comma-separated chain in order.
+    vfilters: list[str] = []
+    if denoise:
+        # Mild settings: light luma spatial, lighter chroma spatial,
+        # moderate temporal. Strong enough to clean h.264 macroblock
+        # noise without crushing film grain on prosumer sources.
+        vfilters.append("hqdn3d=2:1:2:3")
     if encoder.endswith("_vaapi"):
-        cmd += ["-vf", "format=nv12,hwupload"]
+        vfilters.append("format=nv12,hwupload")
+    if vfilters:
+        cmd += ["-vf", ",".join(vfilters)]
 
     cmd += build_stream_map_args(probe, keep_langs, target_container,
                                  add_compat_audio=add_compat_audio)

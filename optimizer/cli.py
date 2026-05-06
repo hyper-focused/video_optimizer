@@ -18,7 +18,12 @@ from typing import Any
 from . import crawler, encoder, naming, probe, report, rules
 from .db import DEFAULT_DB_PATH, Database
 from .models import ProbeResult, probe_from_dict
-from .presets import EST_SECONDS_PER_FILE, MIN_PROBE_SIZE_BYTES, PRESETS
+from .presets import (
+    BITRATE_FLAG_TABLE,
+    EST_SECONDS_PER_FILE,
+    MIN_PROBE_SIZE_BYTES,
+    PRESETS,
+)
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
 
@@ -999,6 +1004,43 @@ def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> 
           f"{(dec['projected_savings_mb'] or 0) / 1024:.1f} GB")
 
 
+def _should_apply_denoise(pr: ProbeResult) -> bool:
+    """Return True if this source benefits from a software denoise pre-pass.
+
+    Triggers in two cases that share the same root cause — sources where
+    AV1's bit budget is at risk of being spent reproducing h.264
+    macroblock noise rather than real picture detail:
+
+      1. SD content (height < 720). SD almost always rides on heavy
+         compression and benefits universally from light cleanup.
+      2. h.264 in the HD band whose source bitrate is below the AV1
+         target bitrate for its resolution bucket. Above the AV1 target,
+         the source has bitrate headroom and a clean re-encode is fine.
+         Below it, the source is already showing artifacts and we want
+         to soften them before AV1 sees them.
+
+    hqdn3d is CPU-only, so callers that pass denoise=True must also
+    disable hw_decode (the QSV zero-copy pipeline can't host a software
+    filter mid-stream). Library-scale assumption: edge-case slowdown on
+    the rare low-bitrate file is preferable to a worse-quality output.
+    """
+    height = pr.height or 0
+    if 0 < height < 720:
+        return True
+    codec = (pr.video_codec or "").lower()
+    if codec != "h264":
+        return False
+    if height >= 1440 or pr.video_bitrate <= 0:
+        return False
+    bucket = pr.resolution_class
+    entry = BITRATE_FLAG_TABLE.get(bucket)
+    if entry is None:
+        return False
+    target_mbps, _flag_mbps = entry
+    actual_mbps = pr.video_bitrate / 1_000_000.0
+    return actual_mbps < target_mbps
+
+
 def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                          target_container: str, enc_name: str,
                          keep_langs: list[str],
@@ -1010,12 +1052,20 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                                           target_container, keep_langs,
                                           add_compat_audio=add_compat)
         return cmd, "remux"
+    denoise = _should_apply_denoise(pr)
+    # hqdn3d is CPU-only; if it's needed we override hw_decode off so the
+    # QSV zero-copy path doesn't try to host a software filter.
+    hw_decode = (getattr(args, "hw_decode", False) and not denoise)
     cmd = encoder.build_encode_command(
         pr, output_path, enc_name, args.quality, keep_langs,
-        target_container, hw_decode=getattr(args, "hw_decode", False),
+        target_container, hw_decode=hw_decode,
         add_compat_audio=add_compat,
+        denoise=denoise,
     )
-    return cmd, f"encode via {enc_name}"
+    desc = f"encode via {enc_name}"
+    if denoise:
+        desc += " (+ denoise pre-pass)"
+    return cmd, desc
 
 
 def _execute_encode(db: Database, dec: dict, pr: ProbeResult,

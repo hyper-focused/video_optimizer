@@ -15,7 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from optimizer.cli import _plan_probe_gate
+from optimizer import encoder
+from optimizer.cli import _plan_probe_gate, _should_apply_denoise
 from optimizer.db import Database
 from optimizer.rules import (
     InefficientCodecRule,
@@ -189,6 +190,94 @@ class PlanGateSdTests(_GateTestBase):
                 _plan_probe_gate(db, self._probe(codec="av1", height=480)),
                 "av1_source",
             )
+
+
+# --------------------------------------------------------------------------- #
+# Denoise decision (low-bitrate h.264 + SD)
+# --------------------------------------------------------------------------- #
+
+
+class DenoiseDecisionTests(unittest.TestCase):
+    """`_should_apply_denoise` triggers on SD or low-bitrate HD h.264."""
+
+    def test_h264_1080p_low_bitrate_denoises(self):
+        # 1080p AV1 target is 5 Mbps; a 3 Mbps source is below that.
+        pr = make_probe(codec="h264", height=1080,
+                        video_bitrate=3_000_000)
+        self.assertTrue(_should_apply_denoise(pr))
+
+    def test_h264_1080p_high_bitrate_does_not_denoise(self):
+        pr = make_probe(codec="h264", height=1080,
+                        video_bitrate=12_000_000)
+        self.assertFalse(_should_apply_denoise(pr))
+
+    def test_h264_at_av1_target_does_not_denoise(self):
+        # Boundary: at exactly the target bitrate the source has just
+        # enough headroom for a clean re-encode.
+        pr = make_probe(codec="h264", height=1080,
+                        video_bitrate=5_000_000)
+        self.assertFalse(_should_apply_denoise(pr))
+
+    def test_hevc_low_bitrate_does_not_denoise(self):
+        # Denoise is h.264-specific in the HD band.
+        pr = make_probe(codec="hevc", height=1080,
+                        video_bitrate=2_000_000)
+        self.assertFalse(_should_apply_denoise(pr))
+
+    def test_unknown_bitrate_does_not_denoise(self):
+        pr = make_probe(codec="h264", height=1080, video_bitrate=0)
+        self.assertFalse(_should_apply_denoise(pr))
+
+    def test_sd_always_denoises(self):
+        # SD content benefits universally from cleanup.
+        pr = make_probe(codec="hevc", height=480, video_bitrate=1_500_000)
+        self.assertTrue(_should_apply_denoise(pr))
+
+    def test_h264_uhd_does_not_denoise(self):
+        # UHD content has enough headroom; UhdNonAv1Rule covers it
+        # without preprocessing.
+        pr = make_probe(codec="h264", height=2160,
+                        video_bitrate=15_000_000)
+        self.assertFalse(_should_apply_denoise(pr))
+
+
+# --------------------------------------------------------------------------- #
+# Encoder integration (build_encode_command honours denoise=True)
+# --------------------------------------------------------------------------- #
+
+
+class EncoderDenoiseIntegrationTests(unittest.TestCase):
+    """build_encode_command inserts hqdn3d into the -vf chain on denoise=True."""
+
+    def _build(self, **kwargs):
+        pr = make_probe(codec="h264", height=1080)
+        from pathlib import Path
+        return encoder.build_encode_command(
+            pr, Path("/tmp/out.mkv"),
+            "libsvtav1", quality=28,
+            keep_langs=["en", "und"],
+            target_container="mkv",
+            **kwargs,
+        )
+
+    def test_denoise_false_omits_hqdn3d(self):
+        cmd = self._build(denoise=False)
+        joined = " ".join(cmd)
+        self.assertNotIn("hqdn3d", joined)
+
+    def test_denoise_true_inserts_hqdn3d(self):
+        cmd = self._build(denoise=True)
+        # hqdn3d=... must appear inside the -vf argument.
+        self.assertIn("-vf", cmd)
+        vf_idx = cmd.index("-vf")
+        self.assertIn("hqdn3d", cmd[vf_idx + 1])
+
+    def test_denoise_true_excludes_qsv_hwaccel(self):
+        # When denoise is on, the caller is supposed to pass
+        # hw_decode=False; verify the encoder honours that and doesn't
+        # silently insert -hwaccel qsv.
+        cmd = self._build(denoise=True, hw_decode=False)
+        self.assertNotIn("qsv", " ".join(cmd))
 
 
 if __name__ == "__main__":
