@@ -1187,35 +1187,34 @@ def _prepare_dv_source(pr: ProbeResult,
 def _run_dv_p7_pipeline(pr: ProbeResult, work_dir: Path,
                        prepared: Path,
                        args: argparse.Namespace) -> bool:
-    """Run the 3-stage Profile 7 prep: extract HEVC → P7→P8 convert → re-mux+strip.
+    """Run the 4-stage Profile 7 prep: extract → P7→P8 convert → strip → mkvmerge.
 
-    Stage 1+2 are piped (ffmpeg stdout → dovi_tool stdin) so we don't
-    write a 50 GB intermediate Annex-B HEVC. Stage 2 writes the
-    converted P8.1 HEVC to a temp file because stage 3 needs it as a
-    file input alongside the original source. Stage 3 re-attaches
-    audio/subs from the original and applies `dovi_rpu=strip=true` in
-    one pass — the output is plain HDR10 MKV ready for av1_qsv.
+    Stages 1+2 are piped (ffmpeg stdout → dovi_tool stdin) so we
+    don't write a 50 GB intermediate Annex-B HEVC. Stage 3 strips
+    the RPU on the raw HEVC bitstream (output is also raw HEVC, so
+    ffmpeg's matroska timestamp issue doesn't apply). Stage 4 uses
+    mkvmerge to re-attach audio/subs from the original source —
+    mkvmerge handles raw HEVC + B-frame content cleanly where
+    ffmpeg's matroska muxer fails with "Timestamps are unset in a
+    packet for stream 0".
 
-    Returns True on success, False on any subprocess failure (caller
-    cleans up the work_dir).
+    Returns True on success, False on any subprocess failure
+    (caller cleans up the work_dir).
     """
-    print(f"    DV Profile 7: converting to P8 + stripping RPU "
+    print(f"    DV Profile 7: P7→P8 + strip RPU + mkvmerge "
           f"(temp dir: {work_dir.name})")
     p8_hevc = work_dir / "p8.hevc"
-    extract_cmd = encoder.build_dv_p7_extract_command(pr)
-    convert_cmd = encoder.build_dv_p7_convert_command(p8_hevc)
+    stripped_hevc = work_dir / "stripped.hevc"
 
-    # Stage 1+2: piped extract → convert. Both stdouts captured so
-    # ffmpeg's progress logs can be flushed if it errors before the
-    # pipe closes; on success we just discard them.
+    # Stage 1+2: piped extract → convert.
     extract_proc = subprocess.Popen(
-        extract_cmd,
+        encoder.build_dv_p7_extract_command(pr),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL if not args.verbose else None,
     )
     try:
         convert_proc = subprocess.run(
-            convert_cmd,
+            encoder.build_dv_p7_convert_command(p8_hevc),
             stdin=extract_proc.stdout,
             stderr=subprocess.PIPE if not args.verbose else None,
         )
@@ -1238,18 +1237,36 @@ def _run_dv_p7_pipeline(pr: ProbeResult, work_dir: Path,
         print("    FAIL: dovi_tool produced no output")
         return False
 
-    # Stage 3: re-mux + strip via the existing run_ffmpeg helper so
-    # the timeout / progress / stall watchdog all apply.
-    remux_cmd = encoder.build_dv_p7_remux_strip_command(pr, p8_hevc, prepared)
+    # Stage 3: strip RPU on raw HEVC → raw HEVC (no container
+    # involved, so the matroska timestamp issue doesn't apply).
     timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
     ok, err = encoder.run_ffmpeg(
-        remux_cmd, pr.duration_seconds,
-        timeout_seconds=timeout, verbose=args.verbose,
-        label="    DV-P7-remux ",
+        encoder.build_dv_p7_strip_raw_command(p8_hevc, stripped_hevc),
+        pr.duration_seconds, timeout_seconds=timeout,
+        verbose=args.verbose, label="    DV-P7-strip ",
     )
     if not ok:
-        print(f"    FAIL: DV P7 remux+strip failed: {err[:200]}")
+        print(f"    FAIL: DV P7 strip failed: {err[:200]}")
         return False
+
+    # Free the unstripped intermediate before stage 4 runs — keeps
+    # peak temp disk to ~2x source rather than 3x.
+    p8_hevc.unlink(missing_ok=True)
+
+    # Stage 4: mkvmerge muxes stripped HEVC + original audio/subs.
+    mkvmerge_proc = subprocess.run(
+        encoder.build_dv_p7_mkvmerge_command(pr, stripped_hevc, prepared),
+        capture_output=True, text=True,
+    )
+    if mkvmerge_proc.returncode != 0:
+        # mkvmerge returns 1 for warnings, 2 for errors. Treat 2 as
+        # failure; warnings (1) plus a present output file are fine.
+        if mkvmerge_proc.returncode >= 2 or not prepared.exists():
+            err = (mkvmerge_proc.stderr or
+                   mkvmerge_proc.stdout or "").strip()[:400]
+            print(f"    FAIL: mkvmerge returned "
+                  f"{mkvmerge_proc.returncode}\n      {err}")
+            return False
     return True
 
 
@@ -1506,6 +1523,28 @@ def _doctor_check_vaapi() -> None:
         print("    (VAAPI encoders won't run; QSV/NVENC are independent)")
 
 
+def _doctor_check_dv_tools() -> None:
+    """Report dovi_tool / mkvmerge availability for the DV strip path.
+
+    Both are needed for Profile 7 sources; only dovi_tool is needed-
+    less (Profile 8.x uses ffmpeg's built-in dovi_rpu bsf). We don't
+    flag missing DV tools as errors — the plan-gate falls back to
+    skipping P7 sources cleanly when they're absent — just informational.
+    """
+    print("\nDolby Vision tools")
+    print("==================")
+    if encoder.has_dovi_tool():
+        print("  dovi_tool: present (P7 → P8 conversion available)")
+    else:
+        print("  dovi_tool: absent")
+        print("    (P7 sources will be skipped at plan time; P8 still works)")
+    if encoder.has_mkvmerge():
+        print("  mkvmerge:  present (P7 re-mux available)")
+    else:
+        print("  mkvmerge:  absent")
+        print("    (install mkvtoolnix-cli to enable P7 prep)")
+
+
 def _doctor_check_db(db_path: Path, issues: list[str]) -> None:
     print("\nDatabase")
     print("========")
@@ -1564,6 +1603,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     tools = _doctor_check_tools(issues)
     _doctor_check_encoders(tools, issues)
     _doctor_check_vaapi()
+    _doctor_check_dv_tools()
     _doctor_check_db(args.db, issues)
     if args.probe is not None:
         _doctor_sample_probe(args.probe, issues)

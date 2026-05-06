@@ -156,11 +156,12 @@ def output_extension(target: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-# Module-level cache for dovi_tool availability. Populated on first call.
-# Use a sentinel rather than None so we can distinguish "uncached" from
-# "checked and missing".
-_DOVI_TOOL_UNCACHED = object()
-_dovi_tool_cache: object = _DOVI_TOOL_UNCACHED
+# Module-level caches for external-tool availability. Populated on first
+# call; tests can reset by re-binding the relevant `*_cache` variable
+# back to the sentinel.
+_TOOL_UNCACHED = object()
+_dovi_tool_cache: object = _TOOL_UNCACHED
+_mkvmerge_cache: object = _TOOL_UNCACHED
 
 
 def has_dovi_tool() -> bool:
@@ -168,13 +169,28 @@ def has_dovi_tool() -> bool:
 
     Required only for Profile 7 sources (P7 → P8 conversion). The
     P8.x strip path uses ffmpeg's built-in `dovi_rpu` bsf and doesn't
-    need dovi_tool. Cached at module scope; tests can reset by
-    setting `_dovi_tool_cache = _DOVI_TOOL_UNCACHED`.
+    need dovi_tool. Cached at module scope.
     """
     global _dovi_tool_cache
-    if _dovi_tool_cache is _DOVI_TOOL_UNCACHED:
+    if _dovi_tool_cache is _TOOL_UNCACHED:
         _dovi_tool_cache = shutil.which("dovi_tool")
     return _dovi_tool_cache is not None
+
+
+def has_mkvmerge() -> bool:
+    """Return True if `mkvmerge` (mkvtoolnix-cli) is on PATH.
+
+    Required for Profile 7 sources alongside dovi_tool — the P7 prep
+    pipeline needs to mux the converted+stripped raw HEVC bitstream
+    back into MKV with the original audio/subs. ffmpeg's matroska
+    muxer chokes on raw HEVC + B-frame content with "Timestamps are
+    unset in a packet" because the raw bitstream has no container
+    PTS/DTS. mkvmerge handles raw HEVC + DV cleanly, by design.
+    """
+    global _mkvmerge_cache
+    if _mkvmerge_cache is _TOOL_UNCACHED:
+        _mkvmerge_cache = shutil.which("mkvmerge")
+    return _mkvmerge_cache is not None
 
 
 def dv_strategy(dv_profile: int | None) -> str | None:
@@ -196,7 +212,13 @@ def dv_strategy(dv_profile: int | None) -> str | None:
     if dv_profile == 5:
         return None  # P5 has no clean HDR10 base layer
     if dv_profile == 7:
-        return "p7_convert" if has_dovi_tool() else None
+        # P7 path requires BOTH external tools: dovi_tool to flatten
+        # P7 → P8.1 (drop the EL), and mkvmerge to mux the converted
+        # raw HEVC back with the original audio/subs (ffmpeg's matroska
+        # muxer can't handle raw-HEVC stream-copy on B-frame content).
+        if has_dovi_tool() and has_mkvmerge():
+            return "p7_convert"
+        return None
     if dv_profile == 8:
         return "p8_strip"
     # Profile 4 / 9 / 10 (rare or AV1-native) — be conservative, skip
@@ -328,29 +350,49 @@ def validate_output(probe: ProbeResult,
     return True, ""
 
 
-def build_dv_p7_remux_strip_command(probe: ProbeResult,
-                                    p8_hevc_path: Path,
-                                    prepared_path: Path) -> list[str]:
-    """Return ffmpeg argv: re-mux converted HEVC + original streams + strip.
+def build_dv_p7_strip_raw_command(p8_hevc_path: Path,
+                                  stripped_hevc_path: Path) -> list[str]:
+    """Return ffmpeg argv: read raw P8 HEVC, strip RPU, write raw HEVC.
 
-    Final stage of the Profile 7 pipeline. Takes the dovi_tool output
-    (P8.1 HEVC bitstream, video-only) and re-attaches audio + subs
-    from the original source via the second `-i`, applying the
-    `dovi_rpu=strip=true` bsf in the same pass so the output is plain
-    HDR10 ready for av1_qsv. Stream indices are preserved by keeping
-    `-map 1:a?` / `-map 1:s?` references against the original source.
+    Stage 3a of the Profile 7 pipeline. `-c copy -f hevc` keeps the
+    output in raw annex-B form so the matroska timestamp problem
+    doesn't apply (no container, no PTS/DTS to worry about). The
+    stripped bitstream is plain HDR10, ready for mkvmerge to mux
+    alongside the source's audio/subs.
     """
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-y",
         "-i", str(p8_hevc_path),
-        "-i", probe.path,
-        "-map", "0:v:0",
-        "-map", "1:a?",
-        "-map", "1:s?",
         "-c", "copy",
         "-bsf:v", "dovi_rpu=strip=true",
-        "-progress", "pipe:1", "-nostats",
-        str(prepared_path),
+        "-f", "hevc",
+        str(stripped_hevc_path),
+    ]
+
+
+def build_dv_p7_mkvmerge_command(probe: ProbeResult,
+                                 stripped_hevc_path: Path,
+                                 prepared_path: Path) -> list[str]:
+    """Return mkvmerge argv: mux stripped HEVC + source audio/subs.
+
+    Stage 3b of the Profile 7 pipeline. mkvmerge handles raw HEVC
+    cleanly, by design — it parses the bitstream and synthesises the
+    matroska timestamps from the SPS/VUI rate, which ffmpeg's matroska
+    muxer doesn't do. Audio and subtitles come from the original
+    source; the `--no-video` switch on the source input keeps
+    mkvmerge from attaching the original (unstripped) DV-tagged HEVC
+    a second time.
+    """
+    return [
+        "mkvmerge", "-q",  # -q suppresses chatty progress
+        "-o", str(prepared_path),
+        # Stripped HEVC video (only video; mkvmerge auto-detects rate).
+        "--no-audio", "--no-subtitles", "--no-chapters", "--no-attachments",
+        str(stripped_hevc_path),
+        # Original source: take its audio + subs + chapters; drop the
+        # original (unstripped) video stream.
+        "--no-video", "--no-attachments",
+        probe.path,
     ]
 
 
