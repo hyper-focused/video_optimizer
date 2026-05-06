@@ -763,9 +763,11 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
     denoise=True inserts an `hqdn3d` software filter into the -vf chain.
     Used by the apply layer for low-bitrate h.264 and SD content where
     pre-cleaning the source helps AV1 allocate bits to real content
-    rather than h.264 macroblock noise. hqdn3d is CPU-only, so callers
-    that pass denoise=True must also disable hw_decode (the zero-copy
-    QSV pipeline can't host a software filter mid-stream).
+    rather than h.264 macroblock noise. hqdn3d is CPU-only and won't
+    compose with QSV zero-copy decode; in practice this never matters
+    because every condition that triggers denoise (h.264 in [720, 1440)
+    or height < 720) lands in the HD preset where hw_decode is already
+    False by default.
     """
     q = quality if quality is not None else _quality_default(encoder)
     # 1440p is the cutoff: anything ≥ 1440p uses UHD-tuned encoder values

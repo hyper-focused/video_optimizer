@@ -1053,12 +1053,13 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                                           add_compat_audio=add_compat)
         return cmd, "remux"
     denoise = _should_apply_denoise(pr)
-    # hqdn3d is CPU-only; if it's needed we override hw_decode off so the
-    # QSV zero-copy path doesn't try to host a software filter.
-    hw_decode = (getattr(args, "hw_decode", False) and not denoise)
+    # No explicit hw_decode override: every code path that triggers
+    # denoise lands in the HD preset (height < 1440), which already
+    # defaults hw_decode=False. The UHD preset never sees a denoise
+    # candidate because its resolution gate is min_height=1440.
     cmd = encoder.build_encode_command(
         pr, output_path, enc_name, args.quality, keep_langs,
-        target_container, hw_decode=hw_decode,
+        target_container, hw_decode=getattr(args, "hw_decode", False),
         add_compat_audio=add_compat,
         denoise=denoise,
     )
