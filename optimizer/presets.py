@@ -46,8 +46,9 @@ PRESETS: dict[str, dict[str, object]] = {
     "SD": {
         "label": "≤719p / SD library archive (AV1 + MKV)",
         "target": "av1+mkv",
-        "quality": 23,             # slightly looser than HD: SD is more
-                                   # perceptually fragile under heavy compression
+        "quality": 24,             # looser than HD: SD is more perceptually
+                                   # fragile under heavy compression, and the
+                                   # storage delta vs CQ 21 is small at SD sizes
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
