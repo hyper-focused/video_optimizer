@@ -61,48 +61,34 @@ Run `./video_optimizer.py doctor` to verify your setup before the first encode
 
 ## Quick start
 
-The setup is fast. The encodes are paced by your GPU and vary widely by
-hardware — as a single reference point, on Intel Battlemage with hardware
-decode + encode we see roughly **~15 min per 1080p Blu-ray remux**
-(~220 fps) and **~1 hour per 2160p HDR remux** (~40–55 fps, ~2× realtime).
-Older iGPUs, software fallback (`libsvtav1`), or NVENC will land in
-different places — let one encode finish to calibrate.
-
-A whole-library run is hours-to-days depending on backlog size; run
-`optimize` overnight or under `nohup` the first time.
+The default workflow is point-and-shoot:
+`./video_optimizer.py /path/to/movies` will scan the library, plan the
+encodes, and run them — writing each output next to its source and
+leaving the originals untouched. When it finishes, it prints a per-run
+report and tells you the cleanup command to remove the originals when
+you're ready.
 
 ```bash
-# 1. Verify the setup is healthy (ffmpeg, encoders, GPU, db). Takes seconds.
+# 1. (One-time) Verify your setup is healthy.
 ./video_optimizer.py doctor
 
-# 2. Preview what *would* happen on a single 1080p file. No encodes run.
-./video_optimizer.py optimize /mnt/media/Movies \
-    --output /tmp/preview --dry-run --limit 1
+# 2. Encode a library — outputs land next to each source, originals untouched.
+./video_optimizer.py /path/to/movies
 
-# 3. Encode one real file into a side directory (originals untouched).
-#    This is your first proof-of-life — duration depends on your GPU
-#    (see throughput notes above). Watch the progress line for fps and ETA.
-./video_optimizer.py optimize /mnt/media/Movies \
-    --output /tmp/test --limit 1 --auto
-
-# 4. Confirm the output is good (open it, scrub it, compare to original).
-ls /tmp/test/...
-
-# 5. Encode the whole library, in-place, with originals moved to a recycle dir.
-#    Recycle directory is auto-detected; if there's an @Recycle / .@Recycle /
-#    #recycle / .Trash inside the path it's used, otherwise <PATH>/.@Recycle
-#    is created. Originals are *moved*, not deleted, so the run is undoable
-#    until you empty the recycle dir.
-./video_optimizer.py optimize /mnt/media/Movies --in-place --auto
+# 3. When you're ready, remove the originals from the most recent run.
+./video_optimizer.py cleanup            # dry-run listing, no deletes
+./video_optimizer.py cleanup --apply    # actually unlink the originals
 ```
 
-`optimize` runs scan → plan → uhd-archive → hd-archive in sequence with
-calibrated defaults (CQ 15 for 2160p, CQ 21 for 1080p, AV1 + MKV target,
-filename rewriting on, REENCODE marker on). Each tier's resolution gate
-keeps them from clobbering each other.
+If you're not sure where to start, run `./video_optimizer.py` with no
+arguments in a terminal — you'll get a guided wizard that walks through
+the same workflow with explanations and a confirmation gate before any
+encode runs.
 
-To stay closer to the originals (no filename rewriting, custom CQ, etc.),
-use `apply` directly — see [Common workflows](#common-workflows).
+For other output behaviors (mirror to a separate tree, replace originals
+atomically) and the full flag reference, see
+`./video_optimizer.py optimize --help` and the dedicated subcommand
+`--help` pages.
 
 ### doctor (preflight checks)
 
@@ -199,17 +185,29 @@ suspect a probe row doesn't reflect the current file content.
 
 ## Common workflows
 
-### "Just shrink my Movies folder" (1080p library, in-place)
+### "Just shrink my Movies folder" (point-and-shoot)
+
+```bash
+./video_optimizer.py /mnt/media/Movies            # encode beside, originals kept
+./video_optimizer.py cleanup --apply              # remove originals when ready
+```
+
+The bare invocation runs scan → plan → uhd-archive (no-op if no UHD
+content) → hd-archive, with each output written next to its source
+(`foo.mkv → foo.AV1.REENCODE.mkv`) and originals untouched. It keeps
+`en` + `und` audio, adds AAC 5.1 + 2.0 compat tracks, and rewrites
+filenames to drop the old codec token and add `AV1.REENCODE`. After the
+run, the printed report tells you which originals are safe to delete;
+`cleanup --apply` unlinks them after re-checking that each output exists
+and is non-empty.
+
+If you'd rather have the originals atomically moved to a recycle
+directory in the same step (the older one-shot semantics), pass
+`--in-place` to the explicit `optimize` subcommand:
 
 ```bash
 ./video_optimizer.py optimize /mnt/media/Movies --in-place --auto
 ```
-
-Equivalent to: scan → plan → uhd-archive (no-op if no UHD content) →
-hd-archive, with originals atomically moved to `<path>/.@Recycle` (or an
-existing recycle dir if one is already there). Keeps `en` + `und` audio,
-adds AAC 5.1 + 2.0 compat tracks, rewrites filenames to drop the old codec
-token and add `AV1.REENCODE`.
 
 ### "Mixed 4K + 1080p library, side mode for safety"
 
@@ -700,7 +698,10 @@ the Arr app's library polling while the run is in progress.
 
 | Subcommand | Purpose |
 |------------|---------|
-| `optimize PATH` | One-shot scan+plan+apply with safe defaults. New-user friendly. |
+| `PATH` (bare invocation) | Point-and-shoot: scan + plan + encode beside the sources, originals untouched. |
+| `wizard` | Interactive guided run; same as bare-no-args in a terminal. |
+| `optimize PATH` | Explicit form of the one-shot run; exposes `--mode`, `--output`, `--in-place`, etc. |
+| `cleanup` | Remove originals of successfully-encoded files from a prior run (dry-run by default). |
 | `doctor` | Preflight checks for ffmpeg, encoders, GPU, db. |
 | `scan PATH` | Recursive walk + ffprobe → cache. |
 | `reprobe PATH` | Force re-probe (ignores cache). Alias for `scan --no-probe-cache`. |
@@ -757,7 +758,6 @@ the Arr app's library polling while the run is in progress.
 - `--output DIR` — side mode output root (mutually exclusive with `--in-place`)
 - `--in-place` — replace mode with auto-resolved recycle dir
 - `--recycle-to DIR` — override the auto-resolved recycle dir
-- `--skip-scan` — reuse the existing probe cache; skip the scan phase
 - `--min-size SIZE` — passed through to the scan phase (default `1G`;
   `0` disables; also see the dedicated section above)
 

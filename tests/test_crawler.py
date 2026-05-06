@@ -15,7 +15,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from optimizer.crawler import _SKIP_DIRS, _is_skipped_dir, crawl
+from optimizer.crawler import (
+    _EXTRAS_DIRS,
+    _SKIP_DIRS,
+    _is_extras_dir,
+    _is_skipped_dir,
+    crawl,
+    is_extras_filename,
+)
 
 
 class SkipListTests(unittest.TestCase):
@@ -63,6 +70,92 @@ class CrawlIntegrationTests(unittest.TestCase):
 
             yielded = sorted(p.name for p in crawl(root))
             self.assertEqual(yielded, ["Real Movie (2020).mkv"])
+
+
+class ExtrasFilterTests(unittest.TestCase):
+    """Plex-style extras directories and filename suffixes are filtered
+    by default (`skip_extras=True`); --allow-extras turns the skip off."""
+
+    def test_known_extras_dirs(self):
+        for name in ("Trailers", "trailer", "Behind The Scenes",
+                     "BehindTheScenes", "Featurettes", "Deleted Scenes",
+                     "Interviews", "Shorts", "Bonus", "BTS", "Samples"):
+            self.assertTrue(
+                _is_extras_dir(Path(f"/Movies/X/{name}")),
+                f"expected {name!r} to match the extras dir set",
+            )
+
+    def test_normal_dirs_not_extras(self):
+        for name in ("Movies", "Season 1", "X (2020)"):
+            self.assertFalse(
+                _is_extras_dir(Path(f"/X/{name}")),
+                f"{name!r} is a regular directory; should not match extras",
+            )
+
+    def test_extras_suffix_filenames(self):
+        for name in ("Movie-trailer.mkv", "Movie-bts.mp4",
+                     "Movie-deleted.mkv", "Movie-featurette.mp4",
+                     "Movie-sample.mkv", "Movie-extra.mp4"):
+            self.assertTrue(
+                is_extras_filename(Path(name)),
+                f"expected {name!r} to be classified as extras",
+            )
+
+    def test_normal_filenames_not_extras(self):
+        # "trailer" without the dash prefix isn't an extras suffix.
+        for name in ("Movie.mkv", "Trailer Park Boys.mkv",
+                     "The Trailer (2020).mp4"):
+            self.assertFalse(
+                is_extras_filename(Path(name)),
+                f"{name!r} should not be classified as extras",
+            )
+
+    def test_extras_dirs_skipped_during_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature = root / "Movies" / "Real (2020).mkv"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(b"x" * 100)
+
+            trailer_dir = root / "Movies" / "Trailers" / "preview.mkv"
+            trailer_dir.parent.mkdir(parents=True)
+            trailer_dir.write_bytes(b"x" * 100)
+
+            yielded = sorted(p.name for p in crawl(root))
+            self.assertEqual(yielded, ["Real (2020).mkv"])
+
+    def test_extras_filename_skipped_during_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature = root / "Movies" / "Real (2020).mkv"
+            trailer = root / "Movies" / "Real (2020)-trailer.mp4"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(b"x" * 100)
+            trailer.write_bytes(b"x" * 100)
+
+            yielded = sorted(p.name for p in crawl(root))
+            self.assertEqual(yielded, ["Real (2020).mkv"])
+
+    def test_allow_extras_disables_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            feature = root / "Movies" / "Real (2020).mkv"
+            trailer = root / "Movies" / "Real (2020)-trailer.mp4"
+            feature.parent.mkdir(parents=True)
+            feature.write_bytes(b"x" * 100)
+            trailer.write_bytes(b"x" * 100)
+
+            yielded = sorted(p.name for p in crawl(root, skip_extras=False))
+            self.assertEqual(
+                yielded,
+                ["Real (2020)-trailer.mp4", "Real (2020).mkv"],
+            )
+
+    def test_extras_dir_set_is_lowercase_only(self):
+        # The membership check lowercases the dir name; no UpperCase
+        # entries should exist in the set or matching breaks.
+        for name in _EXTRAS_DIRS:
+            self.assertEqual(name, name.lower())
 
 
 if __name__ == "__main__":

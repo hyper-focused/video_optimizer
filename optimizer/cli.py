@@ -18,7 +18,12 @@ from typing import Any
 from . import crawler, encoder, naming, probe, report, rules
 from .db import DEFAULT_DB_PATH, Database
 from .models import ProbeResult, probe_from_dict
-from .presets import MIN_PROBE_SIZE_BYTES, PRESETS
+from .presets import (
+    BITRATE_FLAG_TABLE,
+    EST_SECONDS_PER_FILE,
+    MIN_PROBE_SIZE_BYTES,
+    PRESETS,
+)
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
 
@@ -98,6 +103,11 @@ def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
                         "ffprobe is I/O-bound, so workers >> NFS server's "
                         "concurrent-read ceiling don't help.")
     _add_min_size_arg(s)
+    s.add_argument("--allow-extras", action="store_true",
+                   help="Include Plex-style extras (Trailers, Behind The "
+                        "Scenes, Featurettes, files with -trailer/-bts/etc. "
+                        "suffixes). Default: skip them — a library-scale "
+                        "tool shouldn't burn GPU time on add-ons.")
     s.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(s)
 
@@ -113,6 +123,8 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     r.add_argument("--workers", type=int, default=None,
                    help="Parallel ffprobe workers (default: min(8, CPU count)).")
     _add_min_size_arg(r)
+    r.add_argument("--allow-extras", action="store_true",
+                   help="Include Plex-style extras during the re-probe walk.")
     r.add_argument("--verbose", "-v", action="store_true")
     _add_common_db_arg(r)
 
@@ -137,6 +149,15 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                          "skip them permanently. Use this when intentionally "
                          "re-running an already-encoded file (e.g. trying a "
                          "different CQ).")
+    pl.add_argument("--allow-av1", action="store_true",
+                    help="Re-queue AV1 sources. Default behavior is to skip "
+                         "AV1 entirely (it's already at the target codec; "
+                         "re-encoding is wasteful and quality-lossy).")
+    pl.add_argument("--allow-extras", action="store_true",
+                    help="Re-queue files matching Plex extras suffixes "
+                         "(`-trailer`, `-bts`, `-deleted`, …). Default "
+                         "skips them; the crawler also filters extras "
+                         "directories at walk time.")
     _add_common_db_arg(pl)
 
 
@@ -151,6 +172,11 @@ def _add_apply_parser(sub: "argparse._SubParsersAction") -> None:
     _add_apply_encoding_args(ap)
     _add_apply_naming_args(ap)
     ap.add_argument("--verbose", "-v", action="store_true")
+    # Suppress the post-run report. Hidden in --help; this is for users with
+    # piped output / cron contexts who genuinely don't want the summary or
+    # the persisted ~/.video_optimizer/reports/run-N.txt file.
+    ap.add_argument("--no-report", action="store_true",
+                    help=argparse.SUPPRESS)
     _add_common_db_arg(ap)
 
 
@@ -158,7 +184,8 @@ def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
     """Attach apply-mode flags governing confirmation, output layout, limits."""
     ap.add_argument("--auto", action="store_true",
                     help="Skip per-file confirmation.")
-    ap.add_argument("--mode", choices=["side", "replace"], default="side")
+    ap.add_argument("--mode", choices=["beside", "side", "replace"],
+                    default="side")
     ap.add_argument("--output-root", type=Path,
                     help="Required for --mode side. Mirrored output tree.")
     ap.add_argument("--source-root", type=Path,
@@ -216,6 +243,19 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
     ca.add_argument("--no-compat-audio", action="store_false",
                     dest="compat_audio",
                     help="Disable the AAC compat-track shadowing.")
+    ap.add_argument("--original-audio", action="store_true",
+                    help="Bypass the 3-stream audio ladder; map every "
+                         "input audio track via stream-copy. Ignores "
+                         "--keep-langs and --compat-audio (subtitles "
+                         "still respect --keep-langs). Use when you "
+                         "want every track preserved bit-perfectly.")
+    ap.add_argument("--original-subs", action="store_true",
+                    help="Bypass the --keep-langs filter for subtitles; "
+                         "map every input subtitle track via stream-copy. "
+                         "MKV target preserves all formats; MP4 still "
+                         "drops image subs (PGS/VOBSUB) and converts "
+                         "text to mov_text (the container's own limit, "
+                         "not the flag's).")
 
 
 def _add_apply_naming_args(ap: argparse.ArgumentParser) -> None:
@@ -290,64 +330,90 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
         description=(
             "Run scan, plan, and apply against PATH in a single command, "
             "using calibrated presets for each resolution tier (CQ 15 for "
-            "UHD, CQ 21 for HD). Pick exactly one of --output (writes new "
-            "files to a separate tree, leaves originals untouched) or "
-            "--in-place (writes alongside originals and atomically moves "
-            "the originals into a recycle directory)."
+            "UHD, CQ 21 for HD). The default output mode is 'beside': new "
+            "files land alongside the source and originals stay untouched "
+            "(see the optional `cleanup` subcommand for removing them). "
+            "Pass --output DIR to mirror outputs into a separate tree, or "
+            "--in-place to recycle the originals."
         ),
     )
     op.add_argument("path", type=Path, help="Library directory to optimize.")
-    op.add_argument("--dry-run", action="store_true",
-                    help="Print planned ffmpeg commands and exit. Combine "
-                         "with --limit 1 to preview a single encode.")
+    op.add_argument("--mode", choices=["beside", "side", "replace"],
+                    default=None,
+                    help="Output mode. 'beside' writes alongside the source "
+                         "and leaves originals untouched (default when "
+                         "neither --output nor --in-place is set). 'side' "
+                         "mirrors output into a separate tree (--output). "
+                         "'replace' writes alongside originals and moves "
+                         "the originals into a recycle directory (--in-place).")
 
-    out = op.add_mutually_exclusive_group(required=True)
+    out = op.add_mutually_exclusive_group()
     out.add_argument("--output", type=Path, metavar="DIR",
                      help="Side mode: write new files under DIR mirroring "
-                          "PATH's structure. Originals are untouched. The "
-                          "safest first-time choice.")
+                          "PATH's structure. Originals are untouched.")
     out.add_argument("--in-place", action="store_true",
                      help="Replace mode: write new files alongside originals "
                           "and move the originals into a recycle directory "
-                          "(see --recycle-to). Atomic when source and "
-                          "recycle dir are on the same filesystem.")
+                          "(see --recycle-to).")
 
     op.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
                     help="With --in-place: recycle directory for displaced "
                          "originals. If omitted, an existing @Recycle / "
                          "#recycle / .Trash under PATH is used; otherwise "
                          "<PATH>/.@Recycle is created.")
-    op.add_argument("--auto", action="store_true",
-                    help="Skip per-file confirmation prompts.")
     op.add_argument("--limit", type=int, default=0, metavar="N",
                     help="Process at most N candidates per tier "
                          "(0 = no limit). Useful with --dry-run to preview "
                          "the first encode that would run.")
-    op.add_argument("--quality", type=int, default=None,
-                    help="Override the preset CQ (HD default: 21, "
-                         "UHD default: 15). Lower = better quality + larger.")
+    op.add_argument("--dry-run", action="store_true",
+                    help="Print planned ffmpeg commands and exit. Combine "
+                         "with --limit 1 to preview a single encode.")
+    op.add_argument("--confirm", action="store_true",
+                    help="Prompt per-file before encoding. Overrides the "
+                         "auto-yes default of the bare invocation.")
+    op.add_argument("--cleanup-after", action="store_true",
+                    help="After a successful run, prompt to remove the "
+                         "originals of completed encodes.")
+    op.add_argument("--original-audio", action="store_true",
+                    help="Keep every input audio track via stream-copy "
+                         "(default strips to --keep-langs and rebuilds a "
+                         "3-stream ladder).")
+    op.add_argument("--original-subs", action="store_true",
+                    help="Keep every input subtitle track via stream-copy "
+                         "(default strips to --keep-langs).")
+    op.add_argument("--verbose", "-v", action="store_true")
+
+    # Hidden / advanced flags below — still functional, just not in --help.
+    op.add_argument("--auto", action="store_true",
+                    help=argparse.SUPPRESS)
+    op.add_argument("--workers", type=int, default=8,
+                    help=argparse.SUPPRESS)
     op.add_argument("--keep-langs", default=None,
-                    help="Override languages kept on apply (default: en,und).")
+                    help=argparse.SUPPRESS)
     op.add_argument("--hwaccel",
                     choices=["auto", "qsv", "nvenc", "vaapi",
                              "videotoolbox", "software", "none"],
                     default="auto",
-                    help="Encoder hardware backend (default: auto).")
+                    help=argparse.SUPPRESS)
     hwd = op.add_mutually_exclusive_group()
     hwd.add_argument("--hw-decode", action="store_true", default=None,
-                     help="Force zero-copy QSV decode->encode on both tiers.")
+                     help=argparse.SUPPRESS)
     hwd.add_argument("--no-hw-decode", action="store_false",
                      dest="hw_decode",
-                     help="Force CPU decode->QSV encode on both tiers.")
-    op.add_argument("--skip-scan", action="store_true",
-                    help="Reuse the existing probe cache; skip the scan "
-                         "phase. Fine when PATH hasn't changed since the "
-                         "last optimize/scan run.")
-    op.add_argument("--workers", type=int, default=8,
-                    help="Parallel workers for the scan phase (default: 8).")
-    _add_min_size_arg(op)
-    op.add_argument("--verbose", "-v", action="store_true")
-    _add_common_db_arg(op)
+                     help=argparse.SUPPRESS)
+    op.add_argument("--quality", type=int, default=None,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--min-size", type=_parse_size,
+                    default=MIN_PROBE_SIZE_BYTES,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--allow-av1", action="store_true",
+                    help=argparse.SUPPRESS)
+    op.add_argument("--allow-extras", action="store_true",
+                    help=argparse.SUPPRESS)
+    op.add_argument("--bare-invocation", action="store_true", default=False,
+                    help=argparse.SUPPRESS)
 
 
 def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
@@ -364,7 +430,8 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         # Workflow knobs (mirror _add_apply_workflow_args, narrowed).
         p.add_argument("--auto", action="store_true",
                        help="Skip per-file confirmation.")
-        p.add_argument("--mode", choices=["side", "replace"], default="side")
+        p.add_argument("--mode", choices=["beside", "side", "replace"],
+                       default="side")
         p.add_argument("--output-root", type=Path,
                        help="Required for --mode side. Mirrored output tree.")
         p.add_argument("--source-root", type=Path,
@@ -419,6 +486,10 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         ca.add_argument("--no-compat-audio", action="store_false",
                         dest="compat_audio",
                         help="Disable the AAC compat-track shadowing.")
+        p.add_argument("--original-audio", action="store_true",
+                       help="Keep every input audio track via stream-copy.")
+        p.add_argument("--original-subs", action="store_true",
+                       help="Keep every input subtitle track via stream-copy.")
         # Naming: preset turns rewrite-codec + reencode-tag on; user can opt
         # out of dotted style or change the marker token.
         p.add_argument("--no-dotted", action="store_true",
@@ -429,6 +500,37 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
                        help="Override the REENCODE marker token (default: REENCODE).")
         p.add_argument("--verbose", "-v", action="store_true")
         _add_common_db_arg(p)
+
+
+def _add_cleanup_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `cleanup` subcommand for removing post-encode originals.
+
+    Defaults to a dry-run listing keyed on the most-recent run with at
+    least one completed decision. `--apply` actually unlinks the source
+    files, gated by a 3-check guard (output exists, non-empty, distinct
+    from source) applied per-decision in `cmd_cleanup`.
+    """
+    cl = sub.add_parser(
+        "cleanup",
+        help="Remove originals of successfully-encoded files from a prior run.",
+    )
+    cl.add_argument("--run", type=int, default=None, metavar="N",
+                    help="Target a specific run id. If omitted, the most "
+                         "recent run with at least one completed decision "
+                         "is used.")
+    cl.add_argument("--apply", action="store_true",
+                    help="Actually remove the originals. Without this flag, "
+                         "cleanup prints a dry-run listing and exits.")
+    _add_common_db_arg(cl)
+
+
+def _add_wizard_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `wizard` subcommand (forward-declared stub for Task #8)."""
+    wz = sub.add_parser(
+        "wizard",
+        help="Interactive guided run (stub; full implementation lands in Task #8).",
+    )
+    _add_common_db_arg(wz)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -448,6 +550,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_doctor_parser(sub)
     _add_optimize_parser(sub)
     _add_preset_parsers(sub)
+    _add_cleanup_parser(sub)
+    _add_wizard_parser(sub)
     return p
 
 
@@ -484,9 +588,11 @@ def _scan_walk_phase(args: argparse.Namespace, db: Database, force: bool,
     skip row cleared and fall through to the normal cache-or-probe path.
     """
     min_size = max(0, getattr(args, "min_size", MIN_PROBE_SIZE_BYTES))
+    skip_extras = not bool(getattr(args, "allow_extras", False))
     seen = cached = size_skipped = errors = 0
     uncached: list[Path] = []
-    for fp in crawler.crawl(args.path, recursive=not args.no_recursive):
+    for fp in crawler.crawl(args.path, recursive=not args.no_recursive,
+                            skip_extras=skip_extras):
         seen += 1
         try:
             st = fp.stat()
@@ -598,7 +704,9 @@ def _is_reencoded_filename(path: str) -> bool:
 
 
 def _plan_probe_gate(db: Database, pr,
-                     *, allow_reencoded: bool = False) -> str:
+                     *, allow_reencoded: bool = False,
+                     allow_av1: bool = False,
+                     allow_extras: bool = False) -> str:
     """Pre-rule filter for one probe.
 
     Returns one of:
@@ -610,7 +718,17 @@ def _plan_probe_gate(db: Database, pr,
       "reencoded"  — filename carries the REENCODE marker (output of a
                      prior run); skipped permanently unless caller passes
                      allow_reencoded=True (`plan --allow-reencoded`).
-      "ok"         — admit to rule evaluation.
+      "av1_source" — source codec is AV1; re-encoding is wasteful by
+                     default. Caller can pass allow_av1=True to override
+                     (`plan --allow-av1`).
+      "extras"     — filename matches a Plex-style extras suffix
+                     (`-trailer`, `-bts`, etc.). Defensive: the crawler
+                     normally filters these at walk time, but a probe
+                     cache populated before extras filtering existed
+                     could surface them here. allow_extras=True overrides.
+      "ok"         — admit to rule evaluation. SD content (height < 720)
+                     is admitted; the per-tier presets pick which band
+                     they want.
     """
     if not Path(pr.path).exists():
         # Decisions FK back to files with default RESTRICT; delete
@@ -629,7 +747,37 @@ def _plan_probe_gate(db: Database, pr,
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
+    if not allow_av1 and (pr.video_codec or "").lower() == "av1":
+        return "av1_source"
+    if not allow_extras and crawler.is_extras_filename(Path(pr.path)):
+        return "extras"
     return "ok"
+
+
+_PLAN_SKIP_MESSAGES = (
+    ("missing",    "pruned {n} stale cache rows (source moved or deleted)"),
+    ("stalled",    "skipped {n} files with 2+ stall failures "
+                   "(see `./video_optimizer.py replace-list` for the list)"),
+    ("dv",         "skipped {n} Dolby Vision sources "
+                   "(av1_qsv stalls on DV; awaiting DV-aware encode path)"),
+    ("reencoded",  "skipped {n} files already tagged REENCODE "
+                   "(prior outputs of this tool; pass --allow-reencoded "
+                   "to re-queue)"),
+    ("av1_source", "skipped {n} AV1 sources "
+                   "(already at the target codec; pass --allow-av1 "
+                   "to re-encode anyway)"),
+    ("extras",     "skipped {n} extras "
+                   "(trailers / BTS / featurettes; pass --allow-extras "
+                   "to include them)"),
+)
+
+
+def _emit_plan_skip_summary(counts: dict) -> None:
+    """Print one summary line per non-zero plan-gate skip bucket."""
+    for key, template in _PLAN_SKIP_MESSAGES:
+        n = counts.get(key, 0)
+        if n:
+            print(template.format(n=n))
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -642,15 +790,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
         return 2
 
     allow_reencoded = bool(getattr(args, "allow_reencoded", False))
+    allow_av1 = bool(getattr(args, "allow_av1", False))
+    allow_extras = bool(getattr(args, "allow_extras", False))
     with Database(args.db) as db:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
-        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0}
+        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
+                  "av1_source": 0, "extras": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
-            verdict = _plan_probe_gate(db, pr, allow_reencoded=allow_reencoded)
+            verdict = _plan_probe_gate(
+                db, pr, allow_reencoded=allow_reencoded,
+                allow_av1=allow_av1, allow_extras=allow_extras)
             if verdict != "ok":
                 counts[verdict] += 1
                 continue
@@ -662,25 +815,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 rules_fired=[v.rule for v in cand.fired if not _is_advisory(v.rule)],
                 target=cand.target,
                 projected_savings_mb=cand.total_projected_savings_mb,
+                run_id=run_id,
             )
             candidates.append(cand)
-        pruned = counts["missing"]
-        stall_blocked = counts["stalled"]
-        dv_blocked = counts["dv"]
-        reencoded_blocked = counts["reencoded"]
-        if pruned:
+        if counts["missing"]:
             db.conn.commit()
-            print(f"pruned {pruned} stale cache rows (source moved or deleted)")
-        if stall_blocked:
-            print(f"skipped {stall_blocked} files with 2+ stall failures "
-                  f"(see `./video_optimizer.py replace-list` for the list)")
-        if dv_blocked:
-            print(f"skipped {dv_blocked} Dolby Vision sources "
-                  f"(av1_qsv stalls on DV; awaiting DV-aware encode path)")
-        if reencoded_blocked:
-            print(f"skipped {reencoded_blocked} files already tagged "
-                  f"REENCODE (prior outputs of this tool; pass "
-                  f"--allow-reencoded to re-queue)")
+        _emit_plan_skip_summary(counts)
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -691,10 +831,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
         summary = {"cleared_pending": cleared,
                    "candidates": len(candidates),
-                   "pruned_stale_rows": pruned,
-                   "stall_blocked": stall_blocked,
-                   "dv_blocked": dv_blocked,
-                   "reencoded_blocked": reencoded_blocked}
+                   "pruned_stale_rows": counts["missing"],
+                   "stall_blocked": counts["stalled"],
+                   "dv_blocked": counts["dv"],
+                   "reencoded_blocked": counts["reencoded"],
+                   "av1_blocked": counts["av1_source"],
+                   "extras_blocked": counts["extras"]}
         db.end_run(run_id, summary)
     return 0
 
@@ -736,10 +878,14 @@ def _prefilter_resolution_gate(db: Database, pending: list[dict],
     return eligible
 
 
-def cmd_apply(args: argparse.Namespace) -> int:
-    """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
+def _validate_apply_args(args: argparse.Namespace) -> int:
+    """Pre-flight checks for cmd_apply. Returns 0 on ok, nonzero exit code."""
     if args.mode == "side" and not args.output_root:
         print("error: --mode side requires --output-root", file=sys.stderr)
+        return 2
+    if args.mode == "beside" and getattr(args, "output_root", None):
+        print("error: --mode beside is incompatible with --output-root "
+              "(beside writes alongside the source)", file=sys.stderr)
         return 2
     if args.backup and getattr(args, "recycle_to", None):
         print("error: --backup and --recycle-to are mutually exclusive "
@@ -751,11 +897,24 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 2
     if not _confirm_hard_delete_if_needed(args):
         return 2
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
+    rc = _validate_apply_args(args)
+    if rc != 0:
+        return rc
 
     keep_langs = [s.strip() for s in args.keep_langs.split(",") if s.strip()]
 
     with Database(args.db) as db:
         run_id = db.start_run("apply", None, _args_dict(args))
+        # Stashed on the namespace so downstream helpers (_apply_one,
+        # _execute_encode, _finalize_output) can stamp every mark_decision
+        # with the apply run id without growing every signature. The
+        # post-run report (`_emit_run_report`) keys on this run id.
+        args._apply_run_id = run_id  # noqa: SLF001
         pending = db.list_pending_decisions()
         pending = _prefilter_resolution_gate(db, pending, args)
 
@@ -767,16 +926,19 @@ def cmd_apply(args: argparse.Namespace) -> int:
             db.end_run(run_id, {"applied": 0})
             return 0
 
-        counts = {"applied": 0, "skipped": 0, "failed": 0, "deferred": 0}
+        counts = {"applied": 0, "skipped": 0, "failed": 0,
+                  "deferred": 0, "dry_run": 0}
         bytes_saved = 0
         for i, dec in enumerate(pending, 1):
             status, saved = _apply_one(db, dec, args, keep_langs, i, len(pending))
-            # Only count terminal statuses; "dry_run" is a no-op for counters.
+            # Count every terminal/observable status so the report knows
+            # whether ≥1 decision was processed (dry_run included).
             if status in counts:
                 counts[status] += 1
             bytes_saved += saved
 
-        summary = {**counts, "approx_bytes_saved": bytes_saved}
+        summary = {k: v for k, v in counts.items() if k != "dry_run"}
+        summary["approx_bytes_saved"] = bytes_saved
         db.end_run(run_id, summary)
         deferred_note = (f", {counts['deferred']} deferred (resolution gate)"
                          if counts["deferred"] else "")
@@ -784,17 +946,24 @@ def cmd_apply(args: argparse.Namespace) -> int:
               f"{counts['skipped']} skipped, {counts['failed']} failed"
               f"{deferred_note}; "
               f"~{_format_bytes(bytes_saved)} saved")
+
+        touched = (counts["applied"] + counts["skipped"] + counts["failed"]
+                   + counts["dry_run"])
+        if touched and not getattr(args, "no_report", False):
+            _emit_run_report(db, run_id)
     return 0
 
 
 def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
                keep_langs: list[str], idx: int, total: int) -> tuple[str, int]:
     """Process a single pending decision. Returns (status, bytes_saved)."""
+    run_id = getattr(args, "_apply_run_id", None)
     pr = _load_probe_for_decision(db, dec)
     if pr is None:
         print(f"[{idx}/{total}] {dec['path']}: probe missing, skipping")
         db.mark_decision(dec["id"], "skipped",
-                         error="probe missing in cache (rerun scan)")
+                         error="probe missing in cache (rerun scan)",
+                         run_id=run_id)
         return "skipped", 0
 
     # Defense in depth: catch sources that disappeared between plan and
@@ -804,13 +973,14 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     if not Path(pr.path).exists():
         print(f"[{idx}/{total}] {pr.path}: source no longer exists, skipping")
         db.mark_decision(dec["id"], "skipped",
-                         error="source no longer exists at apply time")
+                         error="source no longer exists at apply time",
+                         run_id=run_id)
         return "skipped", 0
 
     _print_decision_header(dec, pr, idx, total)
 
     # Resolution gate: defer (leave pending) if outside the requested band.
-    # Used by hd-archive to skip UHD candidates and uhd-archive to skip HD.
+    # Used by HD/SD to skip UHD candidates and UHD to skip HD/SD, etc.
     min_h = getattr(args, "min_height", None)
     max_h = getattr(args, "max_height", None)
     if min_h is not None and pr.height < min_h:
@@ -832,7 +1002,8 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
 
     if not args.auto and not args.dry_run:
         if not _confirm("    encode this file? [y/N/q]: "):
-            db.mark_decision(dec["id"], "skipped", error="user declined")
+            db.mark_decision(dec["id"], "skipped", error="user declined",
+                             run_id=run_id)
             return "skipped", 0
 
     target = dec["target"]
@@ -843,7 +1014,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         enc_name = encoder.select_encoder(target, args.hwaccel)
     except RuntimeError as e:
         print(f"    FAIL: {e}")
-        db.mark_decision(dec["id"], "failed", error=str(e))
+        db.mark_decision(dec["id"], "failed", error=str(e), run_id=run_id)
         return "failed", 0
 
     cmd, desc = _build_apply_command(dec, pr, output_path, target_container,
@@ -852,6 +1023,10 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     if args.dry_run:
         print(f"    DRY RUN ({desc}) → {output_path}")
         print("    " + " ".join(cmd))
+        # Stamp the apply run on the row so the post-run report finds it.
+        # Status stays 'pending' — re-running apply without --dry-run should
+        # still process the row.
+        db.stamp_decision_run(dec["id"], run_id)
         return "dry_run", 0
 
     label = f"[{idx}/{total}] {Path(pr.path).name}: "
@@ -866,23 +1041,79 @@ def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> 
           f"{(dec['projected_savings_mb'] or 0) / 1024:.1f} GB")
 
 
+def _should_apply_denoise(pr: ProbeResult) -> bool:
+    """Return True if this source benefits from a software denoise pre-pass.
+
+    Triggers in two cases that share the same root cause — sources where
+    AV1's bit budget is at risk of being spent reproducing h.264
+    macroblock noise rather than real picture detail:
+
+      1. SD content (height < 720). SD almost always rides on heavy
+         compression and benefits universally from light cleanup.
+      2. h.264 in the HD band whose source bitrate is below the AV1
+         target bitrate for its resolution bucket. Above the AV1 target,
+         the source has bitrate headroom and a clean re-encode is fine.
+         Below it, the source is already showing artifacts and we want
+         to soften them before AV1 sees them.
+
+    hqdn3d is CPU-only, so callers that pass denoise=True must also
+    disable hw_decode (the QSV zero-copy pipeline can't host a software
+    filter mid-stream). Library-scale assumption: edge-case slowdown on
+    the rare low-bitrate file is preferable to a worse-quality output.
+    """
+    height = pr.height or 0
+    if 0 < height < 720:
+        return True
+    codec = (pr.video_codec or "").lower()
+    if codec != "h264":
+        return False
+    if height >= 1440 or pr.video_bitrate <= 0:
+        return False
+    bucket = pr.resolution_class
+    entry = BITRATE_FLAG_TABLE.get(bucket)
+    if entry is None:
+        return False
+    target_mbps, _flag_mbps = entry
+    actual_mbps = pr.video_bitrate / 1_000_000.0
+    return actual_mbps < target_mbps
+
+
 def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                          target_container: str, enc_name: str,
                          keep_langs: list[str],
                          args: argparse.Namespace) -> tuple[list[str], str]:
     """Pick remux vs encode and build the corresponding ffmpeg argv."""
     add_compat = getattr(args, "compat_audio", True)
+    original_audio = bool(getattr(args, "original_audio", False))
+    original_subs = bool(getattr(args, "original_subs", False))
     if _is_remux_only_decision(dec, pr):
         cmd = encoder.build_remux_command(pr, output_path,
                                           target_container, keep_langs,
-                                          add_compat_audio=add_compat)
+                                          add_compat_audio=add_compat,
+                                          original_audio=original_audio,
+                                          original_subs=original_subs)
         return cmd, "remux"
+    denoise = _should_apply_denoise(pr)
+    # No explicit hw_decode override: every code path that triggers
+    # denoise lands in the HD preset (height < 1440), which already
+    # defaults hw_decode=False. The UHD preset never sees a denoise
+    # candidate because its resolution gate is min_height=1440.
     cmd = encoder.build_encode_command(
         pr, output_path, enc_name, args.quality, keep_langs,
         target_container, hw_decode=getattr(args, "hw_decode", False),
         add_compat_audio=add_compat,
+        denoise=denoise,
+        original_audio=original_audio,
+        original_subs=original_subs,
     )
-    return cmd, f"encode via {enc_name}"
+    desc = f"encode via {enc_name}"
+    if denoise:
+        desc += " (+ denoise pre-pass)"
+    if original_audio:
+        desc += " (+ original audio passthrough)"
+    if original_subs:
+        desc += " (+ original subs passthrough)"
+    return cmd, desc
 
 
 def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
@@ -910,7 +1141,8 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                 output_path.unlink()
             except OSError:
                 pass
-        db.mark_decision(dec["id"], "failed", error=err[:1000])
+        db.mark_decision(dec["id"], "failed", error=err[:1000],
+                         run_id=getattr(args, "_apply_run_id", None))
         return "failed", 0
 
     actual_mb = _finalize_output(pr, output_path, args, db, dec)
@@ -1136,34 +1368,62 @@ def _resolve_recycle_dir(path: Path, override: Path | None) -> Path:
 
 def _optimize_resolve_paths(
     args: argparse.Namespace,
-) -> tuple[bool, Path | None, Path, Path | None] | int:
-    """Return (in_place, output_root, source_root, recycle_to) or an exit code."""
-    in_place = bool(args.in_place)
-    if in_place:
-        return (True, None, args.path,
+) -> tuple[str, Path | None, Path, Path | None] | int:
+    """Return (mode, output_root, source_root, recycle_to) or an exit code.
+
+    mode is one of "beside", "side", "replace". Resolution order:
+    explicit --mode wins; else --in-place → replace; else --output → side;
+    else default to beside.
+    """
+    if args.mode is not None:
+        mode = args.mode
+    elif args.in_place:
+        mode = "replace"
+    elif args.output is not None:
+        mode = "side"
+    else:
+        mode = "beside"
+
+    if mode == "replace":
+        return (mode, None, args.path,
                 _resolve_recycle_dir(args.path, args.recycle_to))
+    if mode == "side":
+        if args.output is None:
+            print("error: --mode side requires --output DIR", file=sys.stderr)
+            return 2
+        if args.recycle_to is not None:
+            print("error: --recycle-to only applies to --mode replace",
+                  file=sys.stderr)
+            return 2
+        return (mode, args.output, args.path, None)
+    # beside
     if args.recycle_to is not None:
-        print("error: --recycle-to only applies to --in-place", file=sys.stderr)
+        print("error: --recycle-to only applies to --mode replace",
+              file=sys.stderr)
         return 2
-    return (False, args.output, args.path, None)
+    if args.output is not None:
+        print("error: --mode beside is incompatible with --output "
+              "(beside writes alongside the source)", file=sys.stderr)
+        return 2
+    return (mode, None, args.path, None)
 
 
 def _optimize_run_apply(
     args: argparse.Namespace,
-    in_place: bool,
+    mode: str,
     output_root: Path | None,
     source_root: Path,
     recycle_to: Path | None,
 ) -> int:
     aggregate_rc = 0
-    presets_to_run = ("uhd-archive", "hd-archive")
+    presets_to_run = ("UHD", "HD", "SD")
     for step, preset_name in enumerate(presets_to_run, start=3):
         cfg = PRESETS[preset_name]
         print(f"==> [{step}/4] apply: {preset_name} ({cfg['label']})")
         preset_ns = argparse.Namespace(
             cmd=preset_name,
             auto=args.auto,
-            mode="replace" if in_place else "side",
+            mode=mode,
             output_root=output_root,
             source_root=source_root,
             backup=None,
@@ -1178,6 +1438,8 @@ def _optimize_run_apply(
             timeout=None,
             hw_decode=args.hw_decode,
             compat_audio=True,
+            original_audio=getattr(args, "original_audio", False),
+            original_subs=getattr(args, "original_subs", False),
             no_dotted=False,
             name_suffix="",
             reencode_tag_value="REENCODE",
@@ -1192,6 +1454,45 @@ def _optimize_run_apply(
     return aggregate_rc
 
 
+def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
+    """Flip auto/mode/verbose defaults when invoked via the bare-path rewrite.
+
+    `--bare-invocation` is a sentinel flag set by `_preprocess_argv` when
+    the user typed `./video_optimizer.py PATH` with no subcommand. We then
+    flip a few defaults so that point-and-shoot UX is point-and-shoot. We
+    only flip values the user didn't explicitly set elsewhere.
+    """
+    if not getattr(args, "bare_invocation", False):
+        return
+    if not args.auto:
+        args.auto = True
+    if args.mode is None and not args.in_place and args.output is None:
+        args.mode = "beside"
+    if not args.verbose:
+        args.verbose = True
+
+
+def _print_optimize_banner(
+    args: argparse.Namespace,
+    mode: str,
+    output_root: Path | None,
+    recycle_to: Path | None,
+) -> None:
+    """Print the `==> optimize:` header for a `cmd_optimize` run."""
+    print(f"==> optimize: {args.path}")
+    if mode == "beside":
+        print("    output mode: beside (alongside source; originals untouched)")
+    elif mode == "replace":
+        print("    output mode: replace (in-place)")
+        print(f"    recycle to:  {recycle_to}")
+    else:
+        print("    output mode: side (mirrored output tree)")
+        print(f"    output root: {output_root}")
+    if args.dry_run:
+        print("    DRY RUN (no encodes will run)")
+    print()
+
+
 def cmd_optimize(args: argparse.Namespace) -> int:
     """One-shot scan+plan+apply pipeline using calibrated presets.
 
@@ -1199,6 +1500,13 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     preset's resolution gate (min_height / max_height in PRESETS) keeps
     the two from clobbering each other's queue.
     """
+    _apply_bare_invocation_defaults(args)
+
+    # --confirm is the explicit opt-out from auto-yes; it wins over the
+    # bare-invocation default. (Outside the bare path it's a regular flag.)
+    if getattr(args, "confirm", False):
+        args.auto = False
+
     if not args.path.exists():
         print(f"error: path not found: {args.path}", file=sys.stderr)
         return 2
@@ -1209,29 +1517,20 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     resolved = _optimize_resolve_paths(args)
     if isinstance(resolved, int):
         return resolved
-    in_place, output_root, source_root, recycle_to = resolved
+    mode, output_root, source_root, recycle_to = resolved
 
-    print(f"==> optimize: {args.path}")
-    print(f"    output mode: {'replace (in-place)' if in_place else 'side'}")
-    print(f"    recycle to:  {recycle_to}" if in_place
-          else f"    output root: {output_root}")
-    if args.dry_run:
-        print("    DRY RUN (no encodes will run)")
-    print()
+    _print_optimize_banner(args, mode, output_root, recycle_to)
 
-    if args.skip_scan:
-        print("==> [1/4] scan: skipped (--skip-scan)")
-    else:
-        print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
-        scan_ns = argparse.Namespace(
-            cmd="scan", path=args.path, no_recursive=False,
-            no_probe_cache=False, workers=args.workers,
-            min_size=args.min_size,
-            verbose=args.verbose, db=args.db,
-        )
-        rc = cmd_scan(scan_ns)
-        if rc != 0:
-            return rc
+    print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
+    scan_ns = argparse.Namespace(
+        cmd="scan", path=args.path, no_recursive=False,
+        no_probe_cache=False, workers=args.workers,
+        min_size=args.min_size,
+        verbose=args.verbose, db=args.db,
+    )
+    rc = cmd_scan(scan_ns)
+    if rc != 0:
+        return rc
     print()
 
     print("==> [2/4] plan: evaluating rules against probe cache...")
@@ -1239,6 +1538,8 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         cmd="plan", rules=None, target="av1+mkv", json=False,
         keep_langs=args.keep_langs or "en,und",
         allow_reencoded=False,
+        allow_av1=getattr(args, "allow_av1", False),
+        allow_extras=getattr(args, "allow_extras", False),
         db=args.db,
     )
     rc = cmd_plan(plan_ns)
@@ -1246,7 +1547,59 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return rc
     print()
 
-    return _optimize_run_apply(args, in_place, output_root, source_root, recycle_to)
+    rc = _optimize_run_apply(args, mode, output_root, source_root, recycle_to)
+    if rc == 0 and getattr(args, "cleanup_after", False):
+        _invoke_cleanup_after(args)
+    return rc
+
+
+def _invoke_cleanup_after(args: argparse.Namespace) -> None:
+    """Chain `cmd_cleanup --apply` after a successful optimize run.
+
+    Called when `--cleanup-after` is set and the apply phase returned 0.
+    Resolves the target run id (most-recent run with completions) so
+    the user-facing confirmation prompt can name it. Under `--auto`
+    (which the bare invocation flips on) we skip the prompt — the user
+    opted into chained cleanup already. Otherwise we ask once; on
+    anything other than `y` we print the equivalent `cleanup` command
+    so the user can run it deliberately later.
+    """
+    with Database(args.db) as db:
+        target_run = db.latest_run_with_completions()
+    if target_run is None:
+        print("--cleanup-after: no completed encodes to clean up.")
+        return
+
+    # Count completions just so the prompt is informative.
+    with Database(args.db) as db:
+        decisions = [
+            d for d in db.decisions_for_run(target_run)
+            if d.get("status") == "completed"
+        ]
+    n = len(decisions)
+
+    if not args.auto:
+        try:
+            ans = input(
+                f"Run --cleanup-after will permanently delete {n} originals "
+                f"from run #{target_run}. Continue? [y/N]: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = ""
+        if not ans.startswith("y"):
+            print(f"skipped cleanup; run "
+                  f"'./video_optimizer.py cleanup --run {target_run} --apply' "
+                  f"later if you change your mind")
+            return
+
+    cleanup_ns = argparse.Namespace(
+        cmd="cleanup",
+        run=None,
+        apply=True,
+        db=args.db,
+    )
+    cmd_cleanup(cleanup_ns)
 
 
 def cmd_preset(args: argparse.Namespace) -> int:
@@ -1339,6 +1692,32 @@ def cmd_replace_list(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+_REPORT_DIR = Path.home() / ".video_optimizer" / "reports"
+
+
+def _emit_run_report(db: Database, run_id: int) -> None:
+    """Print + persist the post-apply report keyed on `run_id`.
+
+    Stdout always happens; persistence is best-effort and falls back to a
+    one-line stderr warning if `~/.video_optimizer/reports/` isn't writable
+    (read-only home, OSError on mkdir, etc.).
+    """
+    decisions = db.decisions_for_run(run_id)
+    runs_row = db.get_run(run_id) or {"id": run_id}
+    if not decisions:
+        return
+    stdout_text, persist_text = report.format_run_report(decisions, runs_row)
+    print()
+    print(stdout_text)
+
+    try:
+        _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = _REPORT_DIR / f"run-{run_id}.txt"
+        report_path.write_text(persist_text)
+    except OSError as e:
+        print(f"warning: could not persist run report: {e}", file=sys.stderr)
 
 
 def _format_bytes(n: int) -> str:
@@ -1459,6 +1838,12 @@ def _compute_output_path(pr: ProbeResult, args: argparse.Namespace,
     if args.mode == "replace":
         return src.with_name(new_name)
 
+    if args.mode == "beside":
+        # beside mode: write next to the source; originals stay put. The
+        # collision-safety guarantee comes from --rewrite-codec +
+        # --reencode-tag producing e.g. foo.AV1.REENCODE.mkv from foo.mkv.
+        return src.with_name(new_name)
+
     # side mode: place under --output-root, preserving relative structure.
     if args.source_root:
         try:
@@ -1507,72 +1892,106 @@ def _recycle_destination(src: Path, recycle_to: Path,
         counter += 1
 
 
+def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
+                               args: argparse.Namespace, db: Database,
+                               dec: dict, actual_mb: float,
+                               run_id: int | None) -> str | None:
+    """Run the replace-mode disposal (recycle, backup, unlink original).
+
+    Returns None on success or a status string ("recycled"/"backed-up"/etc.)
+    when the disposal completed without further work; returns the string
+    "done" when the caller should mark the decision and return without
+    additional processing because the helper already wrote a partial-error
+    completion row.
+    """
+    recycle_to = getattr(args, "recycle_to", None)
+    if recycle_to:
+        # Atomic move into recycle-bin instead of copy-then-delete. Wins
+        # over --backup for NAS targets: no doubled disk use, no I/O
+        # cost beyond a directory entry rename when source and target
+        # share a filesystem.
+        dst = _recycle_destination(Path(pr.path), recycle_to,
+                                   getattr(args, "source_root", None))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(pr.path), str(dst))
+        except OSError as e:
+            print(f"    WARN: recycle move failed: {e}; "
+                  f"keeping output and original intact")
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"recycle move failed: {e}",
+                             run_id=run_id)
+            return "done"
+        # Original is now at `dst`; nothing more to delete.
+        return None
+    if args.backup:
+        args.backup.mkdir(parents=True, exist_ok=True)
+        backup_path = args.backup / Path(pr.path).name
+        counter = 1
+        while backup_path.exists():
+            backup_path = args.backup / (
+                f"{Path(pr.path).stem}_backup{counter}{Path(pr.path).suffix}"
+            )
+            counter += 1
+        try:
+            shutil.copy2(pr.path, backup_path)
+        except OSError as e:
+            print(f"    WARN: backup failed: {e}; "
+                  f"keeping output and original intact")
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"backup failed: {e}",
+                             run_id=run_id)
+            return "done"
+    # When --recycle-to is set the move above already removed the
+    # original; otherwise unlink it now (after the optional backup copy).
+    if Path(pr.path) != output_path:
+        try:
+            Path(pr.path).unlink()
+        except OSError as e:
+            db.mark_decision(dec["id"], "completed",
+                             output_path=str(output_path),
+                             actual_savings_mb=actual_mb,
+                             error=f"original not removed: {e}",
+                             run_id=run_id)
+            return "done"
+    return None
+
+
 def _finalize_output(pr: ProbeResult, output_path: Path,
                      args: argparse.Namespace, db: Database,
                      dec: dict) -> float:
     """Compute savings, run backup-or-recycle + remove-original, update db."""
+    run_id = getattr(args, "_apply_run_id", None)
     try:
         out_size = output_path.stat().st_size
     except OSError:
         out_size = 0
     actual_mb = (pr.size - out_size) / (1024 * 1024)
 
-    if args.mode == "replace":
-        recycle_to = getattr(args, "recycle_to", None)
-        if recycle_to:
-            # Atomic move into recycle-bin instead of copy-then-delete. Wins
-            # over --backup for NAS targets: no doubled disk use, no I/O
-            # cost beyond a directory entry rename when source and target
-            # share a filesystem.
-            dst = _recycle_destination(Path(pr.path), recycle_to,
-                                       getattr(args, "source_root", None))
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.move(str(pr.path), str(dst))
-            except OSError as e:
-                print(f"    WARN: recycle move failed: {e}; "
-                      f"keeping output and original intact")
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"recycle move failed: {e}")
-                return actual_mb
-            # Original is now at `dst`; nothing more to delete.
-        elif args.backup:
-            args.backup.mkdir(parents=True, exist_ok=True)
-            backup_path = args.backup / Path(pr.path).name
-            counter = 1
-            while backup_path.exists():
-                backup_path = args.backup / (
-                    f"{Path(pr.path).stem}_backup{counter}{Path(pr.path).suffix}"
-                )
-                counter += 1
-            try:
-                shutil.copy2(pr.path, backup_path)
-            except OSError as e:
-                print(f"    WARN: backup failed: {e}; "
-                      f"keeping output and original intact")
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"backup failed: {e}")
-                return actual_mb
+    if args.mode == "beside":
+        # beside mode never touches the original — the whole point is that
+        # the user (or a follow-up cleanup step) decides when to delete
+        # them. Skip every disposal branch and record the success.
+        db.mark_decision(dec["id"], "completed",
+                         output_path=str(output_path),
+                         actual_savings_mb=actual_mb,
+                         run_id=run_id)
+        return actual_mb
 
-        # When --recycle-to is set the move above already removed the
-        # original; otherwise unlink it now (after the optional backup copy).
-        if not recycle_to and Path(pr.path) != output_path:
-            try:
-                Path(pr.path).unlink()
-            except OSError as e:
-                db.mark_decision(dec["id"], "completed",
-                                 output_path=str(output_path),
-                                 actual_savings_mb=actual_mb,
-                                 error=f"original not removed: {e}")
-                return actual_mb
+    if args.mode == "replace":
+        outcome = _finalize_replace_disposal(pr, output_path, args, db,
+                                             dec, actual_mb, run_id)
+        if outcome == "done":
+            return actual_mb
 
     db.mark_decision(dec["id"], "completed",
                      output_path=str(output_path),
-                     actual_savings_mb=actual_mb)
+                     actual_savings_mb=actual_mb,
+                     run_id=run_id)
     return actual_mb
 
 
@@ -1584,6 +2003,502 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
 _FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
     "scan", "reprobe", "apply", "list-encoders", "optimize",
 })
+
+
+# Single source of truth for argv preprocessing (see main()). Includes
+# forward-declared subcommands (cleanup, wizard) so the dispatch logic
+# doesn't need re-editing when their full handlers land.
+KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
+    "scan", "reprobe", "plan", "apply", "status",
+    "list-encoders", "replace-list", "doctor",
+    "optimize", "cleanup", "wizard",
+}) | frozenset(PRESETS.keys())
+
+
+def _classify_cleanup_decision(dec: dict) -> tuple[str, int, str | None]:
+    """Apply the cleanup 3-check guard to one completed decision.
+
+    Returns ``(source_path, size_bytes, reason_or_None)``. A non-None
+    reason means the decision is **not** cleanable and should be
+    reported as SKIP; size_bytes is meaningful only when reason is None.
+
+    The 3-check guard:
+      (a) decisions.output_path exists on disk,
+      (b) output is non-empty (stat().st_size > 0),
+      (c) output_path != source_path (paranoid; beside mode makes them
+          siblings, not the same).
+    Plus a sanity check that the source still exists — a no-op cleanup
+    on a vanished source is silent noise we'd rather log explicitly.
+    """
+    source_path = dec.get("path") or ""
+    output_path = dec.get("output_path") or ""
+
+    if not output_path:
+        return source_path, 0, "no output_path recorded"
+    # Guard (c) first — paranoid same-path check.
+    if output_path == source_path:
+        return source_path, 0, "output_path == source_path"
+    out = Path(output_path)
+    # Guard (a) — output must exist.
+    if not out.exists():
+        return source_path, 0, f"output missing: {output_path}"
+    # Guard (b) — non-empty.
+    try:
+        out_size = out.stat().st_size
+    except OSError as e:
+        return source_path, 0, f"stat failed: {e}"
+    if out_size <= 0:
+        return source_path, 0, "output zero-byte"
+
+    src = Path(source_path)
+    if not src.exists():
+        return source_path, 0, "source already removed"
+    try:
+        src_size = src.stat().st_size
+    except OSError as e:
+        return source_path, 0, f"source stat failed: {e}"
+    return source_path, src_size, None
+
+
+def _cleanup_apply_unlinks(cleanable: list[tuple[str, int]]) -> tuple[int, int]:
+    """Unlink each cleanable source. Returns (removed_count, freed_bytes)."""
+    removed = 0
+    freed_bytes = 0
+    for source_path, sz in cleanable:
+        try:
+            Path(source_path).unlink()
+        except OSError as e:
+            print(f"warning: could not remove {source_path}: {e}",
+                  file=sys.stderr)
+            continue
+        removed += 1
+        freed_bytes += sz
+    return removed, freed_bytes
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """Remove originals of successfully-encoded files from a prior run.
+
+    Default mode is dry-run: print which originals *would* be removed,
+    sized. `--apply` actually `unlink()`s the source files in Python
+    (not via shell `rm`) after the 3-check guard in
+    `_classify_cleanup_decision`. Skipped sources are reported as SKIP
+    and never unlinked. Frames the work in a `start_run`/`end_run`
+    pair so `runs` captures the audit trail.
+    """
+    with Database(args.db) as db:
+        run_id = args.run
+        if run_id is None:
+            run_id = db.latest_run_with_completions()
+        if run_id is None:
+            print("no completed encodes in run None "
+                  "(or no run found); nothing to clean up")
+            return 0
+
+        cleanup_run_id = db.start_run(
+            "cleanup", None,
+            {"target_run": run_id, "apply": bool(args.apply)},
+        )
+        decisions = [
+            d for d in db.decisions_for_run(run_id)
+            if d.get("status") == "completed"
+        ]
+        if not decisions:
+            print(f"no completed encodes in run {run_id} "
+                  f"(or no run found); nothing to clean up")
+            db.end_run(cleanup_run_id,
+                       {"target_run": run_id, "removed": 0,
+                        "freed_bytes": 0, "skipped": 0})
+            return 0
+
+        cleanable: list[tuple[str, int]] = []
+        skipped: list[tuple[str, str]] = []
+        for dec in decisions:
+            source_path, sz, reason = _classify_cleanup_decision(dec)
+            if reason is None:
+                cleanable.append((source_path, sz))
+            else:
+                skipped.append((source_path, reason))
+
+        for source_path, reason in skipped:
+            print(f"SKIP {reason}  {source_path}")
+
+        if not args.apply:
+            total_bytes = sum(sz for _, sz in cleanable)
+            for source_path, sz in cleanable:
+                print(f"would remove  {_format_bytes(sz)}  {source_path}")
+            print(
+                f"summary: {len(cleanable)} cleanable, "
+                f"{_format_bytes(total_bytes)} total. "
+                f"Re-run with --apply to actually remove."
+            )
+            db.end_run(cleanup_run_id, {
+                "target_run": run_id,
+                "cleanable": len(cleanable),
+                "skipped": len(skipped),
+                "freed_bytes": 0,
+                "dry_run": True,
+            })
+            return 0
+
+        removed, freed_bytes = _cleanup_apply_unlinks(cleanable)
+        print(f"removed {removed} originals, "
+              f"freed {_format_bytes(freed_bytes)}")
+        db.end_run(cleanup_run_id, {
+            "target_run": run_id,
+            "removed": removed,
+            "freed_bytes": freed_bytes,
+            "skipped": len(skipped),
+        })
+        return 0
+
+
+class _WizardAbort(Exception):
+    """Raised by `_prompt` on Ctrl-C / EOF to unwind cmd_wizard cleanly.
+
+    The outer try/except in `cmd_wizard` translates this into a single-line
+    "aborted" message + sys.exit(130), so the user never sees a traceback
+    just for closing the terminal mid-prompt.
+    """
+
+
+def _prompt(prompt: str, default: str | None = None,
+            choices: list[str] | None = None) -> str:
+    """input() wrapper used by the wizard. Tests patch builtins.input.
+
+    `default`: returned verbatim if the user just presses Enter.
+    `choices`: lowercased; the user's answer (lowercased) must match one
+    of them. On no-match, re-prompt with a "please choose: <list>" hint
+    (no retry cap — the user keeps typing until they pick one).
+
+    KeyboardInterrupt / EOFError are caught and re-raised as `_WizardAbort`
+    so the outer wizard loop can convert them into a clean exit-130.
+    """
+    if choices is not None:
+        lowered = [c.lower() for c in choices]
+    else:
+        lowered = None
+    while True:
+        try:
+            answer = input(prompt)
+        except (KeyboardInterrupt, EOFError) as exc:
+            raise _WizardAbort from exc
+        answer = answer.strip()
+        if not answer and default is not None:
+            return default
+        if lowered is not None:
+            if answer.lower() in lowered:
+                return answer.lower()
+            print(f"  please choose: {', '.join(choices or [])}")
+            continue
+        return answer
+
+
+def _wizard_estimate_seconds(decisions: list[dict],
+                             db: Database) -> tuple[int, int, int, int]:
+    """Return (uhd, hd, sd, total_estimated_seconds) for `decisions`.
+
+    Tier is decided by probe height against the SD/HD/UHD preset bounds
+    (UHD ≥ 1440, HD 720..1439, SD < 720). Each tier's count multiplies
+    its `EST_SECONDS_PER_FILE` entry into the total estimate.
+    """
+    uhd_count = hd_count = sd_count = total_seconds = 0
+    uhd_min = PRESETS["UHD"].get("min_height", 1440) or 1440
+    hd_min = PRESETS["HD"].get("min_height", 720) or 720
+    for dec in decisions:
+        pr = _load_probe_for_decision(db, dec)
+        height = pr.height if pr is not None else 0
+        if height >= uhd_min:
+            uhd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("UHD", 0)
+        elif height >= hd_min:
+            hd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("HD", 0)
+        else:
+            sd_count += 1
+            total_seconds += EST_SECONDS_PER_FILE.get("SD", 0)
+    return uhd_count, hd_count, sd_count, total_seconds
+
+
+def _format_hours(seconds: int) -> str:
+    """Render a wall-clock estimate as ~Nh / ~Nm. Used by the wizard summary."""
+    if seconds <= 0:
+        return "~0m"
+    if seconds < 3600:
+        return f"~{max(1, seconds // 60)}m"
+    hours = seconds / 3600.0
+    if hours < 10:
+        return f"~{hours:.1f}h"
+    return f"~{int(round(hours))}h"
+
+
+def _wizard_pick_path(args: argparse.Namespace) -> Path | None:  # noqa: ARG001
+    """Prompt for the library path. Returns None if user gave an empty answer
+    (treated as a clean exit), or a validated Path. Re-prompts up to 3 times
+    on invalid paths before giving up via `_WizardAbort`."""
+    for _ in range(3):
+        raw = _prompt("Path to the directory you want to optimize: ",
+                      default="")
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        if candidate.is_dir():
+            return candidate
+        print(f"  not a directory: {candidate}")
+    print("  too many invalid paths; aborting", file=sys.stderr)
+    raise _WizardAbort
+
+
+def _wizard_pick_mode(
+    args: argparse.Namespace,  # noqa: ARG001
+    library: Path,
+) -> tuple[str, Path | None, Path | None]:
+    """Prompt for the output mode. Returns (mode, output_root, recycle_to)."""
+    print()
+    print("Where should the encoded files go?")
+    print("  [1] Next to the originals (originals untouched)              [default]")
+    print("  [2] Mirror into a separate output directory")
+    print("  [3] Replace originals (move them to a recycle directory)")
+    choice = _prompt("Choice [1]: ", default="1", choices=["1", "2", "3"])
+    if choice == "1":
+        return ("beside", None, None)
+    if choice == "2":
+        raw = _prompt("  Output directory: ", default="")
+        if not raw:
+            print("  no output directory given; aborting", file=sys.stderr)
+            raise _WizardAbort
+        return ("side", Path(raw).expanduser(), None)
+    # choice == "3"
+    raw = _prompt("  Recycle directory (blank = auto-detect under library): ",
+                  default="")
+    recycle_to = Path(raw).expanduser() if raw else None
+    return ("replace", None, recycle_to or _resolve_recycle_dir(library, None))
+
+
+def _wizard_apply_namespace(
+    args: argparse.Namespace,
+    library: Path,
+    mode: str,
+    output_root: Path | None,
+    recycle_to: Path | None,
+    limit: int,
+) -> argparse.Namespace:
+    """Build the Namespace cmd_optimize hands to its preset router.
+
+    Mirrors `_optimize_run_apply`'s shape (which is the proven recipe for
+    chaining the UHD + HD presets through one queue) but lets the wizard
+    inject its own `limit` and `mode`-derived paths.
+    """
+    return argparse.Namespace(
+        path=library,
+        auto=True,
+        mode=mode,
+        output=output_root,
+        in_place=(mode == "replace"),
+        recycle_to=recycle_to,
+        limit=limit,
+        dry_run=False,
+        confirm=False,
+        cleanup_after=False,
+        verbose=True,
+        workers=8,
+        keep_langs=None,
+        hwaccel="auto",
+        hw_decode=None,
+        quality=None,
+        min_size=MIN_PROBE_SIZE_BYTES,
+        db=args.db,
+        bare_invocation=False,
+    )
+
+
+def _wizard_doctor_preflight(args: argparse.Namespace) -> bool:
+    """Run cmd_doctor; return True iff the wizard should proceed."""
+    print("==> doctor: preflight checks")
+    doctor_ns = argparse.Namespace(probe=None, db=args.db)
+    rc = cmd_doctor(doctor_ns)
+    if rc == 0:
+        return True
+    ans = _prompt("doctor reported issues. continue anyway? [y/N]: ",
+                  default="n", choices=["y", "n"])
+    return ans == "y"
+
+
+def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
+    """Run scan + plan against `library`. Returns 0 on success, nonzero else."""
+    print()
+    print(f"==> scan: probing {library}")
+    scan_ns = argparse.Namespace(
+        cmd="scan", path=library, no_recursive=False,
+        no_probe_cache=False, workers=None,
+        min_size=MIN_PROBE_SIZE_BYTES,
+        verbose=False, db=args.db,
+    )
+    if cmd_scan(scan_ns) != 0:
+        print("scan failed; aborting", file=sys.stderr)
+        return 1
+    print()
+    print("==> plan: evaluating rules")
+    plan_ns = argparse.Namespace(
+        cmd="plan", rules=None, target="av1+mkv", json=False,
+        keep_langs="en,und", allow_reencoded=False,
+        allow_av1=False, allow_extras=False,
+        db=args.db,
+    )
+    if cmd_plan(plan_ns) != 0:
+        print("plan failed; aborting", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _wizard_pick_limit(pending: list[dict], db: Database) -> int | None:
+    """Print the plan summary and ask how many files to encode.
+
+    Returns the limit (0 == all), or None if the user chose to quit.
+    """
+    uhd, hd, sd, est_seconds = _wizard_estimate_seconds(pending, db)
+    uhd_hours = _format_hours(uhd * EST_SECONDS_PER_FILE["UHD"])
+    hd_hours = _format_hours(hd * EST_SECONDS_PER_FILE["HD"])
+    sd_hours = _format_hours(sd * EST_SECONDS_PER_FILE["SD"])
+    print()
+    print(f"Found {len(pending)} candidate(s): "
+          f"{uhd} UHD ({uhd_hours}), {hd} HD ({hd_hours}), "
+          f"{sd} SD ({sd_hours})")
+    print(f"Estimated total time: {_format_hours(est_seconds)} on "
+          "Intel Battlemage iGPU; your hardware may vary.")
+    print()
+    print("Encode all of them, or just the first N?")
+    print("  [a] All of them                                              "
+          "[default]")
+    print("  [n] First N (you'll be asked how many)")
+    print("  [q] Quit without encoding")
+    choice = _prompt("Choice [a]: ", default="a", choices=["a", "n", "q"])
+    if choice == "q":
+        return None
+    if choice == "a":
+        return 0
+    while True:
+        raw = _prompt("How many? ", default="")
+        try:
+            limit = int(raw)
+        except ValueError:
+            print("  please enter an integer")
+            continue
+        if limit <= 0:
+            print("  please enter a positive integer")
+            continue
+        return limit
+
+
+def _wizard_run_cleanup_prompt(args: argparse.Namespace) -> None:
+    """After apply, offer to remove originals if ≥1 file was encoded."""
+    with Database(args.db) as db:
+        recent = db.recent_runs(limit=1)
+    encoded = 0
+    saved_bytes = 0
+    if recent and recent[0].get("summary_json"):
+        try:
+            summary = json.loads(recent[0]["summary_json"])
+        except (TypeError, ValueError):
+            summary = {}
+        encoded = int(summary.get("applied", 0) or 0)
+        saved_bytes = int(summary.get("approx_bytes_saved", 0) or 0)
+    if encoded < 1:
+        return
+    print()
+    print(f"Run complete. {encoded} original(s) can be removed "
+          f"(saved {_format_bytes(saved_bytes)} total).")
+    ans = _prompt("Remove the originals now? [y/N]: ",
+                  default="n", choices=["y", "n"])
+    if ans == "y":
+        cmd_cleanup(argparse.Namespace(run=None, apply=True, db=args.db))
+    else:
+        print("keep 'em. Run "
+              "'./video_optimizer.py cleanup --run M --apply' "
+              "later when you're ready.")
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:
+    """Interactive prompt-based workflow.
+
+    Composes `cmd_doctor`, `cmd_scan`, `cmd_plan`, `cmd_optimize` (which
+    itself routes through `cmd_preset` → `cmd_apply`), and `cmd_cleanup`.
+    No new business logic — this is purely a Q&A surface for users who
+    don't want to read --help. See plan §6 / "Wizard prompt sequence".
+    """
+    try:
+        if not _wizard_doctor_preflight(args):
+            return 0
+        print()
+
+        library = _wizard_pick_path(args)
+        if library is None:
+            return 0
+
+        mode, output_root, recycle_to = _wizard_pick_mode(args, library)
+
+        rc = _wizard_run_scan_plan(args, library)
+        if rc != 0:
+            return rc
+
+        with Database(args.db) as db:
+            pending = db.list_pending_decisions()
+            if not pending:
+                print()
+                print("no candidates found. nothing to do.")
+                return 0
+            limit = _wizard_pick_limit(pending, db)
+        if limit is None:
+            return 0
+
+        print()
+        if _prompt("Proceed? [Y/n]: ",
+                   default="y", choices=["y", "n"]) != "y":
+            return 0
+
+        apply_ns = _wizard_apply_namespace(
+            args, library, mode, output_root, recycle_to, limit,
+        )
+    except (KeyboardInterrupt, EOFError, _WizardAbort):
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
+    rc = cmd_optimize(apply_ns)
+    try:
+        _wizard_run_cleanup_prompt(args)
+    except (KeyboardInterrupt, EOFError, _WizardAbort):
+        print("\naborted", file=sys.stderr)
+        sys.exit(130)
+    return rc
+
+
+def _preprocess_argv(argv: list[str]) -> list[str]:
+    """Rewrite a bare `<path>` invocation to `optimize <path> --bare-invocation`.
+
+    Predicate, evaluated in order (first match wins):
+      - argv has zero positional args + stdin/stdout TTY → rewrite to wizard.
+      - argv has zero positional args (no TTY) → no rewrite (top-level help).
+      - argv[1] is -h / --help         → no rewrite.
+      - argv[1] starts with `-`        → no rewrite (let argparse handle).
+      - argv[1] is a known subcommand  → no rewrite.
+      - otherwise                      → rewrite to optimize-with-sentinel.
+    """
+    if len(argv) <= 1:
+        # Bare invocation with no args. If we're attached to a real terminal
+        # on both ends, drop into the interactive wizard; otherwise fall
+        # through to argparse's "subcommand required" error / top-level help
+        # so cron / piped contexts stay non-interactive.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return [argv[0], "wizard"]
+        return argv
+    first = argv[1]
+    if first in {"-h", "--help"}:
+        return argv
+    if first.startswith("-"):
+        return argv
+    if first in KNOWN_SUBCOMMANDS:
+        return argv
+    # Preserve argv[0] (prog name) so the caller's argv[1:] slice still works.
+    return [argv[0], "optimize", first, *argv[2:], "--bare-invocation"]
 
 
 def _assert_external_tools_available(cmd: str) -> None:
@@ -1608,8 +2523,11 @@ def _assert_external_tools_available(cmd: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Dispatches to the chosen subcommand handler."""
+    if argv is None:
+        argv = sys.argv
+    argv = _preprocess_argv(argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv[1:])
     _assert_external_tools_available(args.cmd)
 
     handlers = {
@@ -1622,6 +2540,8 @@ def main(argv: list[str] | None = None) -> int:
         "replace-list": cmd_replace_list,
         "doctor": cmd_doctor,
         "optimize": cmd_optimize,
+        "cleanup": cmd_cleanup,
+        "wizard": cmd_wizard,
     }
     # Preset subcommands all dispatch to the same wrapper.
     for preset_name in PRESETS:

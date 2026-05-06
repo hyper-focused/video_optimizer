@@ -43,23 +43,35 @@ from __future__ import annotations
 #                          quality plateau, CQ 17 falls off the knee)
 
 PRESETS: dict[str, dict[str, object]] = {
-    "hd-archive": {
-        "label": "1080p / HD library archive (AV1 + MKV)",
+    "SD": {
+        "label": "≤719p / SD library archive (AV1 + MKV)",
+        "target": "av1+mkv",
+        "quality": 24,             # looser than HD: SD is more perceptually
+                                   # fragile under heavy compression, and the
+                                   # storage delta vs CQ 21 is small at SD sizes
+        "rewrite_codec": True,
+        "reencode_tag": True,
+        "keep_langs": "en,und",
+        "max_height": 719,         # SD only — leave HD/UHD for their tiers
+    },
+    "HD": {
+        "label": "720–1439p / HD library archive (AV1 + MKV)",
         "target": "av1+mkv",
         "quality": 21,
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
-        "max_height": 1439,        # SD/HD only — skip UHD, leave for uhd-archive
+        "min_height": 720,
+        "max_height": 1439,        # HD only — leave UHD for its tier
     },
-    "uhd-archive": {
-        "label": "2160p / UHD library archive (AV1 + MKV)",
+    "UHD": {
+        "label": "≥1440p / UHD library archive (AV1 + MKV)",
         "target": "av1+mkv",
         "quality": 15,
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
-        "min_height": 1440,        # UHD/QHD only — skip HD, leave for hd-archive
+        "min_height": 1440,        # UHD/QHD only — leave HD/SD for their tiers
         # 4K HEVC sources land in the SW HEVC decoder otherwise; on a
         # 60 Mbps 2160p stream that's 4–6 cores chewing decode while the
         # GPU encode waits, observed as fps decay during long batches.
@@ -69,6 +81,35 @@ PRESETS: dict[str, dict[str, object]] = {
         # Override per run with --no-hw-decode if a specific title trips it.
         "hw_decode": True,
     },
+}
+
+
+# --------------------------------------------------------------------------- #
+# Per-tier wall-clock estimate per file (consumed by the wizard's plan summary)
+# --------------------------------------------------------------------------- #
+
+# Estimated wall-clock seconds to encode a single representative file in
+# each tier. Calibrated for the developer's hardware: Intel Battlemage
+# iGPU with QSV hw decode + av1_qsv encode, ffmpeg 7.x.
+#
+#   SD:  ~5 min/file   — 480p remux on av1_qsv (CPU decode + GPU encode)
+#   HD:  ~15 min/file  — 1080p Blu-ray remux at ~220 fps
+#   UHD: ~1 hour/file  — 2160p HDR Blu-ray remux at ~40–55 fps
+#
+# Older Intel iGPUs (Tiger Lake / Alder Lake), NVENC, VAAPI, or the
+# software fallback (libsvtav1) will land elsewhere — sometimes by an
+# order of magnitude. The wizard's plan summary should always print a
+# one-line caveat alongside any total it derives from these numbers
+# (something like: "based on Intel Battlemage; your hardware may vary").
+#
+# Single source of truth: if hardware throughput shifts materially
+# (driver update, new silicon, encoder retune), update the values here.
+# The wizard reads this dict — don't duplicate the numbers anywhere else.
+
+EST_SECONDS_PER_FILE: dict[str, int] = {
+    "SD":  300,    # ~5 min — typical 480p, CPU decode + GPU encode
+    "HD":  900,    # ~15 min — 1080p remux, Battlemage iGPU @ ~220 fps
+    "UHD": 3600,   # ~1 hour — 2160p HDR remux, Battlemage iGPU @ ~40–55 fps
 }
 
 
@@ -129,7 +170,7 @@ AV1_QSV_BASE: dict[str, str] = {
 # folders) where the projected savings don't justify the encode.
 # Override per run with `scan --min-size <N>` (accepts `1G`, `500M`, `0`).
 # `0` disables the gate entirely.
-MIN_PROBE_SIZE_BYTES: int = 1024 ** 3   # 1 GB
+MIN_PROBE_SIZE_BYTES: int = 100 * 1024 * 1024   # 100 MB
 
 # --------------------------------------------------------------------------- #
 # Bitrate flag table (consumed by rules.OverBitratedRule)

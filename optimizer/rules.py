@@ -33,6 +33,13 @@ _LEGACY_CONTAINERS: frozenset[str] = frozenset({
 _MODERN_CODECS: frozenset[str] = frozenset({"h264", "hevc", "av1", "vp9"})
 
 
+# Codecs older or less efficient than AV1 that benefit from a transcode
+# whenever the source bitrate is at or above the AV1 target bitrate for
+# the file's resolution. h.264 is the dominant case — widely used, still
+# noticeably less efficient than AV1 at matched perceptual quality.
+_INEFFICIENT_CODECS: frozenset[str] = frozenset({"h264"})
+
+
 _MB = 1024.0 * 1024.0
 
 
@@ -113,33 +120,128 @@ class OverBitratedRule(Rule):
 # --------------------------------------------------------------------------- #
 
 
+def _codec_set_verdict(probe: ProbeResult, name: str, *,
+                       codec_set: frozenset[str], savings_frac: float,
+                       severity: str, reason: str,
+                       height_band: tuple[int, int] | None = None,
+                       ) -> RuleVerdict:
+    """Shared evaluator for codec-membership rules. ``reason`` may use {codec}.
+    ``height_band=(low, high)`` gates on probe height in [low, high)."""
+    codec = (probe.video_codec or "").lower()
+    if codec not in codec_set:
+        return _miss(name)
+    h = probe.height or 0
+    if height_band and not (height_band[0] <= h < height_band[1]):
+        return _miss(name)
+    notes = {"codec": codec, "height": h} if height_band else {"codec": codec}
+    return RuleVerdict(
+        rule=name, fired=True, severity=severity,
+        reason=reason.format(codec=codec),
+        projected_savings_mb=max((probe.size or 0) * savings_frac / _MB, 0.0),
+        notes=notes,
+    )
+
+
 class LegacyCodecRule(Rule):
-    """Flag files using legacy/obsolete video codecs."""
+    """Flag files using legacy/obsolete video codecs (MPEG-2, VC-1, WMV, ...)."""
 
     name = "legacy_codec"
     advisory = False
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        """Fire when the source codec is on the legacy list (MPEG-2, VC-1, WMV, ...)."""
-        codec = (probe.video_codec or "").lower()
-        if codec not in _LEGACY_CODECS:
-            return _miss(self.name)
-
-        savings_mb = max((probe.size or 0) * 0.5 / _MB, 0.0)
-        reason = f"legacy codec {codec!r}; modern encode typically halves size"
-        return RuleVerdict(
-            rule=self.name,
-            fired=True,
-            reason=reason,
-            severity="high",
-            projected_savings_mb=savings_mb,
-            notes={"codec": codec},
+        return _codec_set_verdict(
+            probe, self.name,
+            codec_set=_LEGACY_CODECS,
+            savings_frac=0.5, severity="high",
+            reason="legacy codec {codec!r}; modern encode typically halves size",
         )
 
 
 # --------------------------------------------------------------------------- #
-# ContainerMigrationRule
+# InefficientCodecRule / ContainerMigrationRule
 # --------------------------------------------------------------------------- #
+
+
+def _non_av1_verdict(probe: ProbeResult, name: str, *,
+                     height_band: tuple[int, int],
+                     savings_frac: float, severity: str,
+                     tier_label: str) -> RuleVerdict:
+    """Shared evaluator: fire when codec != av1 and height is in [low, high)."""
+    codec = (probe.video_codec or "").lower()
+    if codec == "av1":
+        return _miss(name)
+    h = probe.height or 0
+    if not (height_band[0] <= h < height_band[1]):
+        return _miss(name)
+    return RuleVerdict(
+        rule=name, fired=True,
+        reason=f"{codec} at {tier_label}; AV1 target codec for this tier",
+        severity=severity,
+        projected_savings_mb=max((probe.size or 0) * savings_frac / _MB, 0.0),
+        notes={"codec": codec, "height": h},
+    )
+
+
+class InefficientCodecRule(Rule):
+    """Flag h.264 (and similar) at HD: always a transcode candidate.
+
+    AV1 is materially more efficient than h.264 at HD perceptual
+    quality. CQ-based encoding preserves quality even when the source
+    is heavily compressed (the worst case is an output similar in
+    size to the source — never a perceptual regression). HEVC at HD
+    is left alone (its efficiency is close enough to AV1 that the
+    re-encode time isn't worth it); SD has its own rule, and UHD is
+    handled by UhdNonAv1Rule.
+    """
+
+    name = "inefficient_codec"
+    advisory = False
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        return _codec_set_verdict(
+            probe, self.name,
+            codec_set=_INEFFICIENT_CODECS,
+            savings_frac=0.30, severity="medium",
+            reason="{codec} at HD; AV1 transcode (CQ-preserved quality)",
+            height_band=(720, 1440),
+        )
+
+
+class UhdNonAv1Rule(Rule):
+    """At UHD, anything other than AV1 is a re-encode candidate."""
+
+    name = "uhd_non_av1"
+    advisory = False
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        return _non_av1_verdict(
+            probe, self.name,
+            height_band=(1440, 1_000_000),
+            savings_frac=0.25, severity="high",
+            tier_label="UHD",
+        )
+
+
+class SdNonAv1Rule(Rule):
+    """At SD (height < 720), anything other than AV1 is a re-encode candidate.
+
+    Most SD content in libraries is legacy (mpeg2 DVD rips, h.264
+    captures, divx-era downloads). Re-encoding to AV1 modernises the
+    format and shrinks the file with negligible quality risk on the
+    typical SD source. AV1 SD content is excluded upstream by the
+    plan-time gate.
+    """
+
+    name = "sd_non_av1"
+    advisory = False
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        return _non_av1_verdict(
+            probe, self.name,
+            height_band=(1, 720),
+            savings_frac=0.25, severity="medium",
+            tier_label="SD",
+        )
 
 
 class ContainerMigrationRule(Rule):
@@ -204,6 +306,9 @@ class HdrAdvisoryRule(Rule):
 RULES: dict[str, Rule] = {
     "over_bitrate":         OverBitratedRule(),
     "legacy_codec":         LegacyCodecRule(),
+    "inefficient_codec":    InefficientCodecRule(),
+    "uhd_non_av1":          UhdNonAv1Rule(),
+    "sd_non_av1":           SdNonAv1Rule(),
     "container_migration":  ContainerMigrationRule(),
     "hdr_advisory":         HdrAdvisoryRule(),
 }

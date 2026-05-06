@@ -31,6 +31,38 @@ _SKIP_DIRS = frozenset({
 })
 
 
+# Plex / Sonarr / Radarr "local extras" conventions: trailers, BTS,
+# featurettes, etc. live in dedicated subdirectories or carry specific
+# filename suffixes. None of this is "main feature" content, and a
+# library-scale tool re-encoding hours of trailers per movie is wasted
+# GPU time. Comparison is case-insensitive (lowered name).
+_EXTRAS_DIRS = frozenset({
+    "trailer", "trailers",
+    "extra", "extras",
+    "featurette", "featurettes",
+    "behind the scenes", "behindthescenes",
+    "behind-the-scenes", "behind_the_scenes",
+    "deleted scenes", "deletedscenes",
+    "deleted-scenes", "deleted_scenes",
+    "deleted scene", "deletedscene",
+    "interview", "interviews",
+    "short", "shorts",
+    "scene", "scenes",
+    "other", "others",
+    "bonus", "bonuses",
+    "bts",
+    "sample", "samples",
+})
+
+# Filename-stem suffixes (post-`-`) that mark a file as an extra even
+# when it lives next to a feature presentation. Plex-flavoured.
+_EXTRAS_SUFFIXES = (
+    "-trailer", "-behindthescenes", "-bts", "-deleted",
+    "-featurette", "-interview", "-scene", "-short",
+    "-other", "-bonus", "-extra", "-sample",
+)
+
+
 def _is_supported(path: Path) -> bool:
     """Return True if path has a supported video extension."""
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -39,6 +71,22 @@ def _is_supported(path: Path) -> bool:
 def _is_skipped_dir(path: Path) -> bool:
     """Return True if a directory name matches the NAS / OS skip-list."""
     return path.name in _SKIP_DIRS
+
+
+def _is_extras_dir(path: Path) -> bool:
+    """Return True if a directory name matches a known extras convention."""
+    return path.name.lower() in _EXTRAS_DIRS
+
+
+def is_extras_filename(path: Path) -> bool:
+    """Return True if a filename stem ends with an extras suffix.
+
+    Public so the plan-gate can defensively catch extras files that
+    escaped the directory-level filter (e.g. `Movie-trailer.mp4`
+    sitting next to `Movie.mkv`).
+    """
+    stem = path.stem.lower()
+    return any(stem.endswith(suffix) for suffix in _EXTRAS_SUFFIXES)
 
 
 def _is_usable(path: Path) -> bool:
@@ -77,11 +125,13 @@ def _iter_dir_sorted(directory: Path) -> list[Path]:
 
 
 def _classify_entry(entry: Path, root_resolved: Path,
-                    recursive: bool) -> tuple[str, Path | None]:
+                    recursive: bool, *,
+                    skip_extras: bool = True) -> tuple[str, Path | None]:
     """Decide what to do with a directory entry.
 
     Returns one of:
-      ("skip",  None)   — symlink-escape, unsupported, unreadable, or
+      ("skip",  None)   — symlink-escape, unsupported, unreadable, an
+                          extras dir/file while skip_extras is True, or
                           a subdirectory while not recursing.
       ("recurse", path) — caller should descend into `path`.
       ("yield", path)   — caller should yield `path` as a video file.
@@ -93,14 +143,26 @@ def _classify_entry(entry: Path, root_resolved: Path,
         if _is_skipped_dir(entry):
             log.debug("skip system dir: %s", entry)
             return "skip", None
+        if skip_extras and _is_extras_dir(entry):
+            log.debug("skip extras dir: %s", entry)
+            return "skip", None
         return ("recurse", entry) if recursive else ("skip", None)
     if entry.is_file() and _is_supported(entry) and _is_usable(entry):
+        if skip_extras and is_extras_filename(entry):
+            log.debug("skip extras filename: %s", entry)
+            return "skip", None
         return "yield", entry
     return "skip", None
 
 
-def crawl(root: Path, recursive: bool = True) -> Iterator[Path]:
-    """Yield paths of supported video files under root."""
+def crawl(root: Path, recursive: bool = True, *,
+          skip_extras: bool = True) -> Iterator[Path]:
+    """Yield paths of supported video files under root.
+
+    When skip_extras is True (default), Plex-style local-extras
+    directories (Trailers, Behind The Scenes, Featurettes, …) and
+    files with extras suffixes (`-trailer`, `-bts`, …) are excluded.
+    """
     if root.is_file():
         if _is_supported(root) and _is_usable(root):
             yield root
@@ -112,7 +174,8 @@ def crawl(root: Path, recursive: bool = True) -> Iterator[Path]:
     stack: list[Path] = [root]
     while stack:
         for entry in _iter_dir_sorted(stack.pop()):
-            action, target = _classify_entry(entry, root_resolved, recursive)
+            action, target = _classify_entry(
+                entry, root_resolved, recursive, skip_extras=skip_extras)
             if action == "recurse" and target is not None:
                 stack.append(target)
             elif action == "yield" and target is not None:

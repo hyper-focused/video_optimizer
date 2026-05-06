@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     output_path           TEXT,
     actual_savings_mb     REAL,
     error                 TEXT,
+    run_id                INTEGER,
     FOREIGN KEY (path) REFERENCES files(path)
 );
 
@@ -72,7 +73,23 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(_SCHEMA)
+        self._migrate_decisions_run_id()
         self.conn.commit()
+
+    def _migrate_decisions_run_id(self) -> None:
+        """De-facto migration: add `run_id` to existing `decisions` rows.
+
+        Schema is created idempotently (CLAUDE.md: there is no migration
+        system), but a CREATE TABLE IF NOT EXISTS won't add a column to a
+        pre-existing table. ALTER and swallow the duplicate-column error
+        so re-running on a fresh db is a no-op.
+        """
+        try:
+            self.conn.execute("ALTER TABLE decisions ADD COLUMN run_id INTEGER")
+        except sqlite3.OperationalError as e:
+            # "duplicate column name: run_id" — already migrated.
+            if "duplicate column" not in str(e).lower():
+                raise
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -179,15 +196,22 @@ class Database:
         rules_fired: list[str],
         target: str,
         projected_savings_mb: float | None,
+        run_id: int | None = None,
     ) -> int:
-        """Insert a row with status='pending' and return its row id."""
+        """Insert a row with status='pending' and return its row id.
+
+        `run_id` records which `runs` row created the pending row (typically
+        the current `cmd_plan` run). The apply step overwrites this with its
+        own run id when it terminalises the row, so `decisions_for_run` keys
+        on the *apply* run — that's the run the post-run report describes.
+        """
         cur = self.conn.execute(
             "INSERT INTO decisions "
             "(path, decided_at, rules_fired_json, target, "
-            "projected_savings_mb, status) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
+            "projected_savings_mb, status, run_id) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
             (path, time.time(), json.dumps(rules_fired),
-             target, projected_savings_mb),
+             target, projected_savings_mb, run_id),
         )
         self.conn.commit()
         return int(cur.lastrowid or 0)
@@ -207,14 +231,66 @@ class Database:
         output_path: str | None = None,
         actual_savings_mb: float | None = None,
         error: str | None = None,
+        run_id: int | None = None,
     ) -> None:
-        """Update a decision row's status and outcome fields."""
+        """Update a decision row's status and outcome fields.
+
+        If `run_id` is given, also overwrite the row's run_id with the apply
+        run id so `decisions_for_run(apply_run_id)` returns exactly the rows
+        terminalised in that apply.
+        """
+        if run_id is not None:
+            self.conn.execute(
+                "UPDATE decisions SET status = ?, output_path = ?, "
+                "actual_savings_mb = ?, error = ?, run_id = ? WHERE id = ?",
+                (status, output_path, actual_savings_mb, error,
+                 run_id, decision_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE decisions SET status = ?, output_path = ?, "
+                "actual_savings_mb = ?, error = ? WHERE id = ?",
+                (status, output_path, actual_savings_mb, error, decision_id),
+            )
+        self.conn.commit()
+
+    def stamp_decision_run(self, decision_id: int,
+                           run_id: int | None) -> None:
+        """Update a decision row's run_id without touching status / outcome.
+
+        Used by dry-run, which observes a pending row but doesn't terminalise
+        it — yet still needs the row to surface in the post-run report.
+        Caller passing `run_id=None` is a no-op (e.g. an apply context
+        without a stashed run id, which shouldn't normally happen).
+        """
+        if run_id is None:
+            return
         self.conn.execute(
-            "UPDATE decisions SET status = ?, output_path = ?, "
-            "actual_savings_mb = ?, error = ? WHERE id = ?",
-            (status, output_path, actual_savings_mb, error, decision_id),
+            "UPDATE decisions SET run_id = ? WHERE id = ?",
+            (run_id, decision_id),
         )
         self.conn.commit()
+
+    def decisions_for_run(self, run_id: int) -> list[dict]:
+        """Return decisions associated with `run_id` for the post-run report.
+
+        Ordered by actual savings descending so the report's biggest wins
+        appear first. NULLs sort last (failed/skipped/dry-run rows).
+        """
+        cur = self.conn.execute(
+            "SELECT path, status, output_path, actual_savings_mb, error "
+            "FROM decisions WHERE run_id = ? "
+            "ORDER BY COALESCE(actual_savings_mb, -1) DESC, id ASC",
+            (run_id,),
+        )
+        return [dict(row) for row in cur]
+
+    def get_run(self, run_id: int) -> dict | None:
+        """Fetch a single run row by id, or None if it doesn't exist."""
+        row = self.conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     # ---- runs ---------------------------------------------------------------
 
@@ -242,3 +318,19 @@ class Database:
             (limit,),
         )
         return [dict(row) for row in cur]
+
+    def latest_run_with_completions(self) -> int | None:
+        """Return the id of the most recent run with ≥1 completed decision.
+
+        Used by `cmd_cleanup` to default `--run` when the caller omits it.
+        Returns None if no run has any rows in `decisions` with
+        `status='completed'`.
+        """
+        row = self.conn.execute(
+            "SELECT r.id FROM runs r "
+            "JOIN decisions d ON d.run_id = r.id "
+            "WHERE d.status = 'completed' "
+            "GROUP BY r.id "
+            "ORDER BY r.started_at DESC LIMIT 1"
+        ).fetchone()
+        return int(row["id"]) if row else None

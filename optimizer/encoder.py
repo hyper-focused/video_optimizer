@@ -455,13 +455,20 @@ def _audio_map_args(probe: ProbeResult, langs: set[str], *,
 
 
 def _subtitle_map_args(probe: ProbeResult, langs: set[str],
-                       target_container: str) -> list[str]:
+                       target_container: str,
+                       *, original_subs: bool = False) -> list[str]:
     """-map / -c:s fragment that keeps subs matching `langs`, dropping image
-    subs on mp4 (warning to stderr) and converting text subs to mov_text."""
+    subs on mp4 (warning to stderr) and converting text subs to mov_text.
+
+    original_subs=True bypasses the language filter and keeps every input
+    subtitle track. mp4-incompatible image subtitles are still dropped
+    (the container fundamentally cannot hold them); for mkv targets every
+    subtitle stream is preserved bit-perfectly.
+    """
     kept: list[int] = []
     for i, s in enumerate(probe.subtitle_tracks):
         lang = (s.language or "").lower()
-        if lang not in langs:
+        if not original_subs and lang not in langs:
             continue
         if target_container == "mp4" and s.codec in _IMAGE_SUB_CODECS:
             sys.stderr.write(
@@ -503,13 +510,14 @@ def _kept_audio_indices(probe: ProbeResult, langs: set[str],
 
 
 def _kept_subtitle_indices(probe: ProbeResult, langs: set[str],
-                           target_container: str) -> set[int]:
+                           target_container: str,
+                           *, original_subs: bool = False) -> set[int]:
     """Source subtitle indices that survive into the output (mirrors the
     filter inside `_subtitle_map_args` so we can pre-strip the rest)."""
     kept: set[int] = set()
     for i, s in enumerate(probe.subtitle_tracks):
         lang = (s.language or "").lower()
-        if lang not in langs:
+        if not original_subs and lang not in langs:
             continue
         if target_container == "mp4" and s.codec in _IMAGE_SUB_CODECS:
             continue
@@ -519,7 +527,9 @@ def _kept_subtitle_indices(probe: ProbeResult, langs: set[str],
 
 def _input_discard_args(probe: ProbeResult, keep_langs: list[str],
                         target_container: str,
-                        *, add_compat_audio: bool = True) -> list[str]:
+                        *, add_compat_audio: bool = True,
+                        original_audio: bool = False,
+                        original_subs: bool = False) -> list[str]:
     """Per-input `-discard:<spec> all` flags for streams we won't use.
 
     Why: ffmpeg's demuxer interleaves packets for every active stream by
@@ -535,14 +545,21 @@ def _input_discard_args(probe: ProbeResult, keep_langs: list[str],
 
     Discard preserves source-side indexing — `-map 0:a:1?` still resolves
     to the original audio stream 1 even when audio stream 0 is discarded.
+
+    original_audio=True keeps every audio stream (no discards). The
+    multi-language stall risk re-appears in that case, so the flag is
+    appropriate for users who consciously want every track preserved
+    and accept the throughput tradeoff.
     """
     langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
-    kept_a = _kept_audio_indices(probe, langs, add_compat=add_compat_audio)
-    kept_s = _kept_subtitle_indices(probe, langs, target_container)
+    kept_s = _kept_subtitle_indices(probe, langs, target_container,
+                                    original_subs=original_subs)
     args: list[str] = []
-    for i in range(len(probe.audio_tracks)):
-        if i not in kept_a:
-            args += [f"-discard:a:{i}", "all"]
+    if not original_audio:
+        kept_a = _kept_audio_indices(probe, langs, add_compat=add_compat_audio)
+        for i in range(len(probe.audio_tracks)):
+            if i not in kept_a:
+                args += [f"-discard:a:{i}", "all"]
     for i in range(len(probe.subtitle_tracks)):
         if i not in kept_s:
             args += [f"-discard:s:{i}", "all"]
@@ -551,7 +568,9 @@ def _input_discard_args(probe: ProbeResult, keep_langs: list[str],
 
 def build_stream_map_args(probe: ProbeResult, keep_langs: list[str],
                           target_container: str,
-                          *, add_compat_audio: bool = True) -> list[str]:
+                          *, add_compat_audio: bool = True,
+                          original_audio: bool = False,
+                          original_subs: bool = False) -> list[str]:
     """Return -map + audio/subtitle codec args for chosen streams.
 
     Attachments (embedded fonts, cover art, etc.) are intentionally NOT
@@ -566,11 +585,19 @@ def build_stream_map_args(probe: ProbeResult, keep_langs: list[str],
     preserving embedded fonts (which mostly only matter for ASS/SSA
     subtitle rendering — anime, rarely live-action archive content).
     Observed in the wild on iNCEPTiON-grouped Indiana Jones 4 source.
+
+    original_audio=True bypasses the 3-stream ladder entirely and maps
+    every input audio track via stream-copy. Subtitle handling is
+    unaffected.
     """
     langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
     args: list[str] = ["-map", "0:v:0"]
-    args += _audio_map_args(probe, langs, add_compat=add_compat_audio)
-    args += _subtitle_map_args(probe, langs, target_container)
+    if original_audio:
+        args += ["-map", "0:a?", "-c:a", "copy"]
+    else:
+        args += _audio_map_args(probe, langs, add_compat=add_compat_audio)
+    args += _subtitle_map_args(probe, langs, target_container,
+                               original_subs=original_subs)
     return args
 
 
@@ -727,11 +754,15 @@ def _codec_args(encoder: str, quality: int, *,
 
 def build_remux_command(probe: ProbeResult, output_path: Path,
                         target_container: str, keep_langs: list[str],
-                        *, add_compat_audio: bool = True) -> list[str]:
+                        *, add_compat_audio: bool = True,
+                        original_audio: bool = False,
+                        original_subs: bool = False) -> list[str]:
     """Return ffmpeg argv that stream-copies into target_container."""
     cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     cmd += _input_discard_args(probe, keep_langs, target_container,
-                               add_compat_audio=add_compat_audio)
+                               add_compat_audio=add_compat_audio,
+                               original_audio=original_audio,
+                               original_subs=original_subs)
     cmd += [
         "-i", probe.path,
         "-map_metadata", "0",
@@ -740,7 +771,9 @@ def build_remux_command(probe: ProbeResult, output_path: Path,
         "-c:v", "copy",
     ]
     cmd += build_stream_map_args(probe, keep_langs, target_container,
-                                 add_compat_audio=add_compat_audio)
+                                 add_compat_audio=add_compat_audio,
+                                 original_audio=original_audio,
+                                 original_subs=original_subs)
     if target_container == "mp4":
         cmd += ["-movflags", "+faststart"]
     cmd += ["-progress", "pipe:1", "-nostats", str(output_path)]
@@ -751,13 +784,25 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                          encoder: str, quality: int | None,
                          keep_langs: list[str], target_container: str,
                          *, hw_decode: bool = False,
-                         add_compat_audio: bool = True) -> list[str]:
+                         add_compat_audio: bool = True,
+                         denoise: bool = False,
+                         original_audio: bool = False,
+                         original_subs: bool = False) -> list[str]:
     """Return ffmpeg argv for a real re-encode using the given encoder.
 
     hw_decode=True with a QSV encoder enables zero-copy GPU decode→encode
     (`-hwaccel qsv -hwaccel_output_format qsv`). Saves CPU but can fail on
     legacy codecs that the QSV decoder doesn't support, so callers (apply)
     leave it off by default and the preset wrappers turn it on.
+
+    denoise=True inserts an `hqdn3d` software filter into the -vf chain.
+    Used by the apply layer for low-bitrate h.264 and SD content where
+    pre-cleaning the source helps AV1 allocate bits to real content
+    rather than h.264 macroblock noise. hqdn3d is CPU-only and won't
+    compose with QSV zero-copy decode; in practice this never matters
+    because every condition that triggers denoise (h.264 in [720, 1440)
+    or height < 720) lands in the HD preset where hw_decode is already
+    False by default.
     """
     q = quality if quality is not None else _quality_default(encoder)
     # 1440p is the cutoff: anything ≥ 1440p uses UHD-tuned encoder values
@@ -773,7 +818,9 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
     if encoder.endswith("_vaapi"):
         cmd += ["-vaapi_device", _VAAPI_DEVICE]
     cmd += _input_discard_args(probe, keep_langs, target_container,
-                               add_compat_audio=add_compat_audio)
+                               add_compat_audio=add_compat_audio,
+                               original_audio=original_audio,
+                               original_subs=original_subs)
     cmd += ["-i", probe.path,
             "-map_metadata", "0", "-map_metadata:s", "-1",
             "-map_chapters", "0"]
@@ -782,11 +829,24 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                        bit_depth=probe.bit_depth, hw_decode=hw_decode)
     cmd += _color_passthrough_args(probe)
 
+    # Compose video filter chain: denoise (CPU) → vaapi format/hwupload
+    # (when targeting vaapi). ffmpeg only honours one -vf flag, so build
+    # the comma-separated chain in order.
+    vfilters: list[str] = []
+    if denoise:
+        # Mild settings: light luma spatial, lighter chroma spatial,
+        # moderate temporal. Strong enough to clean h.264 macroblock
+        # noise without crushing film grain on prosumer sources.
+        vfilters.append("hqdn3d=2:1:2:3")
     if encoder.endswith("_vaapi"):
-        cmd += ["-vf", "format=nv12,hwupload"]
+        vfilters.append("format=nv12,hwupload")
+    if vfilters:
+        cmd += ["-vf", ",".join(vfilters)]
 
     cmd += build_stream_map_args(probe, keep_langs, target_container,
-                                 add_compat_audio=add_compat_audio)
+                                 add_compat_audio=add_compat_audio,
+                                 original_audio=original_audio,
+                                 original_subs=original_subs)
 
     if target_container == "mp4":
         cmd += ["-movflags", "+faststart"]
