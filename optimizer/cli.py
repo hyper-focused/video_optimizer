@@ -236,6 +236,19 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
     ca.add_argument("--no-compat-audio", action="store_false",
                     dest="compat_audio",
                     help="Disable the AAC compat-track shadowing.")
+    ap.add_argument("--original-audio", action="store_true",
+                    help="Bypass the 3-stream audio ladder; map every "
+                         "input audio track via stream-copy. Ignores "
+                         "--keep-langs and --compat-audio (subtitles "
+                         "still respect --keep-langs). Use when you "
+                         "want every track preserved bit-perfectly.")
+    ap.add_argument("--original-subs", action="store_true",
+                    help="Bypass the --keep-langs filter for subtitles; "
+                         "map every input subtitle track via stream-copy. "
+                         "MKV target preserves all formats; MP4 still "
+                         "drops image subs (PGS/VOBSUB) and converts "
+                         "text to mov_text (the container's own limit, "
+                         "not the flag's).")
 
 
 def _add_apply_naming_args(ap: argparse.ArgumentParser) -> None:
@@ -354,6 +367,13 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
     op.add_argument("--cleanup-after", action="store_true",
                     help="After a successful run, prompt to remove the "
                          "originals of completed encodes.")
+    op.add_argument("--original-audio", action="store_true",
+                    help="Keep every input audio track via stream-copy "
+                         "(default strips to --keep-langs and rebuilds a "
+                         "3-stream ladder).")
+    op.add_argument("--original-subs", action="store_true",
+                    help="Keep every input subtitle track via stream-copy "
+                         "(default strips to --keep-langs).")
     op.add_argument("--verbose", "-v", action="store_true")
 
     # Hidden / advanced flags below — still functional, just not in --help.
@@ -459,6 +479,10 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
         ca.add_argument("--no-compat-audio", action="store_false",
                         dest="compat_audio",
                         help="Disable the AAC compat-track shadowing.")
+        p.add_argument("--original-audio", action="store_true",
+                       help="Keep every input audio track via stream-copy.")
+        p.add_argument("--original-subs", action="store_true",
+                       help="Keep every input subtitle track via stream-copy.")
         # Naming: preset turns rewrite-codec + reencode-tag on; user can opt
         # out of dotted style or change the marker token.
         p.add_argument("--no-dotted", action="store_true",
@@ -1047,10 +1071,14 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                          args: argparse.Namespace) -> tuple[list[str], str]:
     """Pick remux vs encode and build the corresponding ffmpeg argv."""
     add_compat = getattr(args, "compat_audio", True)
+    original_audio = bool(getattr(args, "original_audio", False))
+    original_subs = bool(getattr(args, "original_subs", False))
     if _is_remux_only_decision(dec, pr):
         cmd = encoder.build_remux_command(pr, output_path,
                                           target_container, keep_langs,
-                                          add_compat_audio=add_compat)
+                                          add_compat_audio=add_compat,
+                                          original_audio=original_audio,
+                                          original_subs=original_subs)
         return cmd, "remux"
     denoise = _should_apply_denoise(pr)
     # No explicit hw_decode override: every code path that triggers
@@ -1062,10 +1090,16 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         target_container, hw_decode=getattr(args, "hw_decode", False),
         add_compat_audio=add_compat,
         denoise=denoise,
+        original_audio=original_audio,
+        original_subs=original_subs,
     )
     desc = f"encode via {enc_name}"
     if denoise:
         desc += " (+ denoise pre-pass)"
+    if original_audio:
+        desc += " (+ original audio passthrough)"
+    if original_subs:
+        desc += " (+ original subs passthrough)"
     return cmd, desc
 
 
@@ -1391,6 +1425,8 @@ def _optimize_run_apply(
             timeout=None,
             hw_decode=args.hw_decode,
             compat_audio=True,
+            original_audio=getattr(args, "original_audio", False),
+            original_subs=getattr(args, "original_subs", False),
             no_dotted=False,
             name_suffix="",
             reencode_tag_value="REENCODE",
