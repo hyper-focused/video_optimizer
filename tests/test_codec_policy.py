@@ -214,6 +214,60 @@ class PlanGateSdTests(_GateTestBase):
             )
 
 
+class PlanGateExistingOutputTests(_GateTestBase):
+    """A source with an AV1 REENCODE sibling is skipped (beside-mode prior run).
+
+    This is the load-bearing test for the bug that re-encoded 47 Ronin
+    overnight: source filename had no REENCODE marker, but the AV1
+    output sat next to it, and the plan-gate blindly re-queued the source.
+    """
+
+    def _setup_source_and_sibling(self, src_name: str,
+                                  sibling_name: str | None) -> Path:
+        src = self.fake_file.parent / src_name
+        src.write_bytes(b"x" * 100)
+        if sibling_name is not None:
+            sibling = self.fake_file.parent / sibling_name
+            sibling.write_bytes(b"y" * 100)
+        p = make_probe(codec="hevc", height=2160)
+        p.path = str(src)
+        return p
+
+    def test_existing_av1_reencode_sibling_skipped(self):
+        # The naming pipeline strips HEVC tokens and inserts AV1.REENCODE.
+        # Source: Foo.HEVC.mkv → expected sibling: Foo.AV1.REENCODE.mkv.
+        pr = self._setup_source_and_sibling(
+            "Foo.HEVC.mkv", "Foo.AV1.REENCODE.mkv",
+        )
+        with Database(self.db_path) as db:
+            self.assertEqual(_plan_probe_gate(db, pr), "existing_output")
+
+    def test_existing_output_admitted_with_allow_reencoded(self):
+        pr = self._setup_source_and_sibling(
+            "Foo.HEVC.mkv", "Foo.AV1.REENCODE.mkv",
+        )
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(db, pr, allow_reencoded=True),
+                "ok",
+            )
+
+    def test_no_sibling_passes_to_rules(self):
+        pr = self._setup_source_and_sibling("Foo.HEVC.mkv", sibling_name=None)
+        with Database(self.db_path) as db:
+            self.assertEqual(_plan_probe_gate(db, pr), "ok")
+
+    def test_unrelated_av1_file_in_dir_does_not_match(self):
+        # Some other AV1.REENCODE.mkv in the directory shouldn't trip
+        # the gate for a different source — the naming pipeline maps
+        # 1:1 by stem, not "any *.AV1.REENCODE.mkv nearby".
+        pr = self._setup_source_and_sibling(
+            "Foo.HEVC.mkv", "Bar.AV1.REENCODE.mkv",
+        )
+        with Database(self.db_path) as db:
+            self.assertEqual(_plan_probe_gate(db, pr), "ok")
+
+
 class PlanGateExtrasTests(_GateTestBase):
     """Extras-suffixed filenames (e.g. `Movie-trailer.mp4`) are skipped."""
 

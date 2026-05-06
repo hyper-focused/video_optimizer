@@ -635,6 +635,38 @@ def _is_reencoded_filename(path: str) -> bool:
     return _REENCODED_MARKER_RE.search(Path(path).stem) is not None
 
 
+def _existing_reencode_sibling(src_path: str) -> Path | None:
+    """Return the path of an existing AV1 REENCODE sibling, or None.
+
+    Catches the beside-mode blind spot: when an HEVC/h.264 source has
+    already been encoded to AV1 (output sitting next to it as
+    `<stem-without-codec-tokens>.AV1.REENCODE.mkv`), a fresh scan that
+    re-probes the source still admits it to the plan because the
+    source's filename never gained the REENCODE marker. Without this
+    sibling check the plan would re-queue the same source on every
+    run, ffmpeg's `-y` would overwrite the prior output, and a
+    mid-encode kill would leave a partial — exactly what we want to
+    prevent.
+
+    Composes the expected output stem using the same naming pipeline
+    SD/HD/UHD/optimize use at apply time (rewrite_codec=True,
+    reencode_tag=True, dotted style) and looks for that .mkv next to
+    the source. Returns the sibling path if found, None otherwise.
+    """
+    src = Path(src_path)
+    if _is_reencoded_filename(src_path):
+        # Source itself is already a REENCODE output — handled by
+        # _is_reencoded_filename in the gate. Don't double-fire here.
+        return None
+    target_codec = encoder.TARGETS["av1+mkv"][0]
+    stem = naming.rewrite_codec_tokens(src.stem, target_codec, dotted=True)
+    stem = naming.append_token(stem, "REENCODE", dotted=True)
+    candidate = src.with_name(f"{stem}.mkv")
+    if candidate.exists() and candidate != src:
+        return candidate
+    return None
+
+
 def _plan_probe_gate(db: Database, pr,
                      *, allow_reencoded: bool = False,
                      allow_av1: bool = False,
@@ -650,6 +682,11 @@ def _plan_probe_gate(db: Database, pr,
       "reencoded"  — filename carries the REENCODE marker (output of a
                      prior run); skipped permanently unless caller passes
                      allow_reencoded=True (`plan --allow-reencoded`).
+      "existing_output" — a sibling `.AV1.REENCODE.mkv` already exists
+                     next to the source (beside-mode prior-run output).
+                     Skipped to avoid overwriting it with a fresh encode;
+                     allow_reencoded=True overrides (re-uses the same
+                     "I want to re-run already-processed files" gate).
       "av1_source" — source codec is AV1; re-encoding is wasteful by
                      default. Caller can pass allow_av1=True to override
                      (`plan --allow-av1`).
@@ -679,6 +716,8 @@ def _plan_probe_gate(db: Database, pr,
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
+    if not allow_reencoded and _existing_reencode_sibling(pr.path) is not None:
+        return "existing_output"
     if not allow_av1 and (pr.video_codec or "").lower() == "av1":
         return "av1_source"
     if not allow_extras and crawler.is_extras_filename(Path(pr.path)):
@@ -687,20 +726,23 @@ def _plan_probe_gate(db: Database, pr,
 
 
 _PLAN_SKIP_MESSAGES = (
-    ("missing",    "pruned {n} stale cache rows (source moved or deleted)"),
-    ("stalled",    "skipped {n} files with 2+ stall failures "
-                   "(see `./video_optimizer.py replace-list` for the list)"),
-    ("dv",         "skipped {n} Dolby Vision sources "
-                   "(av1_qsv stalls on DV; awaiting DV-aware encode path)"),
-    ("reencoded",  "skipped {n} files already tagged REENCODE "
-                   "(prior outputs of this tool; pass --allow-reencoded "
-                   "to re-queue)"),
-    ("av1_source", "skipped {n} AV1 sources "
-                   "(already at the target codec; pass --allow-av1 "
-                   "to re-encode anyway)"),
-    ("extras",     "skipped {n} extras "
-                   "(trailers / BTS / featurettes; pass --allow-extras "
-                   "to include them)"),
+    ("missing",         "pruned {n} stale cache rows (source moved or deleted)"),
+    ("stalled",         "skipped {n} files with 2+ stall failures "
+                        "(see `./video_optimizer.py replace-list` for the list)"),
+    ("dv",              "skipped {n} Dolby Vision sources "
+                        "(av1_qsv stalls on DV; awaiting DV-aware encode path)"),
+    ("reencoded",       "skipped {n} files already tagged REENCODE "
+                        "(prior outputs of this tool; pass --allow-reencoded "
+                        "to re-queue)"),
+    ("existing_output", "skipped {n} sources whose AV1 REENCODE output already "
+                        "exists alongside (pass --allow-reencoded to re-queue; "
+                        "delete the prior output first if it's partial/bad)"),
+    ("av1_source",      "skipped {n} AV1 sources "
+                        "(already at the target codec; pass --allow-av1 "
+                        "to re-encode anyway)"),
+    ("extras",          "skipped {n} extras "
+                        "(trailers / BTS / featurettes; pass --allow-extras "
+                        "to include them)"),
 )
 
 
@@ -729,7 +771,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         cleared = db.clear_pending_decisions()
         candidates = []
         counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
-                  "av1_source": 0, "extras": 0}
+                  "av1_source": 0, "extras": 0, "existing_output": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
@@ -768,7 +810,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                    "dv_blocked": counts["dv"],
                    "reencoded_blocked": counts["reencoded"],
                    "av1_blocked": counts["av1_source"],
-                   "extras_blocked": counts["extras"]}
+                   "extras_blocked": counts["extras"],
+                   "existing_output_blocked": counts["existing_output"]}
         db.end_run(run_id, summary)
     return 0
 
