@@ -44,7 +44,7 @@ Three things to internalise about this pipeline before changing it:
 
 1. **The probe cache key is `(size, mtime)`, not a content hash** (`db.Database.get_cached_probe`). A file edited in place with mtime preserved will produce stale probe data — `reprobe PATH` (alias for `scan --no-probe-cache`) is the escape hatch.
 2. **`plan` is destructive to the pending queue.** It deletes every `status='pending'` row before re-running rules (`db.clear_pending_decisions`). Half-applied queues from a previous run are preserved (their status is no longer `pending`), but you cannot "amend" a plan — re-running starts the queue over.
-3. **`apply` may leave a candidate `pending` rather than terminalising it** when the resolution gate (`--min-height` / `--max-height`) defers it. This is the mechanism that lets `hd-archive` and `uhd-archive` share one queue: each preset processes its own band and skips the other's, leaving those rows for a follow-up run.
+3. **`apply` may leave a candidate `pending` rather than terminalising it** when the resolution gate (`--min-height` / `--max-height`) defers it. This is the mechanism that lets the `SD`, `HD`, and `UHD` presets share one queue: each preset processes its own band (height < 720, 720–1439, ≥1440 respectively) and skips the others', leaving those rows for a follow-up run.
 
 ## Module map (what owns what)
 

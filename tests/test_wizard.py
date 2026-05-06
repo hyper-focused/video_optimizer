@@ -85,9 +85,10 @@ class WizardPromptSequenceTests(unittest.TestCase):
     # ---- 1. happy-path-with-quit --------------------------------------------
 
     def test_quit_at_summary_does_not_encode(self) -> None:
-        """User picks beside-mode then quits at the all/N/quit prompt."""
+        """User picks beside-mode + all-tiers then quits at the all/N/quit prompt."""
         _, scan, plan, optimize, cleanup, _ = self._patch_handlers()
-        answers = [str(self.lib), "1", "q"]
+        # path -> mode 1 -> tier 'a' -> 'q' (quit at limit prompt)
+        answers = [str(self.lib), "1", "a", "q"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -102,8 +103,8 @@ class WizardPromptSequenceTests(unittest.TestCase):
     def test_no_at_confirmation_does_not_encode(self) -> None:
         """User reaches the final 'Proceed?' prompt and answers no."""
         _, scan, plan, optimize, _, _ = self._patch_handlers()
-        # path -> mode 1 -> 'a' (all) -> confirmation 'n'
-        answers = [str(self.lib), "1", "a", "n"]
+        # path -> mode 1 -> tier 'a' -> limit 'a' (all) -> confirmation 'n'
+        answers = [str(self.lib), "1", "a", "a", "n"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -130,8 +131,8 @@ class WizardPromptSequenceTests(unittest.TestCase):
     def test_doctor_warning_user_proceeds(self) -> None:
         """Doctor fails, user answers 'y' and the wizard continues."""
         _, scan, plan, optimize, _, _ = self._patch_handlers(doctor_rc=1)
-        # 'y' -> path -> mode 1 -> 'q' (quit at summary)
-        answers = ["y", str(self.lib), "1", "q"]
+        # 'y' -> path -> mode 1 -> tier 'a' -> 'q' (quit at summary)
+        answers = ["y", str(self.lib), "1", "a", "q"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -184,20 +185,55 @@ class WizardPromptSequenceTests(unittest.TestCase):
     def test_mode_menu_invalid_choice_reprompts(self) -> None:
         """An invalid mode-menu choice should re-ask, not abort."""
         _, scan, plan, optimize, _, _ = self._patch_handlers()
-        # path -> '9' (invalid, re-prompted) -> '1' -> 'q'
-        answers = [str(self.lib), "9", "1", "q"]
+        # path -> '9' (invalid, re-prompted) -> '1' -> tier 'a' -> 'q'
+        answers = [str(self.lib), "9", "1", "a", "q"]
         with patch("builtins.input", side_effect=answers) as inp, \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
         self.assertEqual(rc, 0)
-        # All four answers consumed: path + bad-choice + good-choice + quit.
-        self.assertEqual(inp.call_count, 4)
+        # Five answers consumed: path + bad-choice + good-choice + tier + quit.
+        self.assertEqual(inp.call_count, 5)
         # The "please choose" hint is the canary for the re-prompt branch
         # in `_prompt`.
         self.assertIn("please choose", out.getvalue())
         self.assertEqual(scan.call_count, 1)
         self.assertEqual(plan.call_count, 1)
         self.assertEqual(optimize.call_count, 0)
+
+    # ---- 9. tier-pick prompt routes to the right preset list ---------------
+
+    def test_tier_pick_uhd_routes_single_preset(self) -> None:
+        """Tier 'u' should run the UHD preset only, not all three."""
+        _, scan, plan, optimize, _, _ = self._patch_handlers()
+        # Patch _run_path_pipeline so we can assert on the presets tuple
+        # without actually executing the chain.
+        ran: list[tuple[str, ...]] = []
+        def fake_pipeline(args, presets, *, label):
+            ran.append(presets)
+            return 0
+        with patch.object(cli_mod, "_run_path_pipeline",
+                          side_effect=fake_pipeline), \
+                patch("builtins.input",
+                      side_effect=[str(self.lib), "1", "u", "a", "y", "n"]), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            rc = cli_mod.cmd_wizard(_make_args(self.db_path))
+        self.assertEqual(rc, 0)
+        self.assertEqual(ran, [("UHD",)])
+
+    def test_tier_pick_all_routes_three_presets(self) -> None:
+        _, scan, plan, optimize, _, _ = self._patch_handlers()
+        ran: list[tuple[str, ...]] = []
+        def fake_pipeline(args, presets, *, label):
+            ran.append(presets)
+            return 0
+        with patch.object(cli_mod, "_run_path_pipeline",
+                          side_effect=fake_pipeline), \
+                patch("builtins.input",
+                      side_effect=[str(self.lib), "1", "a", "a", "y", "n"]), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            rc = cli_mod.cmd_wizard(_make_args(self.db_path))
+        self.assertEqual(rc, 0)
+        self.assertEqual(ran, [("UHD", "HD", "SD")])
 
 
 if __name__ == "__main__":

@@ -457,10 +457,12 @@ def _add_cleanup_parser(sub: "argparse._SubParsersAction") -> None:
 
 
 def _add_wizard_parser(sub: "argparse._SubParsersAction") -> None:
-    """Register the `wizard` subcommand (forward-declared stub for Task #8)."""
+    """Register the `wizard` subcommand (interactive guided run)."""
     wz = sub.add_parser(
         "wizard",
-        help="Interactive guided run (stub; full implementation lands in Task #8).",
+        help="Interactive guided run: prompts for path, output mode, and "
+             "tier scope, then runs the full pipeline. Triggered "
+             "automatically when invoked with no args in a TTY.",
     )
     _add_common_db_arg(wz)
 
@@ -2286,6 +2288,30 @@ def _wizard_pick_mode(
     return ("replace", None, recycle_to or _resolve_recycle_dir(library, None))
 
 
+def _wizard_pick_tier() -> tuple[str, ...]:
+    """Prompt for tier scope. Returns the preset tuple to feed the pipeline.
+
+    The four options mirror the path-taking subcommand surface: "all"
+    chains UHD → HD → SD (same as `optimize`); the single-tier choices
+    apply just that preset (same as `UHD` / `HD` / `SD`).
+    """
+    print()
+    print("Which resolution tier(s) should be re-encoded?")
+    print("  [a] All tiers (UHD + HD + SD)                              [default]")
+    print("  [u] UHD only (≥ 1440p)")
+    print("  [h] HD only (720–1439p)")
+    print("  [s] SD only (< 720p)")
+    choice = _prompt("Choice [a]: ", default="a",
+                     choices=["a", "u", "h", "s"])
+    if choice == "u":
+        return ("UHD",)
+    if choice == "h":
+        return ("HD",)
+    if choice == "s":
+        return ("SD",)
+    return ("UHD", "HD", "SD")
+
+
 def _wizard_apply_namespace(
     args: argparse.Namespace,
     library: Path,
@@ -2448,6 +2474,8 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
         mode, output_root, recycle_to = _wizard_pick_mode(args, library)
 
+        presets_to_run = _wizard_pick_tier()
+
         rc = _wizard_run_scan_plan(args, library)
         if rc != 0:
             return rc
@@ -2473,7 +2501,8 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, EOFError, _WizardAbort):
         print("\naborted", file=sys.stderr)
         sys.exit(130)
-    rc = cmd_optimize(apply_ns)
+    label = "optimize" if len(presets_to_run) > 1 else presets_to_run[0]
+    rc = _run_path_pipeline(apply_ns, presets_to_run, label=label)
     try:
         _wizard_run_cleanup_prompt(args)
     except (KeyboardInterrupt, EOFError, _WizardAbort):
