@@ -242,47 +242,64 @@ why.
       >3 audio streams, or a probe-time flag that routes them to a
       different encoder path).
 
-- [ ] **DV-aware encode path for av1_qsv** (replaces the v0.5.15
-      plan-time skip). v0.5.15 detects `dv_profile` from the ffprobe
-      `DOVI configuration record` side-data and drops every DV source
-      from the queue, because av1_qsv consistently wedges on them:
-      Profile 7 (BL+EL, dual-layer) stalls at frame 0; Profile 8
-      (single-layer + RPU) makes initial progress and stalls partway
-      in. Confirmed against five titles in the run-3 / run-6 archive
-      logs (LOTR x265-NAHOM trilogy → P7, The Housemaid 2025 → P7,
-      Hobbit Desolation of Smaug → P8). The skip rule keeps the queue
-      moving but means DV sources are never re-encoded — a permanent
-      gap until this work lands.
+- [ ] **DV strip-and-encode (P7/P8 → HDR10) as the default DV path**
+      (replaces the current plan-time `dv` skip). The probe layer
+      already detects `dv_profile`; today the plan-gate drops every
+      DV source from the queue because av1_qsv wedges on them
+      (Profile 7 stalls at frame 0, Profile 8 stalls partway in).
+      Strategy decided 2026-05-06: strip the DV RPU, encode the
+      HDR10-compatible base layer to AV1. Most modern UHD content
+      has a clean HDR10 base layer; players that don't speak DV
+      already fall back to it, so this is a no-loss path for the
+      common case.
 
-      Two viable paths, both worth prototyping on a single P7 title
-      first to confirm the encoder accepts the modified bitstream:
+      Per-profile routing (matches the README's "Dolby Vision"
+      section):
 
-      1. **Bitstream-filter strip** — prepend `-bsf:v
-         'filter_units=remove_types=62'` (Dolby Vision EL NAL type for
-         HEVC) before `-c:v av1_qsv`. Cheapest fix if the QSV pipeline
-         is happy with a BL-only HEVC frame stream. P7 → strip EL +
-         RPU; P8 → strip RPU only. Risk: the BL alone may still carry
-         RPU-side-data references that confuse the encoder.
+      - **Profile 8.x** (most modern UHD WEB-DL / Blu-ray): one-pass
+        strip via `-bsf:v dovi_rpu=strip` + the existing av1_qsv
+        encode. Base layer is HDR10 already; strip is the only
+        bitstream surgery needed. Wire as a new `strip_dv=True`
+        branch in `encoder.build_encode_command` driven by
+        `pr.dv_profile in {8, "8.1", "8.4", ...}`.
 
-      2. **External `dovi_tool` pre-pass** — `ffmpeg -i src -c copy -bsf
-         hevc_mp4toannexb -f hevc - | dovi_tool remove --rpu-out /dev/null
-         - -o bl.hevc`, then re-mux + encode bl.hevc. Canonical fix for
-         Profile 7 but adds an external dependency (`dovi_tool` from
-         GitHub releases, not in apt). Also doubles the I/O — read
-         source twice on every encode.
+      - **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement
+        layers): plain strip leaves orphan enhancement-layer NALs
+        that confuse the encoder. Need `dovi_tool convert -m 2` to
+        flatten P7 → P8 first, then run the same strip path. New
+        external dep (`dovi_tool` from GitHub, not in apt) — `doctor`
+        gains a check; sources fall back to `dv` skip when it's
+        absent.
 
-      Whichever path lands: keep the plan-time skip behind a flag
-      (`--allow-dv` opt-in) so users on machines without the workaround
-      don't get the stall pattern back. Update `replace-list` to also
-      surface DV sources (alongside two-strikes failures). Worth
-      probing whether `hevc_vaapi` or libsvtav1 handles DV cleanly —
-      if so, route DV sources to a software fallback rather than
-      av1_qsv.
+      - **Profile 5** (Apple TV+, some Vudu): keep skipping. Base
+        layer is *not* HDR10 — it's a custom DV-only colour space
+        that requires the RPU to map. Stripping leaves a green/
+        over-saturated mess; no clean HDR10 fallback exists.
 
-      Outstanding research: capture an `ffmpeg -loglevel debug`
-      transcript of one stalled DV encode to identify exactly which
-      NAL/RPU sequence wedges the av1_qsv intake. Without that, we're
-      guessing about which NAL types to strip.
+      Implementation notes:
+
+      - `_plan_probe_gate` refines the `dv` verdict: P5 always
+        skipped; P7 skipped only when `dovi_tool` is missing on
+        PATH; P8 admitted to rule evaluation, with the apply layer
+        knowing to use the strip path.
+      - `--allow-dv` flag preserved for forcing the legacy
+        skip-everything behavior (in case the strip path causes
+        regressions on a particular title).
+      - The strip path is essentially a two-pass internally:
+        stream-copy with bsf to strip RPU → AV1 encode. Pipe the
+        first pass directly into the second to avoid temp-file I/O
+        on a 50 GB UHD remux.
+      - `replace-list` extension: surface DV-skipped (P5) sources
+        alongside the stall list so the user can find different
+        releases.
+
+      Future direction (not part of this work): **Profile 10
+      preservation** — carry DV metadata through the AV1 encode as
+      Profile 10 OBU side-data, so DV-capable players continue to
+      see DV after the transcode. Depends on `dovi_tool inject-rpu`
+      AV1 support and on Plex/PMS / Shield TV / Apple TV recognising
+      the resulting Profile 10 stream. Revisit when the tooling and
+      player ecosystems stabilise.
 
 - [x] **Drop `-look_ahead 1` from `_qsv_args`** — landed in v0.5.16
       together with the uhd-archive `hw_decode=True` flip and the

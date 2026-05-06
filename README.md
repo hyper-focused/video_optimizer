@@ -4,6 +4,14 @@ A point-and-shoot AV1 transcoder for personal video libraries on Linux.
 Crawls a directory, identifies files worth re-encoding, and re-encodes
 them to AV1 in MKV with hardware acceleration where available.
 
+**Optimized for Intel Arc / Battlemage GPUs** via `av1_qsv`. The
+calibrated presets, lookahead depths, and zero-copy decode→encode
+pipelines are tuned against Intel's QSV stack — that's what was on
+hand during development. NVIDIA (`av1_nvenc` on RTX 4000+) and AMD
+(`av1_vaapi`) work via the encoder fallback chain, but the throughput
+numbers and tier defaults haven't been re-tuned for them. Software
+fallback (`libsvtav1`) is always available.
+
 ```bash
 ./video_optimizer.py /mnt/nas/media/Movies        # encode the whole library
 ./video_optimizer.py UHD /mnt/nas/media/Movies    # 4K only
@@ -26,8 +34,8 @@ three things to the table that a hand-rolled `for f in *.mkv; do ffmpeg
   re-encoding (legacy codecs like MPEG-2/VC-1, h.264 at HD, anything
   non-AV1 at UHD/SD, files in legacy containers like AVI). It also skips
   things that don't need work: AV1 sources, prior outputs of this tool,
-  Plex-style trailers/extras, and Dolby Vision sources (which currently
-  break `av1_qsv`).
+  Plex-style trailers/extras, and Dolby Vision sources that the planned
+  RPU-strip path can't reach (see "Dolby Vision" below).
 - **Library-scale defaults.** Audio collapses to a deterministic 3-stream
   ladder (best lossless passthrough + Opus 5.1 + AAC 2.0). Subtitles
   filter to `--keep-langs` (default `en,und`). Originals are preserved by
@@ -306,11 +314,43 @@ clobber existing work." Out of the box, it will not encode:
 - Files with the `REENCODE` token in their own filename
 - Files that have hit the encoder watchdog twice (chronic stalls — see
   `replace-list` for the manual-action queue)
-- Dolby Vision sources (`av1_qsv` wedges on DV; awaiting a DV-aware encode
-  path)
+- Dolby Vision sources (see below — most are skipped today; planned
+  default flips to "strip the DV layer, encode as HDR10")
 
 Each skip class has an `--allow-*` opt-in flag if you genuinely want to
 re-encode those files anyway.
+
+---
+
+## Dolby Vision
+
+DV sources are the awkward case. `av1_qsv` consistently wedges on them
+(Profile 7 stalls at frame 0; Profile 8 stalls partway through), so the
+tool currently skips DV at plan time. The plan is to strip the DV layer
+and encode the source as plain HDR10 — most modern UHD content has an
+HDR10-compatible base layer underneath the DV metadata, so this is a
+clean fallback that preserves the wide colour gamut and high luma range
+without losing any image data the player can use today.
+
+| DV Profile | Default behavior (planned) | Why |
+|---|---|---|
+| **Profile 8.x** (most modern UHD WEB-DLs and recent Blu-rays) | Strip DV RPU via `dovi_rpu=strip`, encode the HDR10 base layer to AV1 | Base layer is already HDR10-compatible; strip is a one-pass bitstream operation |
+| **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement layers) | Convert P7 → P8 via `dovi_tool` first, then strip + encode | Plain strip leaves orphan enhancement layer NALs that confuse the encoder; `dovi_tool convert -m 2` flattens them |
+| **Profile 5** (Apple TV+, some Vudu) | Skip permanently | Base layer is *not* HDR10 — it's a custom DV-only colour space that requires the RPU to map. Stripping leaves a green/over-saturated mess; no clean HDR10 fallback exists |
+
+**Profile 10 (DV preserved through AV1)** — the bleeding-edge approach
+of carrying DV metadata through into the AV1 output as Profile 10
+OBU side-data — is on the radar but not the default. It depends on
+`dovi_tool inject-rpu`'s AV1 support and on player ecosystems
+recognising the resulting Profile 10 stream. We'll revisit when the
+tooling stabilises and Plex/PMS / shield TVs / other players have
+mainstream Profile 10 support.
+
+**Current state**: the strip path isn't wired into the apply pipeline
+yet — DV sources still get skipped via the `dv` plan-gate verdict. The
+above table describes the planned default. Until the strip lands, the
+manual recipes from the conversation logs are the workaround for users
+who want to re-encode a specific DV title.
 
 ---
 
