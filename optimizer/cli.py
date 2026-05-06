@@ -2539,17 +2539,14 @@ def cmd_wizard(args: argparse.Namespace) -> int:
         print()
         if _prompt("Proceed? [Y/n]: ",
                    default="y", choices=["y", "n"]) != "y":
+            print("aborted by user; nothing encoded.")
             return 0
 
         apply_ns = _wizard_apply_namespace(
             args, library, mode, output_root, recycle_to, limit,
         )
-    except (KeyboardInterrupt, EOFError, _WizardAbort):
-        print("\naborted", file=sys.stderr)
-        sys.exit(130)
-    label = "optimize" if len(presets_to_run) > 1 else presets_to_run[0]
-    rc = _run_path_pipeline(apply_ns, presets_to_run, label=label)
-    try:
+        label = "optimize" if len(presets_to_run) > 1 else presets_to_run[0]
+        rc = _run_path_pipeline(apply_ns, presets_to_run, label=label)
         _wizard_run_cleanup_prompt(args)
     except (KeyboardInterrupt, EOFError, _WizardAbort):
         print("\naborted", file=sys.stderr)

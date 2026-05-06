@@ -220,6 +220,31 @@ class WizardPromptSequenceTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(ran, [("UHD",)])
 
+    def test_proceed_no_does_not_invoke_pipeline(self) -> None:
+        """User answers 'n' at the final Proceed prompt — pipeline must not fire.
+
+        This pins the bug observed live: a wizard run where the user
+        answered 'n' at proceed but the apply pipeline still kicked off
+        and burned GPU time on files the user explicitly declined.
+        """
+        _, scan, plan, optimize, _, _ = self._patch_handlers()
+        ran: list[tuple[str, ...]] = []
+
+        def fake_pipeline(args, presets, *, label):
+            ran.append(presets)
+            return 0
+        # path -> mode 1 -> tier 'a' -> limit 'a' -> proceed 'n'
+        with patch.object(cli_mod, "_run_path_pipeline",
+                          side_effect=fake_pipeline), \
+                patch("builtins.input",
+                      side_effect=[str(self.lib), "1", "a", "a", "n"]), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            rc = cli_mod.cmd_wizard(_make_args(self.db_path))
+        self.assertEqual(rc, 0)
+        self.assertEqual(ran, [],
+                         "pipeline must NOT run when user answered 'n'")
+        self.assertEqual(optimize.call_count, 0)
+
     def test_tier_pick_all_routes_three_presets(self) -> None:
         _, scan, plan, optimize, _, _ = self._patch_handlers()
         ran: list[tuple[str, ...]] = []
