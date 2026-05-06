@@ -105,10 +105,11 @@ class PlanGateReencodeTests(unittest.TestCase):
             )
 
 
-def _plan_args(db_path: Path, *, allow_reencoded: bool = False
-               ) -> argparse.Namespace:
+def _plan_args(db_path: Path, *, allow_reencoded: bool = False,
+               path: Path | None = None) -> argparse.Namespace:
     return argparse.Namespace(
-        cmd="plan", rules=None, target="av1+mkv", json=False,
+        cmd="plan", path=path, rules=None,
+        target="av1+mkv", json=False,
         keep_langs="en,und", allow_reencoded=allow_reencoded,
         db=db_path,
     )
@@ -159,6 +160,69 @@ class CmdPlanReencodeTests(unittest.TestCase):
         self.assertIn(str(self.reenc), self._pending_paths())
         self.assertIn(str(self.fresh), self._pending_paths())
         self.assertEqual(self._last_summary()["reencoded_blocked"], 0)
+
+
+class CmdPlanPathScopeTests(unittest.TestCase):
+    """Path-scope filter: cmd_plan only creates candidates for files under
+    args.path. Without this, a path-pipeline run would re-process probes
+    cached from earlier scans of unrelated directories — the bug the user
+    reported where HD /movies queued candidates from /tv as well."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db_path = self.root / "state.db"
+        self.movies_dir = self.root / "Movies"
+        self.tv_dir = self.root / "TV"
+        self.movies_dir.mkdir()
+        self.tv_dir.mkdir()
+        self.movie = self.movies_dir / "Foo.HEVC.mkv"
+        self.movie.write_bytes(b"x" * 4096)
+        self.tv_episode = self.tv_dir / "Bar.S01E01.HEVC.mkv"
+        self.tv_episode.write_bytes(b"x" * 4096)
+        with Database(self.db_path) as db:
+            db.upsert_probe(_probe_for(self.movie))
+            db.upsert_probe(_probe_for(self.tv_episode))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pending_paths(self) -> set[str]:
+        with sqlite3.connect(str(self.db_path)) as c:
+            rows = c.execute(
+                "SELECT path FROM decisions WHERE status='pending'").fetchall()
+        return {r[0] for r in rows}
+
+    def _last_summary(self) -> dict:
+        import json as _json
+        with sqlite3.connect(str(self.db_path)) as c:
+            row = c.execute(
+                "SELECT summary_json FROM runs WHERE kind='plan' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        return _json.loads(row[0])
+
+    def test_no_path_arg_includes_everything(self):
+        # Standalone `plan` (no path) iterates the whole cache —
+        # backwards-compat for users who scan/plan separately.
+        cmd_plan(_plan_args(self.db_path))
+        self.assertIn(str(self.movie), self._pending_paths())
+        self.assertIn(str(self.tv_episode), self._pending_paths())
+        self.assertEqual(self._last_summary()["out_of_scope_blocked"], 0)
+
+    def test_path_arg_excludes_other_dirs(self):
+        # When path is /Movies, /TV probes get bucketed as out_of_scope
+        # and don't make it into the candidate list.
+        cmd_plan(_plan_args(self.db_path, path=self.movies_dir))
+        self.assertIn(str(self.movie), self._pending_paths())
+        self.assertNotIn(str(self.tv_episode), self._pending_paths())
+        self.assertEqual(self._last_summary()["out_of_scope_blocked"], 1)
+
+    def test_single_file_path_admits_only_that_file(self):
+        # Path can be a single file (Radarr/Sonarr post-processing hook).
+        cmd_plan(_plan_args(self.db_path, path=self.movie))
+        self.assertIn(str(self.movie), self._pending_paths())
+        self.assertNotIn(str(self.tv_episode), self._pending_paths())
+        self.assertEqual(self._last_summary()["out_of_scope_blocked"], 1)
 
 
 if __name__ == "__main__":

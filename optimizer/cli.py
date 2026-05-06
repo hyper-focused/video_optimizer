@@ -637,6 +637,27 @@ def _is_reencoded_filename(path: str) -> bool:
     return _REENCODED_MARKER_RE.search(Path(path).stem) is not None
 
 
+def _path_under(candidate: str, root: Path) -> bool:
+    """Return True if `candidate` lies under `root` (or equals it).
+
+    Used by the plan-time path-scope filter to keep cmd_plan from
+    surfacing candidates that aren't under the user's requested path.
+    Both sides are resolved before comparison so symlinks don't
+    cause false negatives.
+    """
+    try:
+        cand = Path(candidate).resolve(strict=False)
+    except OSError:
+        cand = Path(candidate)
+    if cand == root:
+        return True
+    try:
+        cand.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _existing_reencode_sibling(src_path: str) -> Path | None:
     """Return the path of an existing AV1 REENCODE sibling, or None.
 
@@ -728,6 +749,8 @@ def _plan_probe_gate(db: Database, pr,
 
 
 _PLAN_SKIP_MESSAGES = (
+    ("out_of_scope",    "skipped {n} probes outside the requested path "
+                        "(other libraries cached from earlier scans)"),
     ("missing",         "pruned {n} stale cache rows (source moved or deleted)"),
     ("stalled",         "skipped {n} files with 2+ stall failures "
                         "(see `./video_optimizer.py replace-list` for the list)"),
@@ -768,15 +791,35 @@ def cmd_plan(args: argparse.Namespace) -> int:
     allow_reencoded = bool(getattr(args, "allow_reencoded", False))
     allow_av1 = bool(getattr(args, "allow_av1", False))
     allow_extras = bool(getattr(args, "allow_extras", False))
+    # Path scope: when a path is supplied (path-pipeline subcommands like
+    # SD/HD/UHD/optimize/bare invocation), only probes under that path
+    # are eligible for candidate creation. Without this, the plan would
+    # happily create candidates from older cache entries outside the
+    # user's requested directory and apply would encode them. The
+    # standalone `plan` subcommand has no path and operates on the
+    # whole cache (existing behavior preserved).
+    scope_path = getattr(args, "path", None)
+    if scope_path is not None:
+        try:
+            scope_resolved = Path(scope_path).resolve(strict=False)
+        except OSError:
+            scope_resolved = Path(scope_path)
+    else:
+        scope_resolved = None
     with Database(args.db) as db:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
         counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
-                  "av1_source": 0, "extras": 0, "existing_output": 0}
+                  "av1_source": 0, "extras": 0, "existing_output": 0,
+                  "out_of_scope": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
+            if scope_resolved is not None and not _path_under(pr.path,
+                                                              scope_resolved):
+                counts["out_of_scope"] += 1
+                continue
             verdict = _plan_probe_gate(
                 db, pr, allow_reencoded=allow_reencoded,
                 allow_av1=allow_av1, allow_extras=allow_extras)
@@ -813,7 +856,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                    "reencoded_blocked": counts["reencoded"],
                    "av1_blocked": counts["av1_source"],
                    "extras_blocked": counts["extras"],
-                   "existing_output_blocked": counts["existing_output"]}
+                   "existing_output_blocked": counts["existing_output"],
+                   "out_of_scope_blocked": counts["out_of_scope"]}
         db.end_run(run_id, summary)
     return 0
 
@@ -1507,7 +1551,8 @@ def _run_path_pipeline(args: argparse.Namespace,
 
     print(f"==> [2/{total}] plan: evaluating rules against probe cache...")
     plan_ns = argparse.Namespace(
-        cmd="plan", rules=None, target="av1+mkv", json=False,
+        cmd="plan", path=args.path, rules=None,
+        target="av1+mkv", json=False,
         keep_langs=args.keep_langs or "en,und",
         allow_reencoded=False,
         allow_av1=getattr(args, "allow_av1", False),
@@ -2377,7 +2422,8 @@ def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
     print()
     print("==> plan: evaluating rules")
     plan_ns = argparse.Namespace(
-        cmd="plan", rules=None, target="av1+mkv", json=False,
+        cmd="plan", path=library, rules=None,
+        target="av1+mkv", json=False,
         keep_langs="en,und", allow_reencoded=False,
         allow_av1=False, allow_extras=False,
         db=args.db,
