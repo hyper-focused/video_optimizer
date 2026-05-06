@@ -1492,20 +1492,23 @@ def _run_path_pipeline(args: argparse.Namespace,
 
 
 def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
-    """Flip auto/mode/verbose defaults when invoked via the bare-path rewrite.
+    """Flip pipeline defaults so every path-taking subcommand is point-and-shoot.
 
-    `--bare-invocation` is a sentinel flag set by `_preprocess_argv` when
-    the user typed `./video_optimizer.py PATH` with no subcommand. We then
-    flip a few defaults so that point-and-shoot UX is point-and-shoot. We
-    only flip values the user didn't explicitly set elsewhere.
+    Applied unconditionally to every path-taking pipeline invocation
+    (optimize, SD, HD, UHD, plus the bare-path rewrite). The user
+    picked a path-taking subcommand → they want auto-yes encoding
+    against the source they pointed at. --confirm opts back into
+    per-file prompts; --output/--in-place/--mode opts out of beside.
+
+    The bare-invocation sentinel (`--bare-invocation`) additionally
+    flips verbose on; that's the one place where we infer the user
+    is brand-new and probably wants to see more output.
     """
-    if not getattr(args, "bare_invocation", False):
-        return
     if not args.auto:
         args.auto = True
     if args.mode is None and not args.in_place and args.output is None:
         args.mode = "beside"
-    if not args.verbose:
+    if getattr(args, "bare_invocation", False) and not args.verbose:
         args.verbose = True
 
 
