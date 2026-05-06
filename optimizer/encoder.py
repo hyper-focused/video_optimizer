@@ -359,12 +359,20 @@ def build_dv_p7_strip_raw_command(p8_hevc_path: Path,
     doesn't apply (no container, no PTS/DTS to worry about). The
     stripped bitstream is plain HDR10, ready for mkvmerge to mux
     alongside the source's audio/subs.
+
+    `-progress pipe:1 -nostats` is mandatory for `run_ffmpeg`'s stall
+    watchdog to do anything useful. Without progress events on
+    stdout, the watchdog has no signal to monitor and a hung NAS
+    write at the tail of the strip can park ffmpeg indefinitely
+    (observed on a Princess Bride strip that hung for 56+ minutes
+    after writing 99.87% of the output).
     """
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-y",
         "-i", str(p8_hevc_path),
         "-c", "copy",
         "-bsf:v", "dovi_rpu=strip=true",
+        "-progress", "pipe:1", "-nostats",
         "-f", "hevc",
         str(stripped_hevc_path),
     ]
