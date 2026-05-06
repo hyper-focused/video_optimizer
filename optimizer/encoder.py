@@ -217,7 +217,10 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
         "-i", probe.path,
         "-map", "0",
         "-c", "copy",
-        "-bsf:v", "dovi_rpu=strip",
+        # The bsf has named options; `strip` is a boolean (default false).
+        # Bare `dovi_rpu=strip` is parsed as "strip is the value of an
+        # implicit option" and rejected. Must be `strip=true` (or `strip=1`).
+        "-bsf:v", "dovi_rpu=strip=true",
         "-progress", "pipe:1", "-nostats",
         str(prepared_path),
     ]

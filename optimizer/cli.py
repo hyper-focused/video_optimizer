@@ -159,6 +159,12 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                          "(`-trailer`, `-bts`, `-deleted`, …). Default "
                          "skips them; the crawler also filters extras "
                          "directories at walk time.")
+    pl.add_argument("--allow-hd-hevc", action="store_true",
+                    help="Include HEVC at HD (720..1439) as a re-encode "
+                         "candidate. Default leaves HD HEVC alone — it's "
+                         "already efficient enough that the AV1 savings "
+                         "rarely justify GPU time. Enable for testing or "
+                         "library-wide AV1 consolidation.")
     _add_common_db_arg(pl)
 
 
@@ -390,6 +396,8 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
                    help=argparse.SUPPRESS)
     p.add_argument("--allow-av1", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--allow-extras", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--allow-hd-hevc", action="store_true",
                    help=argparse.SUPPRESS)
     p.add_argument("--bare-invocation", action="store_true", default=False,
                    help=argparse.SUPPRESS)
@@ -785,9 +793,29 @@ def _emit_plan_skip_summary(counts: dict) -> None:
             print(template.format(n=n))
 
 
+def _resolve_enabled_rules(args: argparse.Namespace) -> list[str] | None:
+    """Compose the rule-name list for cmd_plan based on flags.
+
+    None → RulesEngine uses its default-enabled set (every non-opt-in
+    rule). Otherwise returns an explicit list — either the user's
+    `--rules` override, or the default set extended with whichever
+    opt-in rules have been gated on (`--allow-hd-hevc` for now).
+    """
+    if args.rules:
+        return [s.strip() for s in args.rules.split(",")]
+    opt_in_active: list[str] = []
+    if getattr(args, "allow_hd_hevc", False):
+        opt_in_active.append("hd_hevc_opt_in")
+    if not opt_in_active:
+        return None
+    enabled = [n for n, r in rules.RULES.items() if not r.opt_in]
+    enabled.extend(opt_in_active)
+    return enabled
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Run the rules engine over the probe cache; record pending decisions."""
-    enabled = [s.strip() for s in args.rules.split(",")] if args.rules else None
+    enabled = _resolve_enabled_rules(args)
     try:
         engine = rules.RulesEngine(enabled=enabled, target=args.target)
     except ValueError as e:
@@ -1671,6 +1699,7 @@ def _run_path_pipeline(args: argparse.Namespace,
         allow_reencoded=False,
         allow_av1=getattr(args, "allow_av1", False),
         allow_extras=getattr(args, "allow_extras", False),
+        allow_hd_hevc=getattr(args, "allow_hd_hevc", False),
         db=args.db,
     )
     rc = cmd_plan(plan_ns)
@@ -2539,7 +2568,7 @@ def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
         cmd="plan", path=library, rules=None,
         target="av1+mkv", json=False,
         keep_langs="en,und", allow_reencoded=False,
-        allow_av1=False, allow_extras=False,
+        allow_av1=False, allow_extras=False, allow_hd_hevc=False,
         db=args.db,
     )
     if cmd_plan(plan_ns) != 0:

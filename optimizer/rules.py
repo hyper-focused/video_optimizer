@@ -49,10 +49,17 @@ _MB = 1024.0 * 1024.0
 
 
 class Rule:
-    """Base class for rules; subclasses override name and evaluate()."""
+    """Base class for rules; subclasses override name and evaluate().
+
+    `opt_in=True` rules are excluded from the default-enabled set; the
+    CLI layer adds them only when a corresponding flag is passed
+    (`--allow-hd-hevc` etc.). Used for behaviors the project's stated
+    policy declines to do automatically but exposes as overrides.
+    """
 
     name: str = ""
     advisory: bool = False
+    opt_in: bool = False
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
         """Inspect probe and return a RuleVerdict (fired or not)."""
@@ -207,6 +214,31 @@ class InefficientCodecRule(Rule):
         )
 
 
+class HdHevcOptInRule(Rule):
+    """Opt-in: HEVC at HD heights as a re-encode candidate.
+
+    Disabled by default — HEVC at 1080p with reasonable bitrate is the
+    project's stated "leave it alone" tier (it's already efficient
+    enough; the AV1 savings rarely justify the GPU time). Enable via
+    `--allow-hd-hevc` for cases where the user wants HEVC HD content
+    re-encoded anyway (testing the DV-strip path against a small
+    HD HEVC source, library-wide consolidation onto AV1, etc.).
+    """
+
+    name = "hd_hevc_opt_in"
+    advisory = False
+    opt_in = True
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        return _codec_set_verdict(
+            probe, self.name,
+            codec_set=frozenset({"hevc"}),
+            savings_frac=0.20, severity="low",
+            reason="hevc at HD; opt-in re-encode (--allow-hd-hevc)",
+            height_band=(720, 1440),
+        )
+
+
 class UhdNonAv1Rule(Rule):
     """At UHD, anything other than AV1 is a re-encode candidate."""
 
@@ -311,6 +343,9 @@ RULES: dict[str, Rule] = {
     "sd_non_av1":           SdNonAv1Rule(),
     "container_migration":  ContainerMigrationRule(),
     "hdr_advisory":         HdrAdvisoryRule(),
+    # Opt-in rules: excluded from RulesEngine's default-enabled set.
+    # cmd_plan adds these by name when their gating flag is passed.
+    "hd_hevc_opt_in":       HdHevcOptInRule(),
 }
 
 
@@ -324,7 +359,10 @@ class RulesEngine:
 
     def __init__(self, enabled: list[str] | None = None, target: str = "av1+mkv"):
         if enabled is None:
-            self._rules = list(RULES.values())
+            # Default: every rule that isn't opt_in. Opt-in rules
+            # (hd_hevc_opt_in, etc.) are explicit policy overrides; the
+            # CLI layer adds them by name when their gating flag fires.
+            self._rules = [r for r in RULES.values() if not r.opt_in]
         else:
             unknown = [k for k in enabled if k not in RULES]
             if unknown:
