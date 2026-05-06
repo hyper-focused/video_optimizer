@@ -297,11 +297,19 @@ def validate_output(probe: ProbeResult,
     - Output's reported duration is within ±5% of the source's
       duration (catches partial / aborted encodes that exit cleanly
       but write only N seconds of an N+M-second source).
+    - Output is smaller than the source (lossy AV1 re-encode of any
+      reasonable source should always net out smaller; output ≥ source
+      means something went wrong — typically a CQ that's too low for
+      grainy 4K content where AV1 over-allocates bits to preserve
+      film grain detail). Princess Bride observed live: 47 GB UHD
+      HEVC source → 48.8 GB AV1 at CQ 15. Without this guard the
+      "completed" label propagates to cleanup, which then unlinks
+      the source the user actually wanted to keep.
 
-    A non-zero ffprobe exit, missing video stream, or out-of-band
-    duration trips a "failed" verdict — the source stays untouched
-    and cleanup won't unlink it. The output is preserved on disk for
-    the user to inspect or delete manually.
+    A non-zero ffprobe exit, missing video stream, out-of-band
+    duration, or output ≥ source trips a "failed" verdict — the
+    source stays untouched and cleanup won't unlink it. The output
+    is preserved on disk for the user to inspect or delete manually.
 
     Caller (`_finalize_output` in cli.py) propagates the failure:
     decision is marked status='failed' instead of 'completed', so
@@ -347,6 +355,22 @@ def validate_output(probe: ProbeResult,
     if not (0.95 <= ratio <= 1.05):
         return False, (f"duration mismatch: source {src_dur:.1f}s, "
                        f"output {out_dur:.1f}s (ratio {ratio:.2f})")
+    # Output ≥ source guard. AV1 encoded output should always net
+    # smaller than the source on real content; output ≥ source means
+    # the encode misbehaved (usually CQ too low + grainy 4K) and the
+    # result is worse than just keeping the original. Let the user
+    # see the failure, inspect the bloated output, and decide whether
+    # to retry at a higher CQ — without losing the source to cleanup.
+    try:
+        out_size = output_path.stat().st_size
+    except OSError as e:
+        return False, f"cannot stat output: {e}"
+    if probe.size and out_size >= probe.size:
+        delta_mb = (out_size - probe.size) / (1024 * 1024)
+        return False, (f"output ≥ source ({out_size / 1024**3:.2f} GB "
+                       f"vs {probe.size / 1024**3:.2f} GB; "
+                       f"+{delta_mb:.0f} MB) — encode bloated, "
+                       f"likely CQ too low for grainy content")
     return True, ""
 
 
