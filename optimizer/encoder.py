@@ -263,6 +263,71 @@ def build_dv_p7_convert_command(p8_hevc_path: Path) -> list[str]:
     ]
 
 
+def validate_output(probe: ProbeResult,
+                    output_path: Path) -> tuple[bool, str]:
+    """ffprobe the encoded output; return (ok, error_message).
+
+    Sanity checks every encode passes through before we declare it
+    "completed" and let downstream operations (cleanup, etc.) trust it:
+
+    - Output is a parseable container (ffprobe doesn't error).
+    - At least one video stream is present.
+    - Output's reported duration is within ±5% of the source's
+      duration (catches partial / aborted encodes that exit cleanly
+      but write only N seconds of an N+M-second source).
+
+    A non-zero ffprobe exit, missing video stream, or out-of-band
+    duration trips a "failed" verdict — the source stays untouched
+    and cleanup won't unlink it. The output is preserved on disk for
+    the user to inspect or delete manually.
+
+    Caller (`_finalize_output` in cli.py) propagates the failure:
+    decision is marked status='failed' instead of 'completed', so
+    the cleanup 3-check guard never sees a stale "I was encoded
+    successfully" claim that didn't actually finish.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_streams", "-show_entries", "format=duration",
+             str(output_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"ffprobe failed to run: {e}"
+    if result.returncode != 0:
+        return False, (f"ffprobe exit {result.returncode}: "
+                       f"{result.stderr.strip()[:200]}")
+    try:
+        import json as _json
+        info = _json.loads(result.stdout or "{}")
+    except ValueError as e:
+        return False, f"ffprobe output not JSON: {e}"
+    streams = info.get("streams") or []
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    if not video_streams:
+        return False, "no video stream in output"
+    fmt_dur_str = (info.get("format") or {}).get("duration")
+    try:
+        out_dur = float(fmt_dur_str) if fmt_dur_str else 0.0
+    except (ValueError, TypeError):
+        out_dur = 0.0
+    src_dur = float(probe.duration_seconds or 0.0)
+    if src_dur <= 0:
+        # Source had no duration metadata — can't validate. Trust the
+        # encode (rare; mostly synthetic/streaming content the rules
+        # engine wouldn't admit anyway).
+        return True, ""
+    # ±5% tolerance: catches partial encodes (which are typically off
+    # by minutes-to-hours, far more than 5%) without false-flagging
+    # encodes that drop a few sub-second trailing frames at the boundary.
+    ratio = out_dur / src_dur if src_dur > 0 else 0.0
+    if not (0.95 <= ratio <= 1.05):
+        return False, (f"duration mismatch: source {src_dur:.1f}s, "
+                       f"output {out_dur:.1f}s (ratio {ratio:.2f})")
+    return True, ""
+
+
 def build_dv_p7_remux_strip_command(probe: ProbeResult,
                                     p8_hevc_path: Path,
                                     prepared_path: Path) -> list[str]:

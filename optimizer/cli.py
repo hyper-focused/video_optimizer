@@ -2237,8 +2237,25 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
 def _finalize_output(pr: ProbeResult, output_path: Path,
                      args: argparse.Namespace, db: Database,
                      dec: dict) -> float:
-    """Compute savings, run backup-or-recycle + remove-original, update db."""
+    """Compute savings, run backup-or-recycle + remove-original, update db.
+
+    Post-encode validation guard: before any disposal step (recycle /
+    backup / unlink) and before marking the row 'completed', ffprobe
+    the output and confirm the encode actually produced a valid file
+    matching the source's duration. A partial encode (ffmpeg exited
+    cleanly but only wrote N seconds of an N+M-second source) gets
+    marked 'failed' here — the original stays untouched and the
+    cleanup step will never claim the source is safe to remove.
+    """
     run_id = getattr(args, "_apply_run_id", None)
+    valid, err = encoder.validate_output(pr, output_path)
+    if not valid:
+        print(f"    FAIL: output validation: {err}")
+        db.mark_decision(dec["id"], "failed",
+                         output_path=str(output_path),
+                         error=f"validation: {err}",
+                         run_id=run_id, expected_path=pr.path)
+        return 0.0
     try:
         out_size = output_path.stat().st_size
     except OSError:

@@ -130,7 +130,14 @@ class FinalizeOutputBesideTests(unittest.TestCase):
                 args = _beside_args()
                 args._apply_run_id = run_id  # noqa: SLF001
 
-                actual_mb = _finalize_output(pr, output, args, db, row)
+                # Stub the post-encode ffprobe validation; the test's
+                # fake output is a tiny zero-content file that wouldn't
+                # pass duration-match against the synthetic 7200s probe,
+                # but the test is about the no-touch contract for
+                # beside mode, not about validation behavior itself.
+                with patch.object(cli_mod.encoder, "validate_output",
+                                  return_value=(True, "")):
+                    actual_mb = _finalize_output(pr, output, args, db, row)
 
             # Source and output both still on disk — beside never
             # disposes of the original.
@@ -239,7 +246,9 @@ class CmdApplyBesideE2ETests(unittest.TestCase):
                  patch.object(cli_mod.encoder, "select_encoder",
                               return_value="libsvtav1"), \
                  patch.object(cli_mod, "_build_apply_command",
-                              return_value=(["ffmpeg"], "encode (stub)")):
+                              return_value=(["ffmpeg"], "encode (stub)")), \
+                 patch.object(cli_mod.encoder, "validate_output",
+                              return_value=(True, "")):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     rc = cmd_apply(args)
