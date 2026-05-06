@@ -320,34 +320,25 @@ def _add_doctor_parser(sub: "argparse._SubParsersAction") -> None:
     _add_common_db_arg(dr)
 
 
-def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
-    """Register the `optimize` one-shot pipeline subcommand."""
-    op = sub.add_parser(
-        "optimize",
-        help="One-shot scan+plan+apply for a library. Auto-runs the UHD "
-             "preset on 2160p sources and the HD preset on 1080p-and-below, "
-             "with safe defaults. The friendliest entry point for new users.",
-        description=(
-            "Run scan, plan, and apply against PATH in a single command, "
-            "using calibrated presets for each resolution tier (CQ 15 for "
-            "UHD, CQ 21 for HD). The default output mode is 'beside': new "
-            "files land alongside the source and originals stay untouched "
-            "(see the optional `cleanup` subcommand for removing them). "
-            "Pass --output DIR to mirror outputs into a separate tree, or "
-            "--in-place to recycle the originals."
-        ),
-    )
-    op.add_argument("path", type=Path, help="Library directory to optimize.")
-    op.add_argument("--mode", choices=["beside", "side", "replace"],
-                    default=None,
-                    help="Output mode. 'beside' writes alongside the source "
-                         "and leaves originals untouched (default when "
-                         "neither --output nor --in-place is set). 'side' "
-                         "mirrors output into a separate tree (--output). "
-                         "'replace' writes alongside originals and moves "
-                         "the originals into a recycle directory (--in-place).")
+def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
+    """Shared CLI surface for `optimize` and the SD/HD/UHD tier subcommands.
 
-    out = op.add_mutually_exclusive_group()
+    All path-taking pipeline subcommands present the same flags so that
+    `./video_optimizer.py UHD /path` and `./video_optimizer.py /path`
+    differ only in tier scope. Visible flags cover the common UX
+    decisions (where to write, dry-run, confirm, cleanup); advanced
+    flags are SUPPRESSed but functional.
+    """
+    p.add_argument("path", type=Path, help=path_help)
+    p.add_argument("--mode", choices=["beside", "side", "replace"],
+                   default=None,
+                   help="Output mode. 'beside' writes alongside the source "
+                        "and leaves originals untouched (default when "
+                        "neither --output nor --in-place is set). 'side' "
+                        "mirrors output into a separate tree (--output). "
+                        "'replace' writes alongside originals and moves "
+                        "the originals into a recycle directory (--in-place).")
+    out = p.add_mutually_exclusive_group()
     out.add_argument("--output", type=Path, metavar="DIR",
                      help="Side mode: write new files under DIR mirroring "
                           "PATH's structure. Originals are untouched.")
@@ -355,65 +346,71 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
                      help="Replace mode: write new files alongside originals "
                           "and move the originals into a recycle directory "
                           "(see --recycle-to).")
-
-    op.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
-                    help="With --in-place: recycle directory for displaced "
-                         "originals. If omitted, an existing @Recycle / "
-                         "#recycle / .Trash under PATH is used; otherwise "
-                         "<PATH>/.@Recycle is created.")
-    op.add_argument("--limit", type=int, default=0, metavar="N",
-                    help="Process at most N candidates per tier "
-                         "(0 = no limit). Useful with --dry-run to preview "
-                         "the first encode that would run.")
-    op.add_argument("--dry-run", action="store_true",
-                    help="Print planned ffmpeg commands and exit. Combine "
-                         "with --limit 1 to preview a single encode.")
-    op.add_argument("--confirm", action="store_true",
-                    help="Prompt per-file before encoding. Overrides the "
-                         "auto-yes default of the bare invocation.")
-    op.add_argument("--cleanup-after", action="store_true",
-                    help="After a successful run, prompt to remove the "
-                         "originals of completed encodes.")
-    op.add_argument("--original-audio", action="store_true",
-                    help="Keep every input audio track via stream-copy "
-                         "(default strips to --keep-langs and rebuilds a "
-                         "3-stream ladder).")
-    op.add_argument("--original-subs", action="store_true",
-                    help="Keep every input subtitle track via stream-copy "
-                         "(default strips to --keep-langs).")
-    op.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
+                   help="With --in-place: recycle directory for displaced "
+                        "originals. If omitted, an existing @Recycle / "
+                        "#recycle / .Trash under PATH is used; otherwise "
+                        "<PATH>/.@Recycle is created.")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="Process at most N candidates (0 = no limit).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print planned ffmpeg commands and exit.")
+    p.add_argument("--confirm", action="store_true",
+                   help="Prompt per-file before encoding (default is auto-yes).")
+    p.add_argument("--cleanup-after", action="store_true",
+                   help="After a successful run, prompt to remove the "
+                        "originals of completed encodes.")
+    p.add_argument("--original-audio", action="store_true",
+                   help="Keep every input audio track via stream-copy "
+                        "(default strips to --keep-langs and rebuilds a "
+                        "3-stream ladder).")
+    p.add_argument("--original-subs", action="store_true",
+                   help="Keep every input subtitle track via stream-copy "
+                        "(default strips to --keep-langs).")
+    p.add_argument("--verbose", "-v", action="store_true")
 
     # Hidden / advanced flags below — still functional, just not in --help.
-    op.add_argument("--auto", action="store_true",
-                    help=argparse.SUPPRESS)
-    op.add_argument("--workers", type=int, default=8,
-                    help=argparse.SUPPRESS)
-    op.add_argument("--keep-langs", default=None,
-                    help=argparse.SUPPRESS)
-    op.add_argument("--hwaccel",
-                    choices=["auto", "qsv", "nvenc", "vaapi",
-                             "videotoolbox", "software", "none"],
-                    default="auto",
-                    help=argparse.SUPPRESS)
-    hwd = op.add_mutually_exclusive_group()
+    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--workers", type=int, default=8, help=argparse.SUPPRESS)
+    p.add_argument("--keep-langs", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--hwaccel",
+                   choices=["auto", "qsv", "nvenc", "vaapi",
+                            "videotoolbox", "software", "none"],
+                   default="auto", help=argparse.SUPPRESS)
+    hwd = p.add_mutually_exclusive_group()
     hwd.add_argument("--hw-decode", action="store_true", default=None,
                      help=argparse.SUPPRESS)
     hwd.add_argument("--no-hw-decode", action="store_false",
-                     dest="hw_decode",
-                     help=argparse.SUPPRESS)
-    op.add_argument("--quality", type=int, default=None,
-                    help=argparse.SUPPRESS)
-    op.add_argument("--min-size", type=_parse_size,
-                    default=MIN_PROBE_SIZE_BYTES,
-                    help=argparse.SUPPRESS)
-    op.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
-                    help=argparse.SUPPRESS)
-    op.add_argument("--allow-av1", action="store_true",
-                    help=argparse.SUPPRESS)
-    op.add_argument("--allow-extras", action="store_true",
-                    help=argparse.SUPPRESS)
-    op.add_argument("--bare-invocation", action="store_true", default=False,
-                    help=argparse.SUPPRESS)
+                     dest="hw_decode", help=argparse.SUPPRESS)
+    p.add_argument("--quality", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--min-size", type=_parse_size,
+                   default=MIN_PROBE_SIZE_BYTES, help=argparse.SUPPRESS)
+    p.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--allow-av1", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--allow-extras", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--bare-invocation", action="store_true", default=False,
+                   help=argparse.SUPPRESS)
+
+
+def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `optimize` one-shot pipeline subcommand (all tiers)."""
+    op = sub.add_parser(
+        "optimize",
+        help="One-shot scan+plan+apply for a library, all three tiers "
+             "(UHD + HD + SD). The friendliest entry point for new users.",
+        description=(
+            "Run scan, plan, and apply against PATH in a single command, "
+            "chaining the UHD, HD, and SD presets so every supported "
+            "resolution band is covered. The default output mode is "
+            "'beside': new files land alongside the source and originals "
+            "stay untouched (see the `cleanup` subcommand for removing "
+            "them). Pass --output DIR for a mirrored tree, or --in-place "
+            "to recycle originals as the run proceeds."
+        ),
+    )
+    _add_pipeline_args(op, path_help="Library directory to optimize.")
 
 
 def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
@@ -421,85 +418,20 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
     for name, cfg in PRESETS.items():
         p = sub.add_parser(
             name,
-            help=f"Apply pending decisions with the {cfg['label']} preset.",
+            help=f"Tier-only pipeline (scan+plan+apply) with the "
+                 f"{cfg['label']} preset.",
+            description=(
+                f"Run scan, plan, and apply against PATH using only the "
+                f"{name} preset (resolution-band filtered to "
+                f"{cfg.get('label')}). Same flags as `optimize`; the "
+                f"difference is that `optimize` chains all three tiers "
+                f"and this subcommand processes only the {name} band."
+            ),
         )
-        p.add_argument("--dry-run", action="store_true",
-                       help="Print planned ffmpeg commands and exit without "
-                            "encoding. Use this to preview what would happen "
-                            "before committing to a run.")
-        # Workflow knobs (mirror _add_apply_workflow_args, narrowed).
-        p.add_argument("--auto", action="store_true",
-                       help="Skip per-file confirmation.")
-        p.add_argument("--mode", choices=["beside", "side", "replace"],
-                       default="side")
-        p.add_argument("--output-root", type=Path,
-                       help="Required for --mode side. Mirrored output tree.")
-        p.add_argument("--source-root", type=Path,
-                       help="Strip this prefix when placing outputs in --output-root.")
-        p.add_argument("--backup", type=Path,
-                       help="For --mode replace: copy original here before replacing.")
-        p.add_argument("--recycle-to", type=Path,
-                       help="For --mode replace: atomically move originals into "
-                            "this dir (e.g. /mnt/nas/<share>/@Recycle). Preserves "
-                            "source hierarchy. Mutually exclusive with --backup.")
-        p.add_argument("--allow-hard-delete", action="store_true",
-                       help="Required to combine --mode replace with --auto when "
-                            "neither --backup nor --recycle-to is set. Originals "
-                            "are permanently deleted after each successful encode.")
-        p.add_argument("--limit", type=int, default=0,
-                       help="Process at most N candidates (0 = no limit).")
-        p.add_argument("--min-height", type=int, default=None,
-                       help=f"Override preset min-height filter "
-                            f"(default: {cfg.get('min_height') or 'none'}).")
-        p.add_argument("--max-height", type=int, default=None,
-                       help=f"Override preset max-height filter "
-                            f"(default: {cfg.get('max_height') or 'none'}).")
-        # Selected encoding knobs the user might still want to override.
-        p.add_argument("--quality", type=int, default=None,
-                       help=f"Override preset quality (default: {cfg['quality']}).")
-        p.add_argument("--keep-langs", default=None,
-                       help=f"Override languages kept on apply "
-                            f"(default: {cfg['keep_langs']}).")
-        p.add_argument("--hwaccel",
-                       choices=["auto", "qsv", "nvenc", "vaapi",
-                                "videotoolbox", "software", "none"],
-                       default="auto")
-        p.add_argument("--timeout", type=int, default=None,
-                       help="Per-file ffmpeg wall-clock cap in seconds. "
-                            "0 disables.")
-        # Hardware decode default comes from the preset config (`hw_decode`
-        # in PRESETS). Default=None at the parser level so cmd_preset can
-        # tell user-explicit from preset-default; --hw-decode / --no-hw-decode
-        # both override the preset value when passed.
-        hwd = p.add_mutually_exclusive_group()
-        hwd.add_argument("--hw-decode", action="store_true", default=None,
-                         help="Force the zero-copy QSV decode->encode "
-                              "pipeline on for this run.")
-        hwd.add_argument("--no-hw-decode", action="store_false",
-                         dest="hw_decode",
-                         help="Force CPU decode -> QSV encode for this run.")
-        # Compat audio default-on for presets too.
-        ca = p.add_mutually_exclusive_group()
-        ca.add_argument("--compat-audio", action="store_true", default=True,
-                        help="(default) Add AAC 5.1 + AAC 2.0 compat tracks "
-                             "alongside any hi-res lossless source.")
-        ca.add_argument("--no-compat-audio", action="store_false",
-                        dest="compat_audio",
-                        help="Disable the AAC compat-track shadowing.")
-        p.add_argument("--original-audio", action="store_true",
-                       help="Keep every input audio track via stream-copy.")
-        p.add_argument("--original-subs", action="store_true",
-                       help="Keep every input subtitle track via stream-copy.")
-        # Naming: preset turns rewrite-codec + reencode-tag on; user can opt
-        # out of dotted style or change the marker token.
-        p.add_argument("--no-dotted", action="store_true",
-                       help="Keep input whitespace style instead of forcing dots.")
-        p.add_argument("--name-suffix", default="",
-                       help="Free-form trailing append; runs after preset rename.")
-        p.add_argument("--reencode-tag-value", default="REENCODE",
-                       help="Override the REENCODE marker token (default: REENCODE).")
-        p.add_argument("--verbose", "-v", action="store_true")
-        _add_common_db_arg(p)
+        _add_pipeline_args(
+            p,
+            path_help=f"Library directory to scan for {name}-tier files.",
+        )
 
 
 def _add_cleanup_parser(sub: "argparse._SubParsersAction") -> None:
@@ -1385,8 +1317,12 @@ def _optimize_resolve_paths(
         mode = "beside"
 
     if mode == "replace":
-        return (mode, None, args.path,
-                _resolve_recycle_dir(args.path, args.recycle_to))
+        # Single-file source: resolve recycle/source-root against the
+        # parent directory so @Recycle lives next to siblings, not
+        # inside an empty path-of-the-file context.
+        anchor = args.path if args.path.is_dir() else args.path.parent
+        return (mode, None, anchor,
+                _resolve_recycle_dir(anchor, args.recycle_to))
     if mode == "side":
         if args.output is None:
             print("error: --mode side requires --output DIR", file=sys.stderr)
@@ -1408,49 +1344,150 @@ def _optimize_resolve_paths(
     return (mode, None, args.path, None)
 
 
-def _optimize_run_apply(
-    args: argparse.Namespace,
-    mode: str,
-    output_root: Path | None,
-    source_root: Path,
-    recycle_to: Path | None,
-) -> int:
+def _build_apply_namespace(args: argparse.Namespace, preset_name: str,
+                           mode: str, output_root: Path | None,
+                           source_root: Path,
+                           recycle_to: Path | None) -> argparse.Namespace:
+    """Construct the full apply Namespace for one preset run.
+
+    Path-taking pipeline subcommands carry only the optimize-style flag
+    surface; the preset apply step needs additional fields (backup,
+    name_suffix, etc.) to reach cmd_apply. Hardcode the ones that aren't
+    user-facing on the optimize/SD/HD/UHD parsers.
+    """
+    return argparse.Namespace(
+        cmd=preset_name,
+        auto=args.auto,
+        mode=mode,
+        output_root=output_root,
+        source_root=source_root,
+        backup=None,
+        recycle_to=recycle_to,
+        allow_hard_delete=False,
+        limit=args.limit,
+        min_height=None,
+        max_height=None,
+        quality=args.quality,
+        keep_langs=args.keep_langs,
+        hwaccel=args.hwaccel,
+        timeout=None,
+        hw_decode=args.hw_decode,
+        compat_audio=True,
+        original_audio=getattr(args, "original_audio", False),
+        original_subs=getattr(args, "original_subs", False),
+        no_dotted=False,
+        name_suffix="",
+        reencode_tag_value="REENCODE",
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+        db=args.db,
+    )
+
+
+def _apply_with_preset_config(args: argparse.Namespace) -> int:
+    """Fill preset config into args; dispatch to cmd_apply.
+
+    Internal helper used by `_run_path_pipeline`. Keeps the
+    apply-specific Namespace carrying everything cmd_apply expects
+    (target, rewrite_codec, reencode_tag, plus the preset's CQ /
+    keep_langs / height band / hw_decode defaults).
+    """
+    cfg = PRESETS[args.cmd]
+    args.target = cfg["target"]
+    args.rewrite_codec = bool(cfg["rewrite_codec"])
+    args.reencode_tag = bool(cfg["reencode_tag"])
+    if args.quality is None:
+        args.quality = cfg["quality"]
+    if args.keep_langs is None:
+        args.keep_langs = cfg["keep_langs"]
+    if args.min_height is None and "min_height" in cfg:
+        args.min_height = cfg["min_height"]
+    if args.max_height is None and "max_height" in cfg:
+        args.max_height = cfg["max_height"]
+    if args.hw_decode is None:
+        args.hw_decode = bool(cfg.get("hw_decode", False))
+    if args.verbose:
+        bounds = (f"[{args.min_height or '-'}..{args.max_height or '-'}]"
+                  if (args.min_height or args.max_height) else "any")
+        print(f"preset {args.cmd}: target={args.target}, quality={args.quality}, "
+              f"keep_langs={args.keep_langs}, height={bounds}, "
+              f"rewrite_codec={args.rewrite_codec}, "
+              f"reencode_tag={args.reencode_tag}, hw_decode={args.hw_decode}, "
+              f"compat_audio={args.compat_audio}")
+    return cmd_apply(args)
+
+
+def _run_path_pipeline(args: argparse.Namespace,
+                       presets_to_run: tuple[str, ...],
+                       *, label: str) -> int:
+    """Shared scan + plan + apply pipeline for path-taking subcommands.
+
+    Used by `cmd_optimize` (all three tiers) and `cmd_preset` (one tier
+    per SD/HD/UHD invocation). The apply phase loops once per preset in
+    `presets_to_run`; each preset's own min_height/max_height filter
+    keeps its band isolated.
+    """
+    _apply_bare_invocation_defaults(args)
+    if getattr(args, "confirm", False):
+        args.auto = False
+
+    if not args.path.exists():
+        print(f"error: path not found: {args.path}", file=sys.stderr)
+        return 2
+    if not (args.path.is_dir() or args.path.is_file()):
+        print(f"error: {label} expects a directory or a single video file: "
+              f"{args.path}", file=sys.stderr)
+        return 2
+
+    resolved = _optimize_resolve_paths(args)
+    if isinstance(resolved, int):
+        return resolved
+    mode, output_root, source_root, recycle_to = resolved
+
+    _print_pipeline_banner(args, label, mode, output_root, recycle_to)
+
+    total = 2 + len(presets_to_run)
+    print(f"==> [1/{total}] scan: probing {args.path} (cache hits skip ffprobe)...")
+    scan_ns = argparse.Namespace(
+        cmd="scan", path=args.path, no_recursive=False,
+        no_probe_cache=False, workers=args.workers,
+        min_size=args.min_size,
+        allow_extras=getattr(args, "allow_extras", False),
+        verbose=args.verbose, db=args.db,
+    )
+    rc = cmd_scan(scan_ns)
+    if rc != 0:
+        return rc
+    print()
+
+    print(f"==> [2/{total}] plan: evaluating rules against probe cache...")
+    plan_ns = argparse.Namespace(
+        cmd="plan", rules=None, target="av1+mkv", json=False,
+        keep_langs=args.keep_langs or "en,und",
+        allow_reencoded=False,
+        allow_av1=getattr(args, "allow_av1", False),
+        allow_extras=getattr(args, "allow_extras", False),
+        db=args.db,
+    )
+    rc = cmd_plan(plan_ns)
+    if rc != 0:
+        return rc
+    print()
+
     aggregate_rc = 0
-    presets_to_run = ("UHD", "HD", "SD")
     for step, preset_name in enumerate(presets_to_run, start=3):
         cfg = PRESETS[preset_name]
-        print(f"==> [{step}/4] apply: {preset_name} ({cfg['label']})")
-        preset_ns = argparse.Namespace(
-            cmd=preset_name,
-            auto=args.auto,
-            mode=mode,
-            output_root=output_root,
-            source_root=source_root,
-            backup=None,
-            recycle_to=recycle_to,
-            allow_hard_delete=False,
-            limit=args.limit,
-            min_height=None,
-            max_height=None,
-            quality=args.quality,
-            keep_langs=args.keep_langs,
-            hwaccel=args.hwaccel,
-            timeout=None,
-            hw_decode=args.hw_decode,
-            compat_audio=True,
-            original_audio=getattr(args, "original_audio", False),
-            original_subs=getattr(args, "original_subs", False),
-            no_dotted=False,
-            name_suffix="",
-            reencode_tag_value="REENCODE",
-            dry_run=args.dry_run,
-            verbose=args.verbose,
-            db=args.db,
+        print(f"==> [{step}/{total}] apply: {preset_name} ({cfg['label']})")
+        preset_ns = _build_apply_namespace(
+            args, preset_name, mode, output_root, source_root, recycle_to,
         )
-        rc = cmd_preset(preset_ns)
+        rc = _apply_with_preset_config(preset_ns)
         if rc != 0:
             aggregate_rc = rc
         print()
+
+    if aggregate_rc == 0 and getattr(args, "cleanup_after", False):
+        _invoke_cleanup_after(args)
     return aggregate_rc
 
 
@@ -1472,14 +1509,15 @@ def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
         args.verbose = True
 
 
-def _print_optimize_banner(
+def _print_pipeline_banner(
     args: argparse.Namespace,
+    label: str,
     mode: str,
     output_root: Path | None,
     recycle_to: Path | None,
 ) -> None:
-    """Print the `==> optimize:` header for a `cmd_optimize` run."""
-    print(f"==> optimize: {args.path}")
+    """Print the `==> <label>:` header for a path-taking pipeline run."""
+    print(f"==> {label}: {args.path}")
     if mode == "beside":
         print("    output mode: beside (alongside source; originals untouched)")
     elif mode == "replace":
@@ -1494,63 +1532,8 @@ def _print_optimize_banner(
 
 
 def cmd_optimize(args: argparse.Namespace) -> int:
-    """One-shot scan+plan+apply pipeline using calibrated presets.
-
-    Sequences UHD then HD so the higher-savings tier ships first; each
-    preset's resolution gate (min_height / max_height in PRESETS) keeps
-    the two from clobbering each other's queue.
-    """
-    _apply_bare_invocation_defaults(args)
-
-    # --confirm is the explicit opt-out from auto-yes; it wins over the
-    # bare-invocation default. (Outside the bare path it's a regular flag.)
-    if getattr(args, "confirm", False):
-        args.auto = False
-
-    if not args.path.exists():
-        print(f"error: path not found: {args.path}", file=sys.stderr)
-        return 2
-    if not args.path.is_dir():
-        print(f"error: optimize expects a directory: {args.path}", file=sys.stderr)
-        return 2
-
-    resolved = _optimize_resolve_paths(args)
-    if isinstance(resolved, int):
-        return resolved
-    mode, output_root, source_root, recycle_to = resolved
-
-    _print_optimize_banner(args, mode, output_root, recycle_to)
-
-    print(f"==> [1/4] scan: probing {args.path} (cache hits skip ffprobe)...")
-    scan_ns = argparse.Namespace(
-        cmd="scan", path=args.path, no_recursive=False,
-        no_probe_cache=False, workers=args.workers,
-        min_size=args.min_size,
-        verbose=args.verbose, db=args.db,
-    )
-    rc = cmd_scan(scan_ns)
-    if rc != 0:
-        return rc
-    print()
-
-    print("==> [2/4] plan: evaluating rules against probe cache...")
-    plan_ns = argparse.Namespace(
-        cmd="plan", rules=None, target="av1+mkv", json=False,
-        keep_langs=args.keep_langs or "en,und",
-        allow_reencoded=False,
-        allow_av1=getattr(args, "allow_av1", False),
-        allow_extras=getattr(args, "allow_extras", False),
-        db=args.db,
-    )
-    rc = cmd_plan(plan_ns)
-    if rc != 0:
-        return rc
-    print()
-
-    rc = _optimize_run_apply(args, mode, output_root, source_root, recycle_to)
-    if rc == 0 and getattr(args, "cleanup_after", False):
-        _invoke_cleanup_after(args)
-    return rc
+    """One-shot scan+plan+apply across all three tiers (UHD + HD + SD)."""
+    return _run_path_pipeline(args, ("UHD", "HD", "SD"), label="optimize")
 
 
 def _invoke_cleanup_after(args: argparse.Namespace) -> None:
@@ -1603,30 +1586,12 @@ def _invoke_cleanup_after(args: argparse.Namespace) -> None:
 
 
 def cmd_preset(args: argparse.Namespace) -> int:
-    """Fill in preset values for missing args, then dispatch to cmd_apply."""
-    cfg = PRESETS[args.cmd]
-    args.target = cfg["target"]
-    args.rewrite_codec = bool(cfg["rewrite_codec"])
-    args.reencode_tag = bool(cfg["reencode_tag"])
-    if args.quality is None:
-        args.quality = cfg["quality"]
-    if args.keep_langs is None:
-        args.keep_langs = cfg["keep_langs"]
-    if args.min_height is None and "min_height" in cfg:
-        args.min_height = cfg["min_height"]
-    if args.max_height is None and "max_height" in cfg:
-        args.max_height = cfg["max_height"]
-    if args.hw_decode is None:
-        args.hw_decode = bool(cfg.get("hw_decode", False))
-    if args.verbose:
-        bounds = (f"[{args.min_height or '-'}..{args.max_height or '-'}]"
-                  if (args.min_height or args.max_height) else "any")
-        print(f"preset {args.cmd}: target={args.target}, quality={args.quality}, "
-              f"keep_langs={args.keep_langs}, height={bounds}, "
-              f"rewrite_codec={args.rewrite_codec}, "
-              f"reencode_tag={args.reencode_tag}, hw_decode={args.hw_decode}, "
-              f"compat_audio={args.compat_audio}")
-    return cmd_apply(args)
+    """Tier-only path-taking pipeline (SD / HD / UHD subcommands).
+
+    Same flow as `cmd_optimize` but applies a single preset, so only
+    files within that tier's height band get encoded.
+    """
+    return _run_path_pipeline(args, (args.cmd,), label=args.cmd)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
