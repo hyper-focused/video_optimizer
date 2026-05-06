@@ -50,8 +50,17 @@ content, ambiguous sources) and surfaces them in a per-run report.
 
 ## Install
 
-Stdlib-only Python 3.10+; no `pip install`, no virtualenv. The only
-runtime dependencies are `ffmpeg` and `ffprobe` on `PATH`.
+Stdlib-only Python 3.10+; no `pip install`, no virtualenv. Runtime
+dependencies on `PATH`:
+
+- **`ffmpeg` 7.0+ and `ffprobe`** — required. Older ffmpeg lacks the
+  `dovi_rpu` bitstream filter the DV strip pipeline relies on.
+- **`dovi_tool`** — required for Dolby Vision Profile 7 sources (some
+  UHD Blu-rays). Profile 8.x sources work without it via ffmpeg's
+  built-in bsf. If you don't have any Profile 7 content in your
+  library, you can skip the dovi_tool install — those sources will
+  just stay on the DV skip-list. Most modern UHD WEB-DLs are Profile
+  8, not 7.
 
 ### Debian / Ubuntu
 
@@ -67,6 +76,19 @@ recent kernel and `intel-media-va-driver-non-free` (Debian) /
 `intel-media-va-driver` (Ubuntu). Battlemage specifically needs kernel
 6.13+ (Xe driver) and Mesa 25+.
 
+For Dolby Vision Profile 7 support (optional but on-by-default when
+present), install `dovi_tool`. It's not in apt; grab it from cargo
+or the GitHub releases:
+
+```bash
+# Option A: cargo (no sudo)
+cargo install dovi_tool
+
+# Option B: prebuilt binary
+curl -L "https://github.com/quietvoid/dovi_tool/releases/latest/download/dovi_tool-x86_64-unknown-linux-musl.tar.gz" \
+  | tar xz -C ~/.local/bin/
+```
+
 ### Fedora
 
 ```bash
@@ -80,6 +102,8 @@ cd ~/video_optimizer
 (Fedora's stock `ffmpeg-free` is built without non-free codecs; RPM
 Fusion's full `ffmpeg` is what you want for a transcode workflow.)
 
+For Dolby Vision Profile 7: `cargo install dovi_tool` (no sudo).
+
 ### Arch Linux
 
 ```bash
@@ -88,6 +112,9 @@ git clone https://github.com/hyper-focused/video_optimizer ~/video_optimizer
 cd ~/video_optimizer
 ./video_optimizer.py doctor
 ```
+
+`dovi_tool` is in AUR for Profile 7 support: `yay -S dovi-tool-bin`
+(or `cargo install dovi_tool`).
 
 ### NVIDIA / AMD
 

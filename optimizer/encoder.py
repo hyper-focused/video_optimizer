@@ -210,7 +210,7 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
     filter on the video track to remove DV RPU SEI messages. Output is
     a clean HDR10 MKV that the QSV pipeline accepts without wedging.
     Use for Profile 8.x sources; Profile 7 needs `dovi_tool` first
-    (see `build_dv_p7_pipeline`).
+    (see `build_dv_p7_extract_command` + `build_dv_p7_remux_command`).
     """
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-y",
@@ -220,6 +220,65 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
         # The bsf has named options; `strip` is a boolean (default false).
         # Bare `dovi_rpu=strip` is parsed as "strip is the value of an
         # implicit option" and rejected. Must be `strip=true` (or `strip=1`).
+        "-bsf:v", "dovi_rpu=strip=true",
+        "-progress", "pipe:1", "-nostats",
+        str(prepared_path),
+    ]
+
+
+def build_dv_p7_extract_command(probe: ProbeResult) -> list[str]:
+    """Return ffmpeg argv that emits a raw HEVC Annex-B bitstream on stdout.
+
+    First stage of the Profile 7 conversion pipeline: extract the video
+    stream as a clean Annex-B HEVC bitstream that `dovi_tool convert`
+    can consume on stdin. Audio + subtitles are dropped here and re-
+    muxed back from the original source after conversion.
+    """
+    return [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+        "-i", probe.path,
+        "-map", "0:v:0",
+        "-c", "copy",
+        "-bsf:v", "hevc_mp4toannexb",
+        "-f", "hevc", "-",
+    ]
+
+
+def build_dv_p7_convert_command(p8_hevc_path: Path) -> list[str]:
+    """Return dovi_tool argv: read HEVC on stdin, write P8 HEVC to file.
+
+    Mode 2 (`-m 2`) flattens Profile 7 (BL+EL+RPU) to Profile 8.1
+    (BL+RPU) by discarding the enhancement layer. The resulting HEVC
+    bitstream still carries DV RPU; the strip stage runs after this
+    on the re-muxed MKV to produce clean HDR10.
+    """
+    return [
+        "dovi_tool", "convert", "-m", "2",
+        "-i", "-",
+        "-o", str(p8_hevc_path),
+    ]
+
+
+def build_dv_p7_remux_strip_command(probe: ProbeResult,
+                                    p8_hevc_path: Path,
+                                    prepared_path: Path) -> list[str]:
+    """Return ffmpeg argv: re-mux converted HEVC + original streams + strip.
+
+    Final stage of the Profile 7 pipeline. Takes the dovi_tool output
+    (P8.1 HEVC bitstream, video-only) and re-attaches audio + subs
+    from the original source via the second `-i`, applying the
+    `dovi_rpu=strip=true` bsf in the same pass so the output is plain
+    HDR10 ready for av1_qsv. Stream indices are preserved by keeping
+    `-map 1:a?` / `-map 1:s?` references against the original source.
+    """
+    return [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+        "-i", str(p8_hevc_path),
+        "-i", probe.path,
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        "-map", "1:s?",
+        "-c", "copy",
         "-bsf:v", "dovi_rpu=strip=true",
         "-progress", "pipe:1", "-nostats",
         str(prepared_path),

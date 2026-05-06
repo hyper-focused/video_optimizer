@@ -1170,16 +1170,84 @@ def _prepare_dv_source(pr: ProbeResult,
         return work_dir, str(prepared)
 
     if strategy == "p7_convert":
-        # P7 → P8 via dovi_tool, then strip + encode. Multi-stage; the
-        # implementation lands as a follow-up commit. For now, fall
-        # through to skip (caller marks as skipped).
-        shutil.rmtree(work_dir, ignore_errors=True)
-        print("    DV Profile 7 prep not yet implemented; skipping")
-        return None, None
+        ok = _run_dv_p7_pipeline(pr, work_dir, prepared, args)
+        if not ok:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return None, None
+        return work_dir, str(prepared)
 
     # Unknown strategy string — defensive fallback.
     shutil.rmtree(work_dir, ignore_errors=True)
     return None, None
+
+
+def _run_dv_p7_pipeline(pr: ProbeResult, work_dir: Path,
+                       prepared: Path,
+                       args: argparse.Namespace) -> bool:
+    """Run the 3-stage Profile 7 prep: extract HEVC → P7→P8 convert → re-mux+strip.
+
+    Stage 1+2 are piped (ffmpeg stdout → dovi_tool stdin) so we don't
+    write a 50 GB intermediate Annex-B HEVC. Stage 2 writes the
+    converted P8.1 HEVC to a temp file because stage 3 needs it as a
+    file input alongside the original source. Stage 3 re-attaches
+    audio/subs from the original and applies `dovi_rpu=strip=true` in
+    one pass — the output is plain HDR10 MKV ready for av1_qsv.
+
+    Returns True on success, False on any subprocess failure (caller
+    cleans up the work_dir).
+    """
+    print(f"    DV Profile 7: converting to P8 + stripping RPU "
+          f"(temp dir: {work_dir.name})")
+    p8_hevc = work_dir / "p8.hevc"
+    extract_cmd = encoder.build_dv_p7_extract_command(pr)
+    convert_cmd = encoder.build_dv_p7_convert_command(p8_hevc)
+
+    # Stage 1+2: piped extract → convert. Both stdouts captured so
+    # ffmpeg's progress logs can be flushed if it errors before the
+    # pipe closes; on success we just discard them.
+    extract_proc = subprocess.Popen(
+        extract_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if not args.verbose else None,
+    )
+    try:
+        convert_proc = subprocess.run(
+            convert_cmd,
+            stdin=extract_proc.stdout,
+            stderr=subprocess.PIPE if not args.verbose else None,
+        )
+    finally:
+        if extract_proc.stdout is not None:
+            extract_proc.stdout.close()
+        extract_proc.wait()
+
+    if extract_proc.returncode != 0:
+        print(f"    FAIL: DV P7 extract (ffmpeg) returned "
+              f"{extract_proc.returncode}")
+        return False
+    if convert_proc.returncode != 0:
+        err = (convert_proc.stderr or b"").decode(
+            "utf-8", errors="replace")[:400]
+        print(f"    FAIL: dovi_tool convert returned "
+              f"{convert_proc.returncode}\n      {err}")
+        return False
+    if not p8_hevc.exists() or p8_hevc.stat().st_size == 0:
+        print("    FAIL: dovi_tool produced no output")
+        return False
+
+    # Stage 3: re-mux + strip via the existing run_ffmpeg helper so
+    # the timeout / progress / stall watchdog all apply.
+    remux_cmd = encoder.build_dv_p7_remux_strip_command(pr, p8_hevc, prepared)
+    timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
+    ok, err = encoder.run_ffmpeg(
+        remux_cmd, pr.duration_seconds,
+        timeout_seconds=timeout, verbose=args.verbose,
+        label="    DV-P7-remux ",
+    )
+    if not ok:
+        print(f"    FAIL: DV P7 remux+strip failed: {err[:200]}")
+        return False
+    return True
 
 
 def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> None:
