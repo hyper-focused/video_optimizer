@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Iterator, Self
@@ -24,7 +25,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
-    id                    INTEGER PRIMARY KEY,
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     path                  TEXT NOT NULL,
     decided_at            REAL NOT NULL,
     rules_fired_json      TEXT NOT NULL,
@@ -74,6 +75,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(_SCHEMA)
         self._migrate_decisions_run_id()
+        self._migrate_decisions_autoincrement()
         self.conn.commit()
 
     def _migrate_decisions_run_id(self) -> None:
@@ -90,6 +92,57 @@ class Database:
             # "duplicate column name: run_id" — already migrated.
             if "duplicate column" not in str(e).lower():
                 raise
+
+    def _migrate_decisions_autoincrement(self) -> None:
+        """De-facto migration: switch `decisions.id` to AUTOINCREMENT.
+
+        Without AUTOINCREMENT, SQLite's INTEGER PRIMARY KEY reuses the
+        ids of deleted rows. That's a data-corruption hazard when two
+        processes race against the same db: process A's `clear_pending`
+        deletes B's pending rows, B's INSERT reuses those ids, and A's
+        later `mark_decision(stale_id, ...)` clobbers the wrong row.
+        AUTOINCREMENT makes ids strictly monotonic so stale dec_ids
+        target nothing (UPDATE-by-id with no match is a no-op).
+
+        SQLite can't ALTER a column to add AUTOINCREMENT — needs a
+        table swap. Detect via sqlite_master.sql, migrate via temp
+        table + INSERT SELECT + DROP + RENAME. Skipped on a fresh db
+        where the schema already has AUTOINCREMENT.
+        """
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions'"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return
+        if "AUTOINCREMENT" in row[0]:
+            return  # already migrated (or fresh schema)
+        self.conn.executescript("""
+            BEGIN;
+            CREATE TABLE decisions_new (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                path                  TEXT NOT NULL,
+                decided_at            REAL NOT NULL,
+                rules_fired_json      TEXT NOT NULL,
+                target                TEXT NOT NULL,
+                projected_savings_mb  REAL,
+                status                TEXT NOT NULL,
+                output_path           TEXT,
+                actual_savings_mb     REAL,
+                error                 TEXT,
+                run_id                INTEGER,
+                FOREIGN KEY (path) REFERENCES files(path)
+            );
+            INSERT INTO decisions_new
+                SELECT id, path, decided_at, rules_fired_json, target,
+                       projected_savings_mb, status, output_path,
+                       actual_savings_mb, error, run_id
+                FROM decisions;
+            DROP TABLE decisions;
+            ALTER TABLE decisions_new RENAME TO decisions;
+            CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+            CREATE INDEX IF NOT EXISTS idx_decisions_path   ON decisions(path);
+            COMMIT;
+        """)
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -224,6 +277,34 @@ class Database:
         )
         return [dict(row) for row in cur]
 
+    def _verify_decision_path(self, decision_id: int,
+                              expected_path: str) -> bool:
+        """Confirm `decisions[id=decision_id].path == expected_path`.
+
+        Used by mark_decision and stamp_decision_run to refuse writes
+        when a concurrent plan re-purposed the row's id (the corruption
+        path that produced run-127.txt's MaXXXine-output-on-Princess-
+        Bride-row mismatch). Logs a warning to stderr on mismatch so
+        the operator can spot a concurrent-process collision.
+        """
+        row = self.conn.execute(
+            "SELECT path FROM decisions WHERE id = ?", (decision_id,)
+        ).fetchone()
+        if row is None:
+            sys.stderr.write(
+                f"warning: decision id={decision_id}: row no longer exists "
+                f"(concurrent plan?); skipping update\n"
+            )
+            return False
+        if row["path"] != expected_path:
+            sys.stderr.write(
+                f"warning: decision id={decision_id}: path mismatch "
+                f"(expected {expected_path!r}, found {row['path']!r}); "
+                f"refusing to corrupt the row\n"
+            )
+            return False
+        return True
+
     def mark_decision(
         self,
         decision_id: int,
@@ -232,13 +313,33 @@ class Database:
         actual_savings_mb: float | None = None,
         error: str | None = None,
         run_id: int | None = None,
-    ) -> None:
+        expected_path: str | None = None,
+    ) -> bool:
         """Update a decision row's status and outcome fields.
 
         If `run_id` is given, also overwrite the row's run_id with the apply
         run id so `decisions_for_run(apply_run_id)` returns exactly the rows
         terminalised in that apply.
+
+        `expected_path` (when set) guards against the concurrent-process
+        race where another process's plan deleted this dec_id's pending
+        row, then re-inserted a different file's row that reused the id.
+        Without the guard, mark_decision would write our outcome onto a
+        row that's now describing a different source — visible later as
+        "OK <savings> <wrong_output> <unrelated_source>" lines in the
+        run report. With the guard, a path mismatch makes mark_decision
+        a no-op (returns False) and prints a one-line stderr warning.
+        Combined with AUTOINCREMENT on decisions.id (which prevents the
+        id-reuse half of the race), the corruption shouldn't recur on
+        new dbs; this is defense in depth for old dbs that ran with the
+        non-AUTOINCREMENT schema.
+
+        Returns True if the row was updated, False if `expected_path`
+        didn't match and the UPDATE was skipped.
         """
+        if expected_path is not None and not self._verify_decision_path(
+                decision_id, expected_path):
+            return False
         if run_id is not None:
             self.conn.execute(
                 "UPDATE decisions SET status = ?, output_path = ?, "
@@ -253,23 +354,32 @@ class Database:
                 (status, output_path, actual_savings_mb, error, decision_id),
             )
         self.conn.commit()
+        return True
 
     def stamp_decision_run(self, decision_id: int,
-                           run_id: int | None) -> None:
+                           run_id: int | None,
+                           expected_path: str | None = None) -> bool:
         """Update a decision row's run_id without touching status / outcome.
 
         Used by dry-run, which observes a pending row but doesn't terminalise
         it — yet still needs the row to surface in the post-run report.
         Caller passing `run_id=None` is a no-op (e.g. an apply context
         without a stashed run id, which shouldn't normally happen).
+
+        `expected_path` is the same concurrent-process race guard as on
+        `mark_decision`; mismatch returns False without writing.
         """
         if run_id is None:
-            return
+            return False
+        if expected_path is not None and not self._verify_decision_path(
+                decision_id, expected_path):
+            return False
         self.conn.execute(
             "UPDATE decisions SET run_id = ? WHERE id = ?",
             (run_id, decision_id),
         )
         self.conn.commit()
+        return True
 
     def decisions_for_run(self, run_id: int) -> list[dict]:
         """Return decisions associated with `run_id` for the post-run report.

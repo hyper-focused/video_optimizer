@@ -1018,7 +1018,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         print(f"[{idx}/{total}] {dec['path']}: probe missing, skipping")
         db.mark_decision(dec["id"], "skipped",
                          error="probe missing in cache (rerun scan)",
-                         run_id=run_id)
+                         run_id=run_id, expected_path=dec["path"])
         return "skipped", 0
 
     # Defense in depth: catch sources that disappeared between plan and
@@ -1029,7 +1029,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         print(f"[{idx}/{total}] {pr.path}: source no longer exists, skipping")
         db.mark_decision(dec["id"], "skipped",
                          error="source no longer exists at apply time",
-                         run_id=run_id)
+                         run_id=run_id, expected_path=pr.path)
         return "skipped", 0
 
     _print_decision_header(dec, pr, idx, total)
@@ -1058,7 +1058,7 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
     if not args.auto and not args.dry_run:
         if not _confirm("    encode this file? [y/N/q]: "):
             db.mark_decision(dec["id"], "skipped", error="user declined",
-                             run_id=run_id)
+                             run_id=run_id, expected_path=pr.path)
             return "skipped", 0
 
     target = dec["target"]
@@ -1069,7 +1069,8 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         enc_name = encoder.select_encoder(target, args.hwaccel)
     except RuntimeError as e:
         print(f"    FAIL: {e}")
-        db.mark_decision(dec["id"], "failed", error=str(e), run_id=run_id)
+        db.mark_decision(dec["id"], "failed", error=str(e),
+                         run_id=run_id, expected_path=pr.path)
         return "failed", 0
 
     return _apply_one_after_validation(
@@ -1099,7 +1100,8 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                 # Strategy was None (P5 / P7-without-dovi_tool). Plan
                 # gate should have caught this; defensive belt-and-braces.
                 db.mark_decision(dec["id"], "skipped",
-                                 error="dv_no_prep_strategy", run_id=run_id)
+                                 error="dv_no_prep_strategy", run_id=run_id,
+                                 expected_path=pr.path)
                 return "skipped", 0
 
         cmd, desc = _build_apply_command(
@@ -1111,7 +1113,8 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         if args.dry_run:
             print(f"    DRY RUN ({desc}) → {output_path}")
             print("    " + " ".join(cmd))
-            db.stamp_decision_run(dec["id"], run_id)
+            db.stamp_decision_run(dec["id"], run_id,
+                                  expected_path=pr.path)
             return "dry_run", 0
 
         label = f"[{idx}/{total}] {Path(pr.path).name}: "
@@ -1373,7 +1376,8 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
             except OSError:
                 pass
         db.mark_decision(dec["id"], "failed", error=err[:1000],
-                         run_id=getattr(args, "_apply_run_id", None))
+                         run_id=getattr(args, "_apply_run_id", None),
+                         expected_path=pr.path)
         return "failed", 0
 
     actual_mb = _finalize_output(pr, output_path, args, db, dec)
@@ -2191,7 +2195,7 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
                              error=f"recycle move failed: {e}",
-                             run_id=run_id)
+                             run_id=run_id, expected_path=pr.path)
             return "done"
         # Original is now at `dst`; nothing more to delete.
         return None
@@ -2213,7 +2217,7 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
                              error=f"backup failed: {e}",
-                             run_id=run_id)
+                             run_id=run_id, expected_path=pr.path)
             return "done"
     # When --recycle-to is set the move above already removed the
     # original; otherwise unlink it now (after the optional backup copy).
@@ -2225,7 +2229,7 @@ def _finalize_replace_disposal(pr: ProbeResult, output_path: Path,
                              output_path=str(output_path),
                              actual_savings_mb=actual_mb,
                              error=f"original not removed: {e}",
-                             run_id=run_id)
+                             run_id=run_id, expected_path=pr.path)
             return "done"
     return None
 
@@ -2248,7 +2252,7 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
         db.mark_decision(dec["id"], "completed",
                          output_path=str(output_path),
                          actual_savings_mb=actual_mb,
-                         run_id=run_id)
+                         run_id=run_id, expected_path=pr.path)
         return actual_mb
 
     if args.mode == "replace":
@@ -2260,7 +2264,7 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
     db.mark_decision(dec["id"], "completed",
                      output_path=str(output_path),
                      actual_savings_mb=actual_mb,
-                     run_id=run_id)
+                     run_id=run_id, expected_path=pr.path)
     return actual_mb
 
 
