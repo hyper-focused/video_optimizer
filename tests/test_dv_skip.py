@@ -43,7 +43,10 @@ class DvSkipTests(unittest.TestCase):
         Path(self.dv).write_bytes(b"x")
         with Database(self.db_path) as db:
             db.upsert_probe(_p(self.non_dv, dv_profile=None))
-            db.upsert_probe(_p(self.dv, dv_profile=7))
+            # Profile 5: always skipped (no clean HDR10 base layer to
+            # fall back to). Profile 7 is environment-dependent (admitted
+            # iff dovi_tool is on PATH); P5 keeps the test deterministic.
+            db.upsert_probe(_p(self.dv, dv_profile=5))
 
     def tearDown(self):
         for p in (self.non_dv, self.dv):

@@ -152,6 +152,78 @@ def output_extension(target: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Dolby Vision: per-profile prep strategy
+# --------------------------------------------------------------------------- #
+
+
+# Module-level cache for dovi_tool availability. Populated on first call.
+# Use a sentinel rather than None so we can distinguish "uncached" from
+# "checked and missing".
+_DOVI_TOOL_UNCACHED = object()
+_dovi_tool_cache: object = _DOVI_TOOL_UNCACHED
+
+
+def has_dovi_tool() -> bool:
+    """Return True if `dovi_tool` is on PATH.
+
+    Required only for Profile 7 sources (P7 → P8 conversion). The
+    P8.x strip path uses ffmpeg's built-in `dovi_rpu` bsf and doesn't
+    need dovi_tool. Cached at module scope; tests can reset by
+    setting `_dovi_tool_cache = _DOVI_TOOL_UNCACHED`.
+    """
+    global _dovi_tool_cache
+    if _dovi_tool_cache is _DOVI_TOOL_UNCACHED:
+        _dovi_tool_cache = shutil.which("dovi_tool")
+    return _dovi_tool_cache is not None
+
+
+def dv_strategy(dv_profile: int | None) -> str | None:
+    """Pick the prep strategy for a given DV profile, or None to skip.
+
+    Returns one of:
+      "p8_strip"   — single-pass `dovi_rpu=strip` via ffmpeg bsf, then
+                     encode the HDR10 base layer to AV1. Covers
+                     Profile 8.x — the modern UHD majority.
+      "p7_convert" — multi-stage: extract HEVC, `dovi_tool convert -m 2`
+                     to flatten P7 → P8, re-mux + strip RPU, then encode.
+                     Requires dovi_tool on PATH.
+      None         — skip permanently. Profile 5 (custom DV-only colour
+                     space, no clean HDR10 fallback) and Profile 7 when
+                     dovi_tool is missing both fall here.
+    """
+    if dv_profile is None:
+        return None  # not DV; caller shouldn't have asked
+    if dv_profile == 5:
+        return None  # P5 has no clean HDR10 base layer
+    if dv_profile == 7:
+        return "p7_convert" if has_dovi_tool() else None
+    if dv_profile == 8:
+        return "p8_strip"
+    # Profile 4 / 9 / 10 (rare or AV1-native) — be conservative, skip
+    return None
+
+
+def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]:
+    """Return ffmpeg argv that produces `prepared_path` from `probe.path`.
+
+    Stream-copies every track, applying the `dovi_rpu=strip` bitstream
+    filter on the video track to remove DV RPU SEI messages. Output is
+    a clean HDR10 MKV that the QSV pipeline accepts without wedging.
+    Use for Profile 8.x sources; Profile 7 needs `dovi_tool` first
+    (see `build_dv_p7_pipeline`).
+    """
+    return [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+        "-i", probe.path,
+        "-map", "0",
+        "-c", "copy",
+        "-bsf:v", "dovi_rpu=strip",
+        "-progress", "pipe:1", "-nostats",
+        str(prepared_path),
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Stream mapping
 # --------------------------------------------------------------------------- #
 
@@ -756,15 +828,23 @@ def build_remux_command(probe: ProbeResult, output_path: Path,
                         target_container: str, keep_langs: list[str],
                         *, add_compat_audio: bool = True,
                         original_audio: bool = False,
-                        original_subs: bool = False) -> list[str]:
-    """Return ffmpeg argv that stream-copies into target_container."""
+                        original_subs: bool = False,
+                        source_override: str | None = None) -> list[str]:
+    """Return ffmpeg argv that stream-copies into target_container.
+
+    source_override (when set) replaces probe.path as the `-i` input.
+    Used by the DV-strip pipeline so the prepared HDR10 stream-copy
+    feeds the remux rather than the original DV source. Stream layout
+    decisions still come from the probe.
+    """
+    src = source_override if source_override is not None else probe.path
     cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     cmd += _input_discard_args(probe, keep_langs, target_container,
                                add_compat_audio=add_compat_audio,
                                original_audio=original_audio,
                                original_subs=original_subs)
     cmd += [
-        "-i", probe.path,
+        "-i", src,
         "-map_metadata", "0",
         "-map_metadata:s", "-1",
         "-map_chapters", "0",
@@ -787,7 +867,8 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                          add_compat_audio: bool = True,
                          denoise: bool = False,
                          original_audio: bool = False,
-                         original_subs: bool = False) -> list[str]:
+                         original_subs: bool = False,
+                         source_override: str | None = None) -> list[str]:
     """Return ffmpeg argv for a real re-encode using the given encoder.
 
     hw_decode=True with a QSV encoder enables zero-copy GPU decode→encode
@@ -821,7 +902,8 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                                add_compat_audio=add_compat_audio,
                                original_audio=original_audio,
                                original_subs=original_subs)
-    cmd += ["-i", probe.path,
+    src = source_override if source_override is not None else probe.path
+    cmd += ["-i", src,
             "-map_metadata", "0", "-map_metadata:s", "-1",
             "-map_chapters", "0"]
 

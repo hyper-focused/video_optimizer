@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -735,7 +736,11 @@ def _plan_probe_gate(db: Database, pr,
     ).fetchone()[0]
     if stall_count >= 2:
         return "stalled"
-    if pr.dv_profile is not None:
+    if pr.dv_profile is not None and encoder.dv_strategy(pr.dv_profile) is None:
+        # Profile 5 (custom DV colorspace, no HDR10 base) and Profile 7
+        # without dovi_tool installed both fall here. Profile 8.x and
+        # Profile 7 with dovi_tool available are admitted; the apply
+        # layer routes them through the strip / convert prep pipeline.
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
@@ -755,7 +760,8 @@ _PLAN_SKIP_MESSAGES = (
     ("stalled",         "skipped {n} files with 2+ stall failures "
                         "(see `./video_optimizer.py replace-list` for the list)"),
     ("dv",              "skipped {n} Dolby Vision sources "
-                        "(av1_qsv stalls on DV; awaiting DV-aware encode path)"),
+                        "(Profile 5 has no HDR10 fallback; Profile 7 needs "
+                        "`dovi_tool` on PATH)"),
     ("reencoded",       "skipped {n} files already tagged REENCODE "
                         "(prior outputs of this tool; pass --allow-reencoded "
                         "to re-queue)"),
@@ -1038,20 +1044,114 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         db.mark_decision(dec["id"], "failed", error=str(e), run_id=run_id)
         return "failed", 0
 
-    cmd, desc = _build_apply_command(dec, pr, output_path, target_container,
-                                     enc_name, keep_langs, args)
+    return _apply_one_after_validation(
+        db, dec, pr, args, run_id,
+        output_path, target_container, enc_name, keep_langs, idx, total,
+    )
 
-    if args.dry_run:
-        print(f"    DRY RUN ({desc}) → {output_path}")
-        print("    " + " ".join(cmd))
-        # Stamp the apply run on the row so the post-run report finds it.
-        # Status stays 'pending' — re-running apply without --dry-run should
-        # still process the row.
-        db.stamp_decision_run(dec["id"], run_id)
-        return "dry_run", 0
 
-    label = f"[{idx}/{total}] {Path(pr.path).name}: "
-    return _execute_encode(db, dec, pr, cmd, desc, output_path, args, label)
+def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
+                                args: argparse.Namespace, run_id: int | None,
+                                output_path: Path, target_container: str,
+                                enc_name: str, keep_langs: list[str],
+                                idx: int, total: int) -> tuple[str, int]:
+    """Run DV prep (if needed), build the encode argv, dispatch, cleanup.
+
+    Split from `_apply_one` to keep the validation/gate front-half
+    focused and readable. The DV-prep work_dir lives next to the source
+    so the temp stream-copy stays on the same filesystem; try/finally
+    guarantees teardown even on encode failure.
+    """
+    dv_prep_dir: Path | None = None
+    source_for_encode: str | None = pr.path
+    try:
+        if pr.dv_profile is not None:
+            dv_prep_dir, source_for_encode = _prepare_dv_source(pr, args)
+            if source_for_encode is None:
+                # Strategy was None (P5 / P7-without-dovi_tool). Plan
+                # gate should have caught this; defensive belt-and-braces.
+                db.mark_decision(dec["id"], "skipped",
+                                 error="dv_no_prep_strategy", run_id=run_id)
+                return "skipped", 0
+
+        cmd, desc = _build_apply_command(
+            dec, pr, output_path, target_container,
+            enc_name, keep_langs, args,
+            source_override=source_for_encode,
+        )
+
+        if args.dry_run:
+            print(f"    DRY RUN ({desc}) → {output_path}")
+            print("    " + " ".join(cmd))
+            db.stamp_decision_run(dec["id"], run_id)
+            return "dry_run", 0
+
+        label = f"[{idx}/{total}] {Path(pr.path).name}: "
+        return _execute_encode(db, dec, pr, cmd, desc, output_path, args, label)
+    finally:
+        if dv_prep_dir is not None:
+            shutil.rmtree(dv_prep_dir, ignore_errors=True)
+
+
+def _prepare_dv_source(pr: ProbeResult,
+                       args: argparse.Namespace) -> tuple[Path | None, str | None]:
+    """Run the appropriate DV pre-stage; return (work_dir, prepared_path).
+
+    Profile 8.x: stream-copy with `dovi_rpu=strip` bsf. Single ffmpeg
+    subprocess, ~5-10 minutes on a 50 GB UHD remux (I/O-bound). Output
+    is a clean HDR10 MKV that the QSV pipeline accepts.
+
+    Profile 7: not yet implemented in code — returns (None, None) so
+    the caller skips the file. The plan-gate is supposed to catch this
+    case (admit only when `dovi_tool` is on PATH); the apply-side
+    handler is the next step. Documented in TODO.md.
+
+    Returns:
+      (work_dir, prepared_source_path) on success — caller `rmtree`s
+        work_dir in finally to clean up the temp stream-copy.
+      (None, None) on no-op or unimplemented strategy — caller treats
+        as "skip this source."
+
+    The work_dir lives next to the source on its own filesystem so the
+    ~50 GB temp file write doesn't traverse a slow NAS link or fill /tmp.
+    """
+    strategy = encoder.dv_strategy(pr.dv_profile)
+    if strategy is None:
+        return None, None
+
+    src = Path(pr.path)
+    work_dir = Path(tempfile.mkdtemp(
+        prefix=".vo_dv_prep_", dir=str(src.parent),
+    ))
+    prepared = work_dir / f"{src.stem}.dv-prepped.mkv"
+
+    if strategy == "p8_strip":
+        print(f"    DV Profile {pr.dv_profile}: stripping RPU "
+              f"(temp file: {prepared.name})")
+        cmd = encoder.build_dv_strip_command(pr, prepared)
+        timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
+        ok, err = encoder.run_ffmpeg(
+            cmd, pr.duration_seconds,
+            timeout_seconds=timeout, verbose=args.verbose,
+            label="    DV-strip ",
+        )
+        if not ok:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            print(f"    FAIL: DV strip failed: {err[:200]}")
+            return None, None
+        return work_dir, str(prepared)
+
+    if strategy == "p7_convert":
+        # P7 → P8 via dovi_tool, then strip + encode. Multi-stage; the
+        # implementation lands as a follow-up commit. For now, fall
+        # through to skip (caller marks as skipped).
+        shutil.rmtree(work_dir, ignore_errors=True)
+        print("    DV Profile 7 prep not yet implemented; skipping")
+        return None, None
+
+    # Unknown strategy string — defensive fallback.
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return None, None
 
 
 def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> None:
@@ -1102,8 +1202,18 @@ def _should_apply_denoise(pr: ProbeResult) -> bool:
 def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                          target_container: str, enc_name: str,
                          keep_langs: list[str],
-                         args: argparse.Namespace) -> tuple[list[str], str]:
-    """Pick remux vs encode and build the corresponding ffmpeg argv."""
+                         args: argparse.Namespace,
+                         *,
+                         source_override: str | None = None,
+                         ) -> tuple[list[str], str]:
+    """Pick remux vs encode and build the corresponding ffmpeg argv.
+
+    `source_override` swaps the `-i` source path while keeping all
+    probe-derived stream layout decisions intact. Used by the DV
+    strip pipeline (the prepared HDR10 stream-copy replaces the
+    original DV source for the encode stage; audio/subtitle indices
+    and metadata still come from the probe of the original).
+    """
     add_compat = getattr(args, "compat_audio", True)
     original_audio = bool(getattr(args, "original_audio", False))
     original_subs = bool(getattr(args, "original_subs", False))
@@ -1112,7 +1222,8 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                                           target_container, keep_langs,
                                           add_compat_audio=add_compat,
                                           original_audio=original_audio,
-                                          original_subs=original_subs)
+                                          original_subs=original_subs,
+                                          source_override=source_override)
         return cmd, "remux"
     denoise = _should_apply_denoise(pr)
     # No explicit hw_decode override: every code path that triggers
@@ -1126,6 +1237,7 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         denoise=denoise,
         original_audio=original_audio,
         original_subs=original_subs,
+        source_override=source_override,
     )
     desc = f"encode via {enc_name}"
     if denoise:
@@ -1134,6 +1246,8 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         desc += " (+ original audio passthrough)"
     if original_subs:
         desc += " (+ original subs passthrough)"
+    if source_override is not None:
+        desc += " (+ DV strip pre-pass)"
     return cmd, desc
 
 

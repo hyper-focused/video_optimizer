@@ -96,11 +96,17 @@ class PlanGateReencodeTests(unittest.TestCase):
     def test_gate_dv_takes_precedence_over_reencoded(self):
         """A DV-tagged file that also has REENCODE in the name should
         report 'dv' (the higher-priority skip), not 'reencoded'. Order
-        matters because the operator-facing remediation is different."""
+        matters because the operator-facing remediation is different.
+
+        Uses Profile 5 (always skipped — no clean HDR10 fallback exists)
+        rather than Profile 7 (environment-dependent: admitted when
+        dovi_tool is on PATH) so the test is deterministic regardless
+        of the host's dovi_tool install state.
+        """
         with Database(self.db_path) as db:
             self.assertEqual(
                 _plan_probe_gate(db,
-                                 _probe_for(self.reenc, dv_profile=7)),
+                                 _probe_for(self.reenc, dv_profile=5)),
                 "dv",
             )
 
