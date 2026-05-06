@@ -24,7 +24,7 @@ def _probe_for(path: Path, *, dv_profile: int | None = None) -> ProbeResult:
     return ProbeResult(
         path=str(path), size=path.stat().st_size, mtime=path.stat().st_mtime,
         duration_seconds=3600.0, container="matroska", format_name="matroska,webm",
-        video_codec="av1", width=3840, height=2160, frame_rate=23.976,
+        video_codec="hevc", width=3840, height=2160, frame_rate=23.976,
         pixel_format="yuv420p10le", bit_depth=10,
         video_bitrate=40_000_000,
         color_primaries="bt2020", color_transfer="smpte2084",

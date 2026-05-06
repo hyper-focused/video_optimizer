@@ -33,6 +33,13 @@ _LEGACY_CONTAINERS: frozenset[str] = frozenset({
 _MODERN_CODECS: frozenset[str] = frozenset({"h264", "hevc", "av1", "vp9"})
 
 
+# Codecs older or less efficient than AV1 that benefit from a transcode
+# whenever the source bitrate is at or above the AV1 target bitrate for
+# the file's resolution. h.264 is the dominant case — widely used, still
+# noticeably less efficient than AV1 at matched perceptual quality.
+_INEFFICIENT_CODECS: frozenset[str] = frozenset({"h264"})
+
+
 _MB = 1024.0 * 1024.0
 
 
@@ -142,6 +149,74 @@ class LegacyCodecRule(Rule):
 # --------------------------------------------------------------------------- #
 
 
+class InefficientCodecRule(Rule):
+    """Flag h.264 (and similar) at HD: always a transcode candidate.
+
+    AV1 is materially more efficient than h.264 at HD perceptual
+    quality. CQ-based encoding preserves quality even when the source
+    is heavily compressed (the worst case is an output similar in
+    size to the source — never a perceptual regression). So fire
+    unconditionally for h.264 in the HD band; SD is excluded upstream
+    by the plan-time gate, and UHD is handled by UhdNonAv1Rule which
+    catches a wider codec set.
+    """
+
+    name = "inefficient_codec"
+    advisory = False
+    _HD_MIN_HEIGHT = 720
+    _UHD_MIN_HEIGHT = 1440
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        """Fire when an inefficient codec is sitting in the HD band."""
+        codec = (probe.video_codec or "").lower()
+        if codec not in _INEFFICIENT_CODECS:
+            return _miss(self.name)
+        height = probe.height or 0
+        if height < self._HD_MIN_HEIGHT or height >= self._UHD_MIN_HEIGHT:
+            return _miss(self.name)
+        savings_mb = max((probe.size or 0) * 0.30 / _MB, 0.0)
+        return RuleVerdict(
+            rule=self.name,
+            fired=True,
+            reason=f"{codec} at HD; AV1 transcode (CQ-preserved quality)",
+            severity="medium",
+            projected_savings_mb=savings_mb,
+            notes={"codec": codec, "height": height},
+        )
+
+
+class UhdNonAv1Rule(Rule):
+    """At UHD, anything other than AV1 is a re-encode candidate.
+
+    The savings deltas at 4K are large (HEVC→AV1 typically ~20-30%);
+    AV1 is the explicit target for the UHD library. AV1 sources are
+    excluded upstream by the plan-time gate, so this rule only sees
+    HEVC, h.264, VP9, etc. at UHD and fires on all of them.
+    """
+
+    name = "uhd_non_av1"
+    advisory = False
+    _UHD_MIN_HEIGHT = 1440
+
+    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
+        """Fire for non-AV1 codecs at UHD frame heights."""
+        codec = (probe.video_codec or "").lower()
+        if codec == "av1":
+            return _miss(self.name)
+        height = probe.height or 0
+        if height < self._UHD_MIN_HEIGHT:
+            return _miss(self.name)
+        savings_mb = max((probe.size or 0) * 0.25 / _MB, 0.0)
+        return RuleVerdict(
+            rule=self.name,
+            fired=True,
+            reason=f"{codec} at UHD; AV1 target codec for this tier",
+            severity="high",
+            projected_savings_mb=savings_mb,
+            notes={"codec": codec, "height": height},
+        )
+
+
 class ContainerMigrationRule(Rule):
     """Flag files in legacy containers that should migrate to mp4/mkv."""
 
@@ -204,6 +279,8 @@ class HdrAdvisoryRule(Rule):
 RULES: dict[str, Rule] = {
     "over_bitrate":         OverBitratedRule(),
     "legacy_codec":         LegacyCodecRule(),
+    "inefficient_codec":    InefficientCodecRule(),
+    "uhd_non_av1":          UhdNonAv1Rule(),
     "container_migration":  ContainerMigrationRule(),
     "hdr_advisory":         HdrAdvisoryRule(),
 }

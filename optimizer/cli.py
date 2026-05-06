@@ -137,6 +137,15 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                          "skip them permanently. Use this when intentionally "
                          "re-running an already-encoded file (e.g. trying a "
                          "different CQ).")
+    pl.add_argument("--allow-av1", action="store_true",
+                    help="Re-queue AV1 sources. Default behavior is to skip "
+                         "AV1 entirely (it's already at the target codec; "
+                         "re-encoding is wasteful and quality-lossy).")
+    pl.add_argument("--allow-sd", action="store_true",
+                    help="Re-queue sub-720p (SD) sources. Default behavior "
+                         "is to skip them (the modern AV1 tier targets HD "
+                         "and UHD; SD content rarely benefits and may "
+                         "actually grow).")
     _add_common_db_arg(pl)
 
 
@@ -366,6 +375,10 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
                     default=MIN_PROBE_SIZE_BYTES,
                     help=argparse.SUPPRESS)
     op.add_argument("--db", type=Path, default=DEFAULT_DB_PATH,
+                    help=argparse.SUPPRESS)
+    op.add_argument("--allow-av1", action="store_true",
+                    help=argparse.SUPPRESS)
+    op.add_argument("--allow-sd", action="store_true",
                     help=argparse.SUPPRESS)
     op.add_argument("--bare-invocation", action="store_true", default=False,
                     help=argparse.SUPPRESS)
@@ -653,7 +666,9 @@ def _is_reencoded_filename(path: str) -> bool:
 
 
 def _plan_probe_gate(db: Database, pr,
-                     *, allow_reencoded: bool = False) -> str:
+                     *, allow_reencoded: bool = False,
+                     allow_av1: bool = False,
+                     allow_sd: bool = False) -> str:
     """Pre-rule filter for one probe.
 
     Returns one of:
@@ -665,6 +680,12 @@ def _plan_probe_gate(db: Database, pr,
       "reencoded"  — filename carries the REENCODE marker (output of a
                      prior run); skipped permanently unless caller passes
                      allow_reencoded=True (`plan --allow-reencoded`).
+      "av1_source" — source codec is AV1; re-encoding is wasteful by
+                     default. Caller can pass allow_av1=True to override
+                     (`plan --allow-av1`).
+      "sd_source"  — height < 720; SD content is skipped by default.
+                     Caller can pass allow_sd=True to override
+                     (`plan --allow-sd`).
       "ok"         — admit to rule evaluation.
     """
     if not Path(pr.path).exists():
@@ -684,7 +705,37 @@ def _plan_probe_gate(db: Database, pr,
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
+    if not allow_av1 and (pr.video_codec or "").lower() == "av1":
+        return "av1_source"
+    if not allow_sd and (pr.height or 0) < 720:
+        return "sd_source"
     return "ok"
+
+
+_PLAN_SKIP_MESSAGES = (
+    ("missing",    "pruned {n} stale cache rows (source moved or deleted)"),
+    ("stalled",    "skipped {n} files with 2+ stall failures "
+                   "(see `./video_optimizer.py replace-list` for the list)"),
+    ("dv",         "skipped {n} Dolby Vision sources "
+                   "(av1_qsv stalls on DV; awaiting DV-aware encode path)"),
+    ("reencoded",  "skipped {n} files already tagged REENCODE "
+                   "(prior outputs of this tool; pass --allow-reencoded "
+                   "to re-queue)"),
+    ("av1_source", "skipped {n} AV1 sources "
+                   "(already at the target codec; pass --allow-av1 "
+                   "to re-encode anyway)"),
+    ("sd_source",  "skipped {n} sub-720p sources "
+                   "(SD content is excluded by default; pass --allow-sd "
+                   "to include them)"),
+)
+
+
+def _emit_plan_skip_summary(counts: dict) -> None:
+    """Print one summary line per non-zero plan-gate skip bucket."""
+    for key, template in _PLAN_SKIP_MESSAGES:
+        n = counts.get(key, 0)
+        if n:
+            print(template.format(n=n))
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -697,15 +748,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
         return 2
 
     allow_reencoded = bool(getattr(args, "allow_reencoded", False))
+    allow_av1 = bool(getattr(args, "allow_av1", False))
+    allow_sd = bool(getattr(args, "allow_sd", False))
     with Database(args.db) as db:
         run_id = db.start_run("plan", None, _args_dict(args))
         cleared = db.clear_pending_decisions()
         candidates = []
-        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0}
+        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
+                  "av1_source": 0, "sd_source": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
-            verdict = _plan_probe_gate(db, pr, allow_reencoded=allow_reencoded)
+            verdict = _plan_probe_gate(
+                db, pr, allow_reencoded=allow_reencoded,
+                allow_av1=allow_av1, allow_sd=allow_sd)
             if verdict != "ok":
                 counts[verdict] += 1
                 continue
@@ -720,23 +776,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 run_id=run_id,
             )
             candidates.append(cand)
-        pruned = counts["missing"]
-        stall_blocked = counts["stalled"]
-        dv_blocked = counts["dv"]
-        reencoded_blocked = counts["reencoded"]
-        if pruned:
+        if counts["missing"]:
             db.conn.commit()
-            print(f"pruned {pruned} stale cache rows (source moved or deleted)")
-        if stall_blocked:
-            print(f"skipped {stall_blocked} files with 2+ stall failures "
-                  f"(see `./video_optimizer.py replace-list` for the list)")
-        if dv_blocked:
-            print(f"skipped {dv_blocked} Dolby Vision sources "
-                  f"(av1_qsv stalls on DV; awaiting DV-aware encode path)")
-        if reencoded_blocked:
-            print(f"skipped {reencoded_blocked} files already tagged "
-                  f"REENCODE (prior outputs of this tool; pass "
-                  f"--allow-reencoded to re-queue)")
+        _emit_plan_skip_summary(counts)
 
         candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
 
@@ -747,10 +789,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
         summary = {"cleared_pending": cleared,
                    "candidates": len(candidates),
-                   "pruned_stale_rows": pruned,
-                   "stall_blocked": stall_blocked,
-                   "dv_blocked": dv_blocked,
-                   "reencoded_blocked": reencoded_blocked}
+                   "pruned_stale_rows": counts["missing"],
+                   "stall_blocked": counts["stalled"],
+                   "dv_blocked": counts["dv"],
+                   "reencoded_blocked": counts["reencoded"],
+                   "av1_blocked": counts["av1_source"],
+                   "sd_blocked": counts["sd_source"]}
         db.end_run(run_id, summary)
     return 0
 
@@ -1394,6 +1438,8 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         cmd="plan", rules=None, target="av1+mkv", json=False,
         keep_langs=args.keep_langs or "en,und",
         allow_reencoded=False,
+        allow_av1=getattr(args, "allow_av1", False),
+        allow_sd=getattr(args, "allow_sd", False),
         db=args.db,
     )
     rc = cmd_plan(plan_ns)
@@ -2195,7 +2241,9 @@ def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
     print("==> plan: evaluating rules")
     plan_ns = argparse.Namespace(
         cmd="plan", rules=None, target="av1+mkv", json=False,
-        keep_langs="en,und", allow_reencoded=False, db=args.db,
+        keep_langs="en,und", allow_reencoded=False,
+        allow_av1=False, allow_sd=False,
+        db=args.db,
     )
     if cmd_plan(plan_ns) != 0:
         print("plan failed; aborting", file=sys.stderr)
