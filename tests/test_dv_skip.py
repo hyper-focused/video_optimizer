@@ -119,6 +119,108 @@ class DvStripCommandShapeTests(unittest.TestCase):
         self.assertFalse(any(c.startswith("-discard") for c in cmd),
                          "no keep_langs → no demuxer discards expected")
 
+    def test_original_audio_keeps_every_audio_track(self):
+        """`--original-audio` must round-trip through the strip stage:
+        the user asked for every audio track preserved, so the strip
+        must NOT pre-discard any audio streams (even though the encode's
+        kept-set logic would otherwise drop alternate-language tracks).
+        Pinned because the strip pre-discard optimization could
+        accidentally drop the streams the user explicitly opted to keep."""
+        from optimizer.encoder import build_dv_strip_command
+        from optimizer.models import AudioTrack
+        from tests._fixtures import make_probe
+
+        def at(i: int, lang: str) -> AudioTrack:
+            return AudioTrack(
+                index=i, codec="ac3", language=lang, channels=6,
+                channel_layout="5.1", bitrate=640_000,
+                default=(i == 0), title=None,
+            )
+
+        pr = make_probe(height=2160, dv_profile=7)
+        pr.path = "/movies/x.mkv"
+        # Multilingual remux: 5 audio tracks (eng, jpn, fre, ger, spa).
+        pr.audio_tracks = [
+            at(0, "eng"), at(1, "jpn"), at(2, "fre"),
+            at(3, "ger"), at(4, "spa"),
+        ]
+        # Without original_audio, only `eng` is kept — the strip would
+        # discard the other 4. With original_audio=True, none should
+        # be discarded.
+        cmd = build_dv_strip_command(
+            pr, Path("/o.mkv"),
+            keep_langs=["en", "und"], target_container="mkv",
+            original_audio=True,
+        )
+        audio_discards = [t for t in cmd if t.startswith("-discard:a:")]
+        self.assertEqual(audio_discards, [],
+                         "--original-audio must suppress audio discards "
+                         "in the strip stage; got: " + repr(audio_discards))
+        # Sanity: the bsf is still applied (the DV strip itself didn't
+        # get disabled by --original-audio).
+        self.assertIn("-bsf:v:0", cmd)
+
+    def test_original_subs_keeps_every_subtitle_track(self):
+        """Same contract for `--original-subs`: the strip stage must
+        not pre-discard subtitle streams when the user asked to keep
+        every one."""
+        from optimizer.encoder import build_dv_strip_command
+        from optimizer.models import SubtitleTrack
+        from tests._fixtures import make_probe
+
+        def st(i: int, lang: str) -> SubtitleTrack:
+            return SubtitleTrack(
+                index=i, codec="subrip", language=lang,
+                forced=False, default=(i == 0), title=None,
+            )
+
+        pr = make_probe(height=2160, dv_profile=7)
+        pr.path = "/movies/x.mkv"
+        pr.subtitle_tracks = [
+            st(0, "eng"), st(1, "jpn"), st(2, "fre"), st(3, "ger"),
+        ]
+        cmd = build_dv_strip_command(
+            pr, Path("/o.mkv"),
+            keep_langs=["en", "und"], target_container="mkv",
+            original_subs=True,
+        )
+        sub_discards = [t for t in cmd if t.startswith("-discard:s:")]
+        self.assertEqual(sub_discards, [],
+                         "--original-subs must suppress sub discards "
+                         "in the strip stage; got: " + repr(sub_discards))
+
+    def test_original_audio_and_subs_both_pass_through(self):
+        """Combined: both flags simultaneously. Strip must keep every
+        audio + every subtitle, while still applying the RPU strip."""
+        from optimizer.encoder import build_dv_strip_command
+        from optimizer.models import AudioTrack, SubtitleTrack
+        from tests._fixtures import make_probe
+
+        pr = make_probe(height=2160, dv_profile=7)
+        pr.path = "/movies/x.mkv"
+        pr.audio_tracks = [
+            AudioTrack(index=0, codec="truehd", language="eng", channels=8,
+                       channel_layout="7.1", bitrate=5_000_000,
+                       default=True, title=None),
+            AudioTrack(index=1, codec="ac3", language="jpn", channels=6,
+                       channel_layout="5.1", bitrate=640_000,
+                       default=False, title=None),
+        ]
+        pr.subtitle_tracks = [
+            SubtitleTrack(index=0, codec="subrip", language="eng",
+                          forced=False, default=True, title=None),
+            SubtitleTrack(index=1, codec="subrip", language="jpn",
+                          forced=False, default=False, title=None),
+        ]
+        cmd = build_dv_strip_command(
+            pr, Path("/o.mkv"),
+            keep_langs=["en", "und"], target_container="mkv",
+            original_audio=True, original_subs=True,
+        )
+        self.assertFalse(any(c.startswith("-discard") for c in cmd),
+                         "no discards expected when both original-* flags set")
+        self.assertIn("-bsf:v:0", cmd)
+
     def test_keep_langs_drops_unwanted_audio_at_demuxer(self):
         """The whole point of the optimization: with keep_langs set,
         the strip demuxer drops unwanted audio so they're never read
@@ -160,6 +262,74 @@ class DvStripCommandShapeTests(unittest.TestCase):
             self.assertIn(f"-discard:a:{ac3_idx}", discard_keys)
         # Primary audio (and the dts 5.1 fallback) must NOT be discarded.
         self.assertNotIn("-discard:a:0", discard_keys)
+
+
+class PrepareDvSourceForwardsOriginalAudioTests(unittest.TestCase):
+    """End-to-end: `args.original_audio=True` must flow from the apply
+    layer through `_prepare_dv_source` into the strip command, so the
+    strip doesn't silently drop tracks the user explicitly opted to
+    keep. Pinned because the strip pre-discard optimization (commit
+    5e17efa) added a path where the strip *can* drop audio, and a
+    future refactor that forgets to forward the flag would silently
+    break `--original-audio` for DV sources."""
+
+    def test_args_original_audio_suppresses_strip_discards(self):
+        import argparse
+        import tempfile
+        from unittest.mock import patch
+
+        from optimizer import cli as cli_mod
+        from optimizer.models import AudioTrack
+        from tests._fixtures import make_probe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src.mkv"
+            source.write_bytes(b"x" * 1024)
+
+            pr = make_probe(height=2160, dv_profile=8)
+            pr.path = str(source)
+            pr.audio_tracks = [
+                AudioTrack(index=i, codec="ac3", language=lang, channels=6,
+                           channel_layout="5.1", bitrate=640_000,
+                           default=(i == 0), title=None)
+                for i, lang in enumerate(["eng", "jpn", "fre", "ger"])
+            ]
+
+            args = argparse.Namespace(
+                original_audio=True,
+                original_subs=False,
+                compat_audio=True,
+                verbose=False,
+                timeout=0,
+                dv_p7_convert=False,
+            )
+
+            captured: list[list[str]] = []
+
+            def fake_run(cmd, _pr, _args, label=""):  # noqa: ARG001
+                captured.append(cmd)
+                # Pretend the strip succeeded so _prepare_dv_source
+                # returns (work_dir, prepared, None).
+                Path(cmd[cmd.index("-progress") - 1]).touch()
+                return True, ""
+
+            with patch.object(cli_mod, "_run_encode_ffmpeg",
+                              side_effect=fake_run):
+                _, prepared, err = cli_mod._prepare_dv_source(
+                    pr, args,
+                    keep_langs=["en", "und"], target_container="mkv",
+                )
+
+            self.assertIsNone(err)
+            self.assertIsNotNone(prepared)
+            self.assertEqual(len(captured), 1, "strip should run once")
+            cmd = captured[0]
+            audio_discards = [t for t in cmd if t.startswith("-discard:a:")]
+            self.assertEqual(
+                audio_discards, [],
+                "args.original_audio=True must suppress strip-stage audio "
+                "discards end-to-end; got: " + repr(audio_discards),
+            )
 
 
 class DvStrategyDefaultsTests(unittest.TestCase):

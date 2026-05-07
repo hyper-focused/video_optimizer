@@ -34,8 +34,15 @@ three things to the table that a hand-rolled `for f in *.mkv; do ffmpeg
   re-encoding (legacy codecs like MPEG-2/VC-1, h.264 at HD, anything
   non-AV1 at UHD/SD, files in legacy containers like AVI). It also skips
   things that don't need work: AV1 sources, prior outputs of this tool,
-  Plex-style trailers/extras, and Dolby Vision sources that the planned
-  RPU-strip path can't reach (see "Dolby Vision" below).
+  Plex-style trailers/extras, and Dolby Vision Profile 5 (no HDR10
+  fallback). Profile 7 and 8 are admitted and have their RPU stripped
+  in a pre-pass before the encode (see "Dolby Vision" below).
+- **Adaptive bitrate fallback.** If a UHD encode's mid-encode size
+  projection at the 10% / 20% checkpoints — or its final output —
+  comes out near or above the source size, the encode is killed and
+  retried once at CQ 21. Catches grain-dominated 4K remasters
+  (Princess Bride, Tron, etc.) where the default CQ over-allocates
+  bits. Silent on healthy encodes; opt out with `--no-auto-relax-cq`.
 - **Library-scale defaults.** Audio collapses to a deterministic 3-stream
   ladder (best lossless passthrough + Opus 5.1 + AAC 2.0). Subtitles
   filter to `--keep-langs` (default `en,und`). Originals are preserved by
@@ -55,15 +62,15 @@ dependencies on `PATH`:
 
 - **`ffmpeg` 7.0+ and `ffprobe`** — required. Older ffmpeg lacks the
   `dovi_rpu` bitstream filter the DV strip pipeline relies on.
-- **`dovi_tool` and `mkvmerge` (mkvtoolnix-cli)** — required *together*
-  for Dolby Vision Profile 7 sources (some UHD Blu-rays). dovi_tool
-  flattens P7 → P8.1 by discarding the enhancement layer; mkvmerge
-  muxes the resulting raw HEVC back with the original audio/subs
-  (ffmpeg's matroska muxer can't handle raw HEVC + B-frame content
-  cleanly, so we shell out to mkvmerge for that step). Profile 8.x
-  sources work without either — only ffmpeg's built-in bsf is needed.
-  If you have no Profile 7 content in your library you can skip both
-  installs; those sources stay on the DV skip-list.
+- **`dovi_tool` and `mkvmerge` (mkvtoolnix-cli)** — *optional*. The
+  default DV path uses ffmpeg's built-in `dovi_rpu=strip=true` bsf
+  for both Profile 7 and Profile 8 sources, which doesn't need either
+  external tool. They're only required when you opt into
+  `--dv-p7-convert` — a more aggressive Profile 7 → Profile 8.1
+  conversion path (`dovi_tool convert --discard` + `mkvmerge` re-mux)
+  for stubborn P7 sources where the strip-only path fails. If your
+  library doesn't trip that case (most won't), you can skip both
+  installs.
 
 ### Debian / Ubuntu
 
@@ -79,8 +86,9 @@ recent kernel and `intel-media-va-driver-non-free` (Debian) /
 `intel-media-va-driver` (Ubuntu). Battlemage specifically needs kernel
 6.13+ (Xe driver) and Mesa 25+.
 
-For Dolby Vision Profile 7 support (optional but on-by-default when
-present), install both `dovi_tool` and `mkvtoolnix`:
+For the optional `--dv-p7-convert` path (only needed if a specific
+Profile 7 source fails the default strip-only path), install both
+`dovi_tool` and `mkvtoolnix`:
 
 ```bash
 # mkvmerge — apt has it
@@ -106,8 +114,8 @@ cd ~/video_optimizer
 (Fedora's stock `ffmpeg-free` is built without non-free codecs; RPM
 Fusion's full `ffmpeg` is what you want for a transcode workflow.)
 
-For Dolby Vision Profile 7: `sudo dnf install mkvtoolnix` and
-`cargo install dovi_tool` (no sudo for the latter).
+For the optional `--dv-p7-convert` path: `sudo dnf install mkvtoolnix`
+and `cargo install dovi_tool` (no sudo for the latter).
 
 ### Arch Linux
 
@@ -118,7 +126,7 @@ cd ~/video_optimizer
 ./video_optimizer.py doctor
 ```
 
-For Dolby Vision Profile 7 support: `sudo pacman -S mkvtoolnix-cli`
+For the optional `--dv-p7-convert` path: `sudo pacman -S mkvtoolnix-cli`
 plus `dovi_tool` from AUR (`yay -S dovi-tool-bin`) or
 `cargo install dovi_tool`.
 
@@ -237,8 +245,8 @@ get a dry-run listing.
 ```
 
 With no arguments and stdin attached to a terminal, drops into a wizard
-that prompts for path, output mode, and tier scope, then runs the full
-pipeline.
+that prompts for path, output mode, and tier scope (All / UHD / UHD-CQ21
+/ HD / SD), then runs the full pipeline.
 
 ### Resume / inspect
 
@@ -275,7 +283,15 @@ summarized here.
 | `--limit N` | Process at most N candidates (0 = no limit) |
 | `--confirm` | Prompt per-file before encoding (default is auto-yes) |
 | `--cleanup-after` | Prompt to remove originals after a successful run |
+| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 95% of source size is retried once at CQ 21) |
 | `--verbose` / `-v` | More chatter (timeout labels, preset tunings, etc.) |
+
+### Dolby Vision
+
+| Flag | Effect |
+|---|---|
+| _(none)_ | **Default**: ffmpeg-bsf RPU strip on Profile 7 and Profile 8 sources; Profile 5 is skipped |
+| `--dv-p7-convert` | For Profile 7: opt into the dovi_tool convert + mkvmerge re-mux pipeline before encode (slower, requires both external tools on PATH; reach for it only when strip-only fails) |
 
 ### Audio / subtitle overrides
 
@@ -295,15 +311,14 @@ from `--help` for tidiness, but functional.
 | `--allow-av1` | AV1-source files (default: skipped because re-encoding AV1 is wasteful) |
 | `--allow-extras` | Plex-style trailer/extras directories and `-trailer` / `-bts` / etc. filenames |
 
-### Tuning overrides (advanced)
+### Tuning overrides (advanced; hidden from `--help` for tidiness, but functional)
 
 | Flag | Effect |
 |---|---|
-| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24; lower = better quality, larger file) |
+| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24, UHD-CQ21 21; lower = better quality, larger file) |
 | `--keep-langs en,und` | Comma-separated language codes to retain (default `en,und`) |
 | `--hwaccel {auto,qsv,nvenc,vaapi,videotoolbox,software,none}` | Force a specific hw backend (default auto) |
 | `--hw-decode` / `--no-hw-decode` | Override the preset's hw-decode default |
-| `--workers N` | Parallel ffprobe workers during scan (default `min(8, cpu_count)`) |
 | `--min-size BYTES` | Skip files below this size at scan time (default 100 MB; accepts `100M`, `1G`, etc.) |
 | `--db PATH` | SQLite state file (default `~/.video_optimizer/state.db`) |
 | `--timeout SEC` | Per-file ffmpeg wall-clock cap (default `max(3600, 6 × duration)`; `0` disables) |
