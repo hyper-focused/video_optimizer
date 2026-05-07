@@ -38,12 +38,15 @@ three things to the table that a hand-rolled `for f in *.mkv; do ffmpeg
   fallback). Profile 7 and 8 are admitted and have their RPU stripped
   in a pre-pass before the encode (see "Dolby Vision" below).
 - **Adaptive bitrate fallback.** If a UHD encode's mid-encode size
-  projection at the 10% / 20% checkpoints — or its final output —
-  comes out near or above the source size, the encode is killed and
-  retried once at the relaxed tuning (CQ 21 + encoder preset
-  `slow` instead of `veryslow`). Catches grain-dominated 4K
-  remasters (Princess Bride, Tron, etc.) where the default CQ
-  over-allocates bits, and finishes the retry ~1.5–2× faster than
+  projection at the 10% / 20% / 30% / 50% checkpoints — or its
+  final output — comes out near or above the size of the file
+  ffmpeg is reading, the encode is killed and retried once at the
+  relaxed tuning (CQ 21 + encoder preset `slow` instead of
+  `veryslow`). Catches grain-dominated 4K remasters (Princess
+  Bride, Tron, The Godfather, etc.) where the default CQ
+  over-allocates bits — including cases where the grain density
+  compounds in the second half of the film and the early
+  checkpoints look clean. Finishes the retry ~1.5–2× faster than
   re-running at `veryslow` would. Silent on healthy encodes; opt
   out with `--no-auto-relax-cq`.
 - **Library-scale defaults.** Audio collapses to a deterministic 3-stream

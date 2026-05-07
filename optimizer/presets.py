@@ -231,11 +231,21 @@ RELAXED_UHD_ENCODER_PRESET: str = "slow"
 # `out_size / completion_ratio`. If the projection trips
 # `BLOAT_RATIO_THRESHOLD` at any checkpoint, ffmpeg is killed early and
 # the apply layer retries at `RELAXED_UHD_CQ` (same path as the
-# post-encode check). Two checkpoints catch grain-dominated bloat
-# within the first 10–20% of wall-clock instead of after a full hour
-# on UHD; a clean encode that has a high-bitrate intro will normalise
-# below the threshold by 20% and run to completion.
-BLOAT_CHECKPOINTS: tuple[float, ...] = (0.10, 0.20)
+# post-encode check).
+#
+# Four checkpoints (was two): 10% and 20% catch the obvious case where
+# the encoder struggles from frame 0 (grain-dominated content
+# throughout, e.g. Princess Bride). 30% and 50% catch a class the
+# earlier checkpoints miss — sources where the grain density compounds
+# later in the film. Empirically (TGF 1972, observed in run #168):
+# fps stays near baseline (~57 fps for 2160p av1_qsv) through the
+# first 25-30% of the encode, drops noticeably by 30% as the encoder
+# hits denser grain in the dim interior scenes, and is clearly
+# struggling by 50% (fps dropped to ~42 from ~57). Adding 50%
+# specifically saves an additional ~50 minutes of wasted GPU time on
+# the late-bloating cases vs only sampling at 10/20%. Each checkpoint
+# is consumed once per encode; a healthy file passes through silently.
+BLOAT_CHECKPOINTS: tuple[float, ...] = (0.10, 0.20, 0.30, 0.50)
 
 
 # --------------------------------------------------------------------------- #
