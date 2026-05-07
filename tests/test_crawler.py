@@ -32,6 +32,16 @@ class SkipListTests(unittest.TestCase):
     def test_qnap_recycle_dir_skipped(self):
         self.assertTrue(_is_skipped_dir(Path("/Movies/@Recycle")))
 
+    def test_qnap_hidden_recycle_dir_skipped(self):
+        # Newer QNAP firmware uses the dot-prefixed hidden form by
+        # default. Found in the field after partial AV1 outputs and
+        # orphan dv-prepped temp files moved to .@Recycle were getting
+        # re-scanned and re-queued for transcoding.
+        self.assertTrue(_is_skipped_dir(Path("/Movies/.@Recycle")))
+
+    def test_qnap_hidden_recently_snapshot_skipped(self):
+        self.assertTrue(_is_skipped_dir(Path("/Movies/.@Recently-Snapshot")))
+
     def test_synology_recycle_dir_skipped(self):
         self.assertTrue(_is_skipped_dir(Path("/share/#recycle")))
 
@@ -44,7 +54,9 @@ class SkipListTests(unittest.TestCase):
 
     def test_skip_list_membership(self):
         """Sanity-check the well-known names are present."""
-        for name in (".@__thumb", "@Recycle", "@Recently-Snapshot",
+        for name in (".@__thumb",
+                     "@Recycle", ".@Recycle",
+                     "@Recently-Snapshot", ".@Recently-Snapshot",
                      "#recycle", ".AppleDouble"):
             self.assertIn(name, _SKIP_DIRS)
 

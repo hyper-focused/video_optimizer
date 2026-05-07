@@ -23,8 +23,10 @@ SUPPORTED_EXTENSIONS = frozenset({
 # duplicates we don't want to re-process.
 _SKIP_DIRS = frozenset({
     ".@__thumb",          # Synology DSM thumbnail cache
-    "@Recycle",           # QNAP recycle bin
-    "@Recently-Snapshot", # QNAP snapshot directory
+    "@Recycle",           # QNAP recycle bin (visible)
+    ".@Recycle",          # QNAP recycle bin (hidden — newer firmware default)
+    "@Recently-Snapshot", # QNAP snapshot directory (visible)
+    ".@Recently-Snapshot", # QNAP snapshot directory (hidden)
     "#recycle",           # Synology recycle bin
     ".AppleDouble",       # Mac SMB metadata
     "__pycache__", ".git", ".svn",  # tooling hygiene
