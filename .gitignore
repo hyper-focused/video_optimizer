@@ -36,3 +36,7 @@ clear.py
 cleanup.py
 fix_*.py
 audit_*.py
+
+# ffmpeg arg-parsing artifact: bare 'dovi_rpu=strip=true' on a CLI
+# without -bsf:v: gets created as an output file. Belt-and-braces.
+dovi_rpu=strip=true
