@@ -1149,9 +1149,20 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
 
     dv_prep_dir: Path | None = None
     source_for_encode: str | None = pr.path
+    # encode_probe is what `_build_apply_command` reasons over for
+    # stream layout. For non-DV sources this is just `pr`; for DV
+    # sources where the strip pre-trims unwanted audio/sub streams,
+    # the strip output's stream layout differs from the source's
+    # (matroska renumbers the kept streams contiguously), so we
+    # re-probe the stripped file and use the new probe.
+    encode_probe: ProbeResult = pr
     try:
         if pr.dv_profile is not None:
-            dv_prep_dir, source_for_encode, dv_err = _prepare_dv_source(pr, args)
+            dv_prep_dir, source_for_encode, dv_err = _prepare_dv_source(
+                pr, args,
+                keep_langs=keep_langs,
+                target_container=target_container,
+            )
             if source_for_encode is None:
                 # Two distinct cases — must be reported differently:
                 #   dv_err is None  → no strategy applies (P5, or P7
@@ -1177,9 +1188,16 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                     expected_path=pr.path,
                 )
                 return "failed", 0
+            # Re-probe the stripped file: streams have been pre-trimmed
+            # to the kept set and the muxer renumbered them. The encode
+            # logic must operate on those new indices, not the source's.
+            # Preserve dv_profile=None on the re-probe (the strip's job
+            # was to remove DV) so the apply layer doesn't try to
+            # re-prep an already-stripped temp file.
+            encode_probe = probe.probe_file(Path(source_for_encode))
 
         cmd, desc = _build_apply_command(
-            dec, pr, output_path, target_container,
+            dec, encode_probe, output_path, target_container,
             enc_name, keep_langs, args,
             source_override=source_for_encode,
         )
@@ -1200,7 +1218,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         args.quality = RELAXED_UHD_CQ
         try:
             retry_cmd, retry_desc = _build_apply_command(
-                dec, pr, output_path, target_container,
+                dec, encode_probe, output_path, target_container,
                 enc_name, keep_langs, args,
                 source_override=source_for_encode,
             )
@@ -1218,8 +1236,20 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
 def _prepare_dv_source(
     pr: ProbeResult,
     args: argparse.Namespace,
+    *,
+    keep_langs: list[str] | None = None,
+    target_container: str = "mkv",
 ) -> tuple[Path | None, str | None, str | None]:
     """Run the appropriate DV pre-stage; return (work_dir, prepared_path, error).
+
+    `keep_langs` + `target_container` are forwarded to the strip
+    command so the demuxer can drop audio/sub streams the encode
+    wouldn't keep anyway, *during* the strip rather than after — for
+    multi-track sources (e.g. Saving Private Ryan: 9 audio + 50 subs)
+    this saves the equivalent NAS write+read of the discarded streams.
+    Caller should re-probe the prepared file because the matroska
+    muxer renumbers the kept streams from 0 and the new indices won't
+    match the original probe's.
 
     Three-tuple disambiguates two distinct "couldn't produce a prepared
     source" cases that the caller needs to handle differently:
@@ -1256,7 +1286,14 @@ def _prepare_dv_source(
     if strategy == "p8_strip":
         print(f"    DV Profile {pr.dv_profile}: stripping RPU "
               f"(temp file: {prepared.name})")
-        cmd = encoder.build_dv_strip_command(pr, prepared)
+        cmd = encoder.build_dv_strip_command(
+            pr, prepared,
+            keep_langs=keep_langs,
+            target_container=target_container,
+            add_compat_audio=getattr(args, "compat_audio", True),
+            original_audio=getattr(args, "original_audio", False),
+            original_subs=getattr(args, "original_subs", False),
+        )
         ok, err = _run_encode_ffmpeg(cmd, pr, args, label="    DV-strip ")
         if not ok:
             shutil.rmtree(work_dir, ignore_errors=True)

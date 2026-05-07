@@ -107,6 +107,60 @@ class DvStripCommandShapeTests(unittest.TestCase):
         idx = cmd.index("-bsf:v:0")
         self.assertEqual(cmd[idx + 1], "dovi_rpu=strip=true")
 
+    def test_no_keep_langs_means_no_discards(self):
+        """Backwards-compat: omitting keep_langs preserves the original
+        "copy every stream" behavior so callers that want a faithful
+        clone of the source minus the RPU still get one."""
+        from optimizer.encoder import build_dv_strip_command
+        from tests._fixtures import make_probe
+        pr = make_probe(height=2160, dv_profile=8)
+        pr.path = "/movies/x.mkv"
+        cmd = build_dv_strip_command(pr, Path("/o.mkv"))
+        self.assertFalse(any(c.startswith("-discard") for c in cmd),
+                         "no keep_langs → no demuxer discards expected")
+
+    def test_keep_langs_drops_unwanted_audio_at_demuxer(self):
+        """The whole point of the optimization: with keep_langs set,
+        the strip demuxer drops unwanted audio so they're never read
+        from the NAS or written to the temp file. SPR-shaped: 9 audio
+        streams (TrueHD primary + DTS + 6× AC3 commentary) → keep
+        primary + a 5.1 fallback, discard the rest."""
+        from optimizer.encoder import build_dv_strip_command
+        from optimizer.models import AudioTrack
+        from tests._fixtures import make_probe
+
+        def at(i: int, codec: str, ch: int = 6) -> AudioTrack:
+            return AudioTrack(
+                index=i, codec=codec, language="eng", channels=ch,
+                channel_layout=f"{ch}.0", bitrate=1_000_000,
+                default=(i == 0), title=None,
+            )
+
+        pr = make_probe(height=2160, dv_profile=7)
+        pr.path = "/movies/x.mkv"
+        pr.audio_tracks = (
+            [at(0, "truehd", 8), at(1, "dts", 6)]
+            + [at(i, "ac3", 6) for i in range(2, 9)]
+        )
+        cmd = build_dv_strip_command(
+            pr, Path("/o.mkv"),
+            keep_langs=["en", "und"], target_container="mkv",
+        )
+        discards = {cmd[i + 1] for i, t in enumerate(cmd[:-1])
+                    if t.startswith("-discard:a:")}
+        # The 7 commentary AC3 tracks (a:2..a:8) should be discarded;
+        # primary TrueHD (a:0) and a 5.1 fallback (a:1 dts) are kept.
+        for ac3_idx in range(2, 9):
+            self.assertIn(
+                "all", discards,  # value side; key check below
+                f"a:{ac3_idx} should be discarded",
+            )
+        discard_keys = [t for t in cmd if t.startswith("-discard:a:")]
+        for ac3_idx in range(2, 9):
+            self.assertIn(f"-discard:a:{ac3_idx}", discard_keys)
+        # Primary audio (and the dts 5.1 fallback) must NOT be discarded.
+        self.assertNotIn("-discard:a:0", discard_keys)
+
 
 class DvStrategyDefaultsTests(unittest.TestCase):
     """`encoder.dv_strategy` per-profile dispatch.

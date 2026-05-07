@@ -240,14 +240,22 @@ def dv_strategy(dv_profile: int | None, *,
     return None
 
 
-def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]:
+def build_dv_strip_command(
+    probe: ProbeResult, prepared_path: Path,
+    *, keep_langs: list[str] | None = None,
+    target_container: str = "mkv",
+    add_compat_audio: bool = True,
+    original_audio: bool = False,
+    original_subs: bool = False,
+) -> list[str]:
     """Return ffmpeg argv that produces `prepared_path` from `probe.path`.
 
-    Stream-copies every track, applying the `dovi_rpu=strip` bitstream
-    filter on the *primary* video track (`v:0`) to remove DV RPU SEI
-    messages. Output is a clean HDR10 MKV that the QSV pipeline accepts
-    without wedging. Use for Profile 8.x sources; Profile 7 needs
-    `dovi_tool` first (see `build_dv_p7_extract_command` +
+    Applies the `dovi_rpu=strip` bitstream filter on the *primary*
+    video track (`v:0`) to remove DV RPU SEI messages, AND drops
+    audio/subtitle streams the eventual encode wouldn't keep anyway.
+    Output is a clean HDR10 MKV that the QSV pipeline accepts without
+    wedging. Use for Profile 8.x sources; Profile 7 needs `dovi_tool`
+    first (see `build_dv_p7_extract_command` +
     `build_dv_p7_remux_command`).
 
     Stream specifier `v:0` (not bare `v`) is load-bearing: many remuxes
@@ -255,12 +263,34 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
     (e.g. The Housemaid 2025 has a 600x900 mjpeg attached pic). The
     bsf only supports hevc and av1; applying it to the mjpeg attached
     pic crashes ffmpeg with `Error initializing bitstream filter:
-    dovi_rpu`. `v:0` scopes the bsf to the real video track only;
-    every other stream is mapped via `-map 0` and stream-copied
-    untouched (including the cover art).
+    dovi_rpu`. `v:0` scopes the bsf to the real video track only.
+
+    Pre-discard rationale: a Saving Private Ryan-shaped source has
+    9 audio streams (TrueHD primary + DTS + 6 AC3 commentary) and
+    50+ subtitle streams. The eventual encode keeps one primary audio
+    and a handful of language-matched subs; the rest are demuxer-side
+    discarded. Doing that discard at strip time means the strip's
+    write of the temp file (and the encode's read of it) skip the
+    audio/subs the encode would have dropped anyway — for an SPR-class
+    source that's ~25-30 GB less NAS write + 25-30 GB less NAS read.
+
+    `keep_langs=None` falls back to the historical "copy every stream"
+    behavior, kept for callers that want a faithful clone of the
+    source minus the RPU.
     """
-    return [
-        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+    cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    if keep_langs is not None:
+        # Same demuxer-side discards the encode uses. Output mux
+        # renumbers streams contiguously from 0; callers that need
+        # accurate stream layout for the next stage should re-probe
+        # the prepared file.
+        cmd += _input_discard_args(
+            probe, keep_langs, target_container,
+            add_compat_audio=add_compat_audio,
+            original_audio=original_audio,
+            original_subs=original_subs,
+        )
+    cmd += [
         "-i", probe.path,
         "-map", "0",
         "-c", "copy",
@@ -273,6 +303,7 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
         "-progress", "pipe:1", "-nostats",
         str(prepared_path),
     ]
+    return cmd
 
 
 def build_dv_p7_extract_command(probe: ProbeResult) -> list[str]:
