@@ -510,7 +510,7 @@ class BloatChecksAgainstEncoderInputTests(unittest.TestCase):
         """SPR-shaped scenario: original 100 GB (with ~10 GB of audio
         we'd discard), stripped intermediate 90 GB, encoder output
         88 GB. Vs original (100 GB): ratio 0.88, would NOT trip the
-        0.95 threshold. Vs stripped (90 GB): ratio 0.978, WOULD trip
+        0.90 threshold. Vs stripped (90 GB): ratio 0.978, WOULD trip
         the threshold. The bloat check must use the stripped size."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -558,9 +558,9 @@ class BloatChecksAgainstEncoderInputTests(unittest.TestCase):
                         )
 
             # The bloat check should fire (output 88K / encode_probe
-            # 90K = 0.978 ratio, > 0.95 threshold) — even though
-            # vs `pr` (100K) the ratio is only 0.88 and would have
-            # passed.
+            # 90K = 0.978 ratio, > 0.90 threshold) — even though
+            # vs `pr` (100K) the ratio is only 0.88 and would NOT
+            # have tripped.
             self.assertEqual(status, "bloat_retry")
             self.assertIn("encoder input", buf.getvalue())
 
@@ -603,7 +603,7 @@ class BloatChecksAgainstEncoderInputTests(unittest.TestCase):
                             output, args, "test: ",
                         )
 
-            # 0.96 vs pr.size 100_000 trips the 0.95 threshold.
+            # 0.96 vs pr.size 100_000 trips the 0.90 threshold.
             self.assertEqual(status, "bloat_retry")
 
 

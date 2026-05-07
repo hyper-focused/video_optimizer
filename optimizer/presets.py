@@ -208,17 +208,29 @@ AV1_QSV_DEFAULT_ENCODER_PRESET: str = "veryslow"
 # preserve grain that doesn't perceptually need it. The Princess Bride
 # 2160p remux is the canonical case: 47 GB source → 49 GB output at CQ 15.
 #
-# `BLOAT_RATIO_THRESHOLD` is the trigger: if `out_size >= src_size * this`,
-# we delete the output and re-encode once at `RELAXED_UHD_CQ`. 0.95 keeps
-# the second encode rare (most UHD encodes land at 0.4–0.7) but catches
-# the grain-dominated bloat cases reliably.
+# `BLOAT_RATIO_THRESHOLD` is the trigger: if `out_size >= encoder_input * this`,
+# we delete the output and re-encode once at `RELAXED_UHD_CQ`. Healthy UHD
+# encodes land at 0.4–0.7, so any value in the 0.85–0.95 band cleanly
+# separates "encoder did its job" from "encoder gave up on grain."
+#
+# Lowered to 0.90 (was 0.95) after the second TGF live test: fps trajectory
+# made it clear the encode was struggling by 25-30% (fps ~45 falling toward
+# ~38), but the 0.95 threshold needed the encode to project to within ~5%
+# of source size before tripping. At 0.90 the same case trips by 28-30%
+# instead of having to wait for the 50% checkpoint, saving ~25 min of
+# wasted GPU time per borderline case.
+#
+# Borderline retry math (CQ 15 veryslow at 0.92 vs CQ 21 slow at 0.95):
+# the retry at the relaxed tuning produces a slightly LARGER output
+# (~+2 GB on an 80 GB source) in roughly half the wall-clock time. For
+# library-scale archive runs, the time saving is the right trade.
 #
 # Triggered only on UHD (>= 1440p) sources where the bloat pattern is real;
 # 1080p AV1 encodes occasionally come out bigger than over-bitrated 1080p
 # h264 sources but the perceptual stakes / storage delta are too small to
 # justify a re-encode there. Override per run with `--no-auto-relax-cq`.
 
-BLOAT_RATIO_THRESHOLD: float = 0.95
+BLOAT_RATIO_THRESHOLD: float = 0.90
 RELAXED_UHD_CQ: int = 21
 # When the bloat fallback retries at the relaxed CQ, also drop the encoder
 # preset two ladder steps from `veryslow` to `slow`. Same reasoning as the

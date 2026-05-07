@@ -293,7 +293,7 @@ summarized here.
 | `--limit N` | Process at most N candidates (0 = no limit) |
 | `--confirm` | Prompt per-file before encoding (default is auto-yes) |
 | `--cleanup-after` | Prompt to remove originals after a successful run |
-| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 95% of source size is retried once at CQ 21 + encoder preset `slow`) |
+| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 90% of the encoder's input size is retried once at CQ 21 + encoder preset `slow`) |
 | `--verbose` / `-v` | More chatter (timeout labels, preset tunings, etc.) |
 
 ### Dolby Vision
