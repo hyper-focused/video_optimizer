@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import AudioTrack, ProbeResult, SubtitleTrack
-from .presets import AV1_QSV_BASE, AV1_QSV_TIER
+from .presets import AV1_QSV_BASE, AV1_QSV_DEFAULT_ENCODER_PRESET, AV1_QSV_TIER
 
 # --------------------------------------------------------------------------- #
 # Targets + encoder preference
@@ -977,12 +977,27 @@ def _software_args(encoder: str, quality: int) -> list[str] | None:
 
 def _qsv_args(encoder: str, quality: int, *,
               is_uhd: bool = False, bit_depth: int = 8,
-              hw_decode: bool = False) -> list[str]:
+              hw_decode: bool = False,
+              encoder_preset: str | None = None,
+              qsv_overrides: dict[str, str] | None = None) -> list[str]:
     """Codec args for Intel Quick Sync encoders.
 
-    All av1_qsv tuning lives in `optimizer/presets.py` (AV1_QSV_TIER for
-    HD-vs-UHD knobs; AV1_QSV_BASE for the tier-independent flag set that
-    matches the validated `videos/ff_uhd_av1.sh` reference script).
+    Tuning resolution order, lowest precedence first:
+      1. `AV1_QSV_BASE` for the tier-independent flag set (extbrc,
+         low_power, bf, refs, profile, …) — matches the validated
+         `videos/ff_uhd_av1.sh` reference script.
+      2. `AV1_QSV_TIER["uhd" or "hd"]` for the height-bucketed knobs
+         (look_ahead_depth, gop). Bucket is decided at runtime from
+         the source's actual height — apply still adapts even if the
+         caller didn't go through a preset.
+      3. `qsv_overrides` (per-preset dict from PRESETS) — wins over
+         the globals when present. Lets a single preset retune any
+         knob without forking the whole base/tier table. Empty/missing
+         → fall back to globals.
+
+    `encoder_preset` overrides the encoder ladder rung (default
+    AV1_QSV_DEFAULT_ENCODER_PRESET, currently "veryslow"). The PRESETS
+    dispatch threads each tier's `encoder_preset` field through here.
 
     Pure ICQ, no -maxrate / -bufsize — on av1_qsv, the combination of
     extbrc + ICQ + maxrate collapses to a hybrid VBR mode that under-allocates
@@ -997,6 +1012,15 @@ def _qsv_args(encoder: str, quality: int, *,
     (SW decode -> QSV encode), where it does prevent stealth downconvert.
     """
     base = AV1_QSV_BASE
+    overrides = qsv_overrides or {}
+    chosen_preset = encoder_preset or AV1_QSV_DEFAULT_ENCODER_PRESET
+
+    def pick(key: str, source: dict[str, str]) -> str:
+        # Per-preset overrides win, then fall back to the global tier
+        # / base default. Cheap helper (vs a chain of `or`s) so each
+        # av1_qsv knob reads consistently.
+        return overrides.get(key, source[key])
+
     # `-global_quality` is scoped to the video stream (`:v`) so the qscale
     # flag isn't applied to every encoder in the graph. Without the scope,
     # libopus rejects with "Quality-based encoding not supported" and the
@@ -1008,21 +1032,21 @@ def _qsv_args(encoder: str, quality: int, *,
     # `Codec AVOption look_ahead ... has not been used` warning per
     # encode if it's left on. Restore for hevc_qsv / h264_qsv if those
     # encoders ever come back into the regular path.
-    a = ["-c:v", encoder, "-preset", base["preset"],
+    a = ["-c:v", encoder, "-preset", chosen_preset,
          "-global_quality:v", str(quality)]
     if encoder == "av1_qsv":
         tier = AV1_QSV_TIER["uhd" if is_uhd else "hd"]
         a += [
-            "-look_ahead_depth", tier["look_ahead_depth"],
-            "-extbrc", base["extbrc"],
-            "-low_power", base["low_power"],
-            "-adaptive_i", base["adaptive_i"],
-            "-adaptive_b", base["adaptive_b"],
-            "-b_strategy", base["b_strategy"],
-            "-bf", base["bf"],
-            "-refs", base["refs"],
-            "-g", tier["gop"],
-            "-profile:v", base["profile"],
+            "-look_ahead_depth", pick("look_ahead_depth", tier),
+            "-extbrc", pick("extbrc", base),
+            "-low_power", pick("low_power", base),
+            "-adaptive_i", pick("adaptive_i", base),
+            "-adaptive_b", pick("adaptive_b", base),
+            "-b_strategy", pick("b_strategy", base),
+            "-bf", pick("bf", base),
+            "-refs", pick("refs", base),
+            "-g", pick("gop", tier),
+            "-profile:v", pick("profile", base),
         ]
         if bit_depth >= 10 and not hw_decode:
             a += ["-pix_fmt", "p010le"]
@@ -1064,14 +1088,18 @@ def _videotoolbox_args(encoder: str, quality: int) -> list[str]:
 
 def _codec_args(encoder: str, quality: int, *,
                 is_uhd: bool = False, bit_depth: int = 8,
-                hw_decode: bool = False) -> list[str]:
+                hw_decode: bool = False,
+                encoder_preset: str | None = None,
+                qsv_overrides: dict[str, str] | None = None) -> list[str]:
     """Return -c:v + quality/preset arg fragment for the given encoder."""
     sw = _software_args(encoder, quality)
     if sw is not None:
         return sw
     if encoder.endswith("_qsv"):
         return _qsv_args(encoder, quality, is_uhd=is_uhd,
-                         bit_depth=bit_depth, hw_decode=hw_decode)
+                         bit_depth=bit_depth, hw_decode=hw_decode,
+                         encoder_preset=encoder_preset,
+                         qsv_overrides=qsv_overrides)
     if encoder.endswith("_nvenc"):
         return _nvenc_args(encoder, quality)
     if encoder.endswith("_vaapi"):
@@ -1130,7 +1158,10 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
                          denoise: bool = False,
                          original_audio: bool = False,
                          original_subs: bool = False,
-                         source_override: str | None = None) -> list[str]:
+                         source_override: str | None = None,
+                         encoder_preset: str | None = None,
+                         qsv_overrides: dict[str, str] | None = None,
+                         ) -> list[str]:
     """Return ffmpeg argv for a real re-encode using the given encoder.
 
     hw_decode=True with a QSV encoder enables zero-copy GPU decode→encode
@@ -1170,7 +1201,9 @@ def build_encode_command(probe: ProbeResult, output_path: Path,
             "-map_chapters", "0"]
 
     cmd += _codec_args(encoder, q, is_uhd=is_uhd,
-                       bit_depth=probe.bit_depth, hw_decode=hw_decode)
+                       bit_depth=probe.bit_depth, hw_decode=hw_decode,
+                       encoder_preset=encoder_preset,
+                       qsv_overrides=qsv_overrides)
     cmd += _color_passthrough_args(probe)
 
     # Compose video filter chain: denoise (CPU) → vaapi format/hwupload

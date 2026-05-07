@@ -143,14 +143,16 @@ class SubcommandTypoHintTests(unittest.TestCase):
     error pointing at the wrong token."""
 
     def test_typo_of_preset_name_is_caught(self):
+        # UHD-FLIM is a realistic typo of UHD-FILM that
+        # difflib.get_close_matches catches with cutoff=0.7.
         import io
         from contextlib import redirect_stderr
         buf = io.StringIO()
         with redirect_stderr(buf):
             with self.assertRaises(SystemExit) as cm:
-                _preprocess_argv(["bin", "UHD-QC21", "/some/path"])
+                _preprocess_argv(["bin", "UHD-FLIM", "/some/path"])
         self.assertEqual(cm.exception.code, 2)
-        self.assertIn("UHD-CQ21", buf.getvalue())
+        self.assertIn("UHD-FILM", buf.getvalue())
         self.assertIn("Did you mean", buf.getvalue())
 
     def test_typo_of_subcommand_is_caught(self):

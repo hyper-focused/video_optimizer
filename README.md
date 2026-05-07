@@ -40,9 +40,12 @@ three things to the table that a hand-rolled `for f in *.mkv; do ffmpeg
 - **Adaptive bitrate fallback.** If a UHD encode's mid-encode size
   projection at the 10% / 20% checkpoints — or its final output —
   comes out near or above the source size, the encode is killed and
-  retried once at CQ 21. Catches grain-dominated 4K remasters
-  (Princess Bride, Tron, etc.) where the default CQ over-allocates
-  bits. Silent on healthy encodes; opt out with `--no-auto-relax-cq`.
+  retried once at the relaxed tuning (CQ 21 + encoder preset
+  `slow` instead of `veryslow`). Catches grain-dominated 4K
+  remasters (Princess Bride, Tron, etc.) where the default CQ
+  over-allocates bits, and finishes the retry ~1.5–2× faster than
+  re-running at `veryslow` would. Silent on healthy encodes; opt
+  out with `--no-auto-relax-cq`.
 - **Library-scale defaults.** Audio collapses to a deterministic 3-stream
   ladder (best lossless passthrough + Opus 5.1 + AAC 2.0). Subtitles
   filter to `--keep-langs` (default `en,und`). Originals are preserved by
@@ -174,7 +177,7 @@ the dry-run first if you want to see what would happen:
 
 ```bash
 ./video_optimizer.py UHD      /mnt/nas/media/Movies   # 4K, CQ 15 (archive-grade)
-./video_optimizer.py UHD-CQ21 /mnt/nas/media/Movies   # 4K, CQ 21 (looser; for grain-dominated film)
+./video_optimizer.py UHD-FILM /mnt/nas/media/Movies   # 4K, CQ 21 (looser; for grain-dominated film)
 ./video_optimizer.py HD       /mnt/nas/media/Movies   # 1080p / 720p
 ./video_optimizer.py SD       /mnt/nas/media/Movies   # below 720p
 ```
@@ -182,11 +185,15 @@ the dry-run first if you want to see what would happen:
 Useful when UHD is taking ~1h/file and you want HD's quicker batch first,
 or when you've already done UHD and want to clean up the rest.
 
-**`UHD-CQ21`** is for grain-heavy older films at UHD (Princess Bride, etc.)
+**`UHD-FILM`** is for grain-heavy older films at UHD (Princess Bride, etc.)
 where the default UHD CQ over-allocates bits to grain and produces an
-output near or larger than the source. You usually don't need to invoke
-this manually — the default `UHD` preset includes a bloat fallback that
-detects this mid-encode and retries at CQ 21 automatically.
+output near or larger than the source. The preset uses CQ 21 and the
+`slow` encoder preset (vs UHD's `veryslow`) — grain-dominated content
+doesn't reward extra RD-search effort, so the cheaper preset trades a
+small efficiency loss for ~1.5–2× faster encodes. You usually don't
+need to invoke this manually — the default `UHD` preset includes a
+bloat fallback that detects this mid-encode and retries at the same
+tuning (CQ 21 + `slow`) automatically.
 
 ### Test on a few files first
 
@@ -245,7 +252,7 @@ get a dry-run listing.
 ```
 
 With no arguments and stdin attached to a terminal, drops into a wizard
-that prompts for path, output mode, and tier scope (All / UHD / UHD-CQ21
+that prompts for path, output mode, and tier scope (All / UHD / UHD-FILM
 / HD / SD), then runs the full pipeline.
 
 ### Resume / inspect
@@ -283,7 +290,7 @@ summarized here.
 | `--limit N` | Process at most N candidates (0 = no limit) |
 | `--confirm` | Prompt per-file before encoding (default is auto-yes) |
 | `--cleanup-after` | Prompt to remove originals after a successful run |
-| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 95% of source size is retried once at CQ 21) |
+| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 95% of source size is retried once at CQ 21 + encoder preset `slow`) |
 | `--verbose` / `-v` | More chatter (timeout labels, preset tunings, etc.) |
 
 ### Dolby Vision
@@ -315,7 +322,7 @@ from `--help` for tidiness, but functional.
 
 | Flag | Effect |
 |---|---|
-| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24, UHD-CQ21 21; lower = better quality, larger file) |
+| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24, UHD-FILM 21; lower = better quality, larger file) |
 | `--keep-langs en,und` | Comma-separated language codes to retain (default `en,und`) |
 | `--hwaccel {auto,qsv,nvenc,vaapi,videotoolbox,software,none}` | Force a specific hw backend (default auto) |
 | `--hw-decode` / `--no-hw-decode` | Override the preset's hw-decode default |
@@ -330,7 +337,7 @@ from `--help` for tidiness, but functional.
 | `<bare path>` | Implicit `optimize` (all three tiers) |
 | `optimize PATH` | Explicit form of the above |
 | `SD PATH` / `HD PATH` / `UHD PATH` | Same pipeline, single tier |
-| `UHD-CQ21 PATH` | UHD tier at CQ 21 — for grain-dominated older film where the default CQ bloats |
+| `UHD-FILM PATH` | UHD tier at CQ 21 + encoder preset `slow` — for grain-dominated older film where the default CQ bloats; same tuning the UHD bloat fallback retries at |
 | `wizard` | Interactive prompts → full pipeline |
 | `cleanup` | Remove originals from the most recent (or `--run N`) successful run |
 | `doctor` | Preflight checks: ffmpeg, encoders, GPU device, db |

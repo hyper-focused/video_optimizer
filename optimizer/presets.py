@@ -49,6 +49,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "quality": 24,             # looser than HD: SD is more perceptually
                                    # fragile under heavy compression, and the
                                    # storage delta vs CQ 21 is small at SD sizes
+        "encoder_preset": "veryslow",   # max RD-search depth — best efficiency
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
@@ -58,6 +59,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "label": "720–1439p / HD library archive (AV1 + MKV)",
         "target": "av1+mkv",
         "quality": 21,
+        "encoder_preset": "veryslow",
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
@@ -68,6 +70,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "label": "≥1440p / UHD library archive (AV1 + MKV)",
         "target": "av1+mkv",
         "quality": 15,
+        "encoder_preset": "veryslow",   # archive-grade: take the time
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
@@ -81,7 +84,7 @@ PRESETS: dict[str, dict[str, object]] = {
         # Override per run with --no-hw-decode if a specific title trips it.
         "hw_decode": True,
     },
-    "UHD-CQ21": {
+    "UHD-FILM": {
         # Looser CQ for UHD sources where the default UHD preset (CQ 15)
         # over-allocates bits. The Princess Bride 2160p remux is the
         # canonical example: heavy film grain + low scene-motion makes
@@ -91,10 +94,20 @@ PRESETS: dict[str, dict[str, object]] = {
         # while staying perceptually transparent at typical viewing
         # distances. Use for: pre-2000 live-action 4K remasters, any
         # title where the source is grain-dominated rather than detail-
-        # dominated. Opt-in only — `./video_optimizer.py UHD-CQ21 PATH`.
+        # dominated. Opt-in only — `./video_optimizer.py UHD-FILM PATH`.
+        #
+        # Encoder preset is `slow`, two ladder steps faster than UHD's
+        # `veryslow` (av1_qsv: veryslow → slower → slow → medium → ...).
+        # Rationale: the bloat-fallback path that drops to this preset
+        # is engaged precisely on content where the encoder cannot
+        # compress efficiently anyway (grain-dominated). Spending
+        # `veryslow` RD-search effort on bits the encoder can't compress
+        # well is wasted budget — `slow` finishes ~1.5–2× faster with
+        # only a few percent size penalty at this quality target.
         "label": "≥1440p / grainy older film at UHD (AV1 + MKV, CQ 21)",
         "target": "av1+mkv",
         "quality": 21,
+        "encoder_preset": "slow",
         "rewrite_codec": True,
         "reencode_tag": True,
         "keep_langs": "en,und",
@@ -130,7 +143,7 @@ EST_SECONDS_PER_FILE: dict[str, int] = {
     "SD":       300,    # ~5 min — typical 480p, CPU decode + GPU encode
     "HD":       900,    # ~15 min — 1080p remux, Battlemage iGPU @ ~220 fps
     "UHD":      3600,   # ~1 hour — 2160p HDR remux, Battlemage iGPU @ ~40–55 fps
-    "UHD-CQ21": 2400,   # ~40 min — looser CQ encodes a touch faster than UHD
+    "UHD-FILM": 2400,   # ~40 min — looser CQ encodes a touch faster than UHD
 }
 
 
@@ -169,7 +182,6 @@ AV1_QSV_TIER: dict[str, dict[str, str]] = {
 # cast at every consumer site.
 
 AV1_QSV_BASE: dict[str, str] = {
-    "preset": "veryslow",
     "extbrc": "1",
     "low_power": "0",
     "adaptive_i": "1",
@@ -179,6 +191,12 @@ AV1_QSV_BASE: dict[str, str] = {
     "refs": "5",                     # reference frames
     "profile": "main",
 }
+
+# Default encoder preset when no per-PRESETS override is supplied (e.g.
+# when calling `apply` directly without going through cmd_preset). Kept
+# in sync with the `encoder_preset` field on PRESETS["UHD"] so the
+# direct-apply path matches the archive-grade tier behavior.
+AV1_QSV_DEFAULT_ENCODER_PRESET: str = "veryslow"
 
 
 # --------------------------------------------------------------------------- #
@@ -202,6 +220,11 @@ AV1_QSV_BASE: dict[str, str] = {
 
 BLOAT_RATIO_THRESHOLD: float = 0.95
 RELAXED_UHD_CQ: int = 21
+# When the bloat fallback retries at the relaxed CQ, also drop the encoder
+# preset two ladder steps from `veryslow` to `slow`. Same reasoning as the
+# UHD-FILM preset itself: grain-dominated content the encoder can't
+# compress efficiently doesn't reward extra RD-search effort.
+RELAXED_UHD_ENCODER_PRESET: str = "slow"
 
 # Mid-encode bloat checkpoints: fractions of source duration at which
 # we stat the output file and project the final size as

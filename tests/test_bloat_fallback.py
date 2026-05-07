@@ -106,7 +106,7 @@ class ShouldRetryForBloatTests(unittest.TestCase):
         ))
 
     def test_current_cq_already_at_relaxed_does_not_trigger(self):
-        # Belt-and-braces: if the user invoked `UHD-CQ21` directly and
+        # Belt-and-braces: if the user invoked `UHD-FILM` directly and
         # got bloat anyway, retrying at the same CQ is pointless.
         pr, out = self._setup_pair(src_size=10_000, out_size=9_900)
         self.assertFalse(_should_retry_for_bloat(
@@ -253,16 +253,18 @@ class ApplyOneRetryTests(unittest.TestCase):
 
                 args = _args()
                 args._apply_run_id = run_id  # noqa: SLF001
+                args.encoder_preset = "veryslow"  # archive-grade default
 
                 # First call: signal bloat, second call: success. Capture
-                # the args.quality each time so we can assert the retry
-                # bumped CQ to RELAXED_UHD_CQ.
-                seen_cqs: list[int] = []
+                # the (quality, encoder_preset) pair on each invocation
+                # so we can assert the retry bumped both knobs.
+                seen: list[tuple[int, str | None]] = []
 
                 def fake_execute(_db, _dec, _pr, _cmd, _desc,
                                  _out, args_, _label):
-                    seen_cqs.append(args_.quality)
-                    if len(seen_cqs) == 1:
+                    seen.append((args_.quality,
+                                 getattr(args_, "encoder_preset", None)))
+                    if len(seen) == 1:
                         return "bloat_retry", 0
                     return "applied", 1024
 
@@ -279,10 +281,15 @@ class ApplyOneRetryTests(unittest.TestCase):
                         )
 
             self.assertEqual(status, "applied")
-            self.assertEqual(seen_cqs, [15, RELAXED_UHD_CQ])
-            # CQ restored on the namespace so the next file in the queue
-            # starts at the preset default again.
+            # First call: archive-grade defaults. Retry: relaxed CQ + slow.
+            self.assertEqual(seen, [
+                (15, "veryslow"),
+                (RELAXED_UHD_CQ, "slow"),
+            ])
+            # Both knobs restored on the namespace so the next file in
+            # the queue starts at the preset defaults again.
             self.assertEqual(args.quality, 15)
+            self.assertEqual(args.encoder_preset, "veryslow")
             self.assertFalse(getattr(args, "_cq_retried", False))
 
 

@@ -28,6 +28,7 @@ from .presets import (
     MIN_PROBE_SIZE_BYTES,
     PRESETS,
     RELAXED_UHD_CQ,
+    RELAXED_UHD_ENCODER_PRESET,
 )
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
@@ -1210,12 +1211,18 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
             return status, saved
 
         # Bloat fallback: rebuild the encode argv at the relaxed CQ
-        # and run once more. _execute_encode has already deleted the
-        # bloated output. The original CQ is restored after the retry
-        # so the next file in the queue starts from the preset default.
+        # *and* the relaxed encoder preset, then run once more.
+        # `slow` instead of `veryslow` matches the UHD-FILM preset's
+        # tuning — grain-dominated content the encoder can't compress
+        # efficiently doesn't reward extra RD-search effort.
+        # _execute_encode has already deleted the bloated output. The
+        # originals are restored after the retry so the next file in
+        # the queue starts from the preset defaults.
         original_cq = getattr(args, "quality", None)
+        original_encoder_preset = getattr(args, "encoder_preset", None)
         args._cq_retried = True  # noqa: SLF001
         args.quality = RELAXED_UHD_CQ
+        args.encoder_preset = RELAXED_UHD_ENCODER_PRESET
         try:
             retry_cmd, retry_desc = _build_apply_command(
                 dec, encode_probe, output_path, target_container,
@@ -1227,6 +1234,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
             )
         finally:
             args.quality = original_cq
+            args.encoder_preset = original_encoder_preset
             args._cq_retried = False  # noqa: SLF001
     finally:
         if dv_prep_dir is not None:
@@ -1482,6 +1490,8 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         original_audio=original_audio,
         original_subs=original_subs,
         source_override=source_override,
+        encoder_preset=getattr(args, "encoder_preset", None),
+        qsv_overrides=getattr(args, "qsv_overrides", None),
     )
     desc = f"encode via {enc_name}"
     if denoise:
@@ -1516,11 +1526,24 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
         # because run_ffmpeg returned (False, "bloat_projection ..."),
         # but the caller wants the retry path, not a terminal failure.
         if encoder.BLOAT_PROJECTION_REASON in err:
-            print(f"    bloat detected mid-encode: {err}")
-            print(f"    will retry at CQ {RELAXED_UHD_CQ}")
+            # `flush=True` (here and on every other print() in the
+            # bloat-retry path) is load-bearing: stdout is block-
+            # buffered when redirected to a file (e.g. nohup, log
+            # capture), so without an explicit flush the diagnostic
+            # message sits in Python's buffer until the process
+            # exits. The retry happens immediately afterward, so
+            # users tail-ing the log saw the new ffmpeg cmd appear
+            # without the "bloat detected" explanation that produced
+            # it. The progress display in encoder.run_ffmpeg writes
+            # to sys.stderr with explicit flushes; these print()s
+            # need to match that liveness contract.
+            print(f"    bloat detected mid-encode: {err}", flush=True)
+            print(f"    will retry at CQ {RELAXED_UHD_CQ} "
+                  f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
+                  flush=True)
             _unlink_partial_output(output_path)
             return "bloat_retry", 0
-        print(f"    FAIL: {err}")
+        print(f"    FAIL: {err}", flush=True)
         # Clean up partial output so re-runs don't trip on it.
         _unlink_partial_output(output_path)
         db.mark_decision(dec["id"], "failed", error=err[:1000],
@@ -1537,7 +1560,9 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
         ratio = out_size / pr.size if pr.size else 0
         print(f"    bloat detected: output {out_size / 1024 ** 3:.2f} GB "
               f"vs source {pr.size / 1024 ** 3:.2f} GB "
-              f"(ratio {ratio:.2f}); retrying at CQ {RELAXED_UHD_CQ}")
+              f"(ratio {ratio:.2f}); retrying at CQ {RELAXED_UHD_CQ} "
+              f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
+              flush=True)
         _unlink_partial_output(output_path)
         return "bloat_retry", 0
 
@@ -1998,6 +2023,15 @@ def _apply_with_preset_config(args: argparse.Namespace) -> int:
     args.reencode_tag = bool(cfg["reencode_tag"])
     if args.quality is None:
         args.quality = cfg["quality"]
+    # encoder_preset is always taken from PRESETS (not user-overridable
+    # at the CLI surface — it's a tier tuning, not a per-run knob).
+    args.encoder_preset = cfg.get("encoder_preset")
+    # Optional per-preset overrides for the av1_qsv tuning knobs that
+    # otherwise come from AV1_QSV_BASE / AV1_QSV_TIER. Empty dict
+    # ({}) means "use the globals". A preset can override any subset
+    # (e.g. just `gop` for grain-content tuning) without forking the
+    # full base+tier table. See `_qsv_args` for the resolution order.
+    args.qsv_overrides = cfg.get("qsv_overrides", {})
     if args.keep_langs is None:
         args.keep_langs = cfg["keep_langs"]
     if args.min_height is None and "min_height" in cfg:
@@ -2873,7 +2907,7 @@ def _wizard_pick_tier() -> tuple[str, ...]:
     print("Which resolution tier(s) should be re-encoded?")
     print("  [a] All tiers (UHD + HD + SD)                              [default]")
     print("  [u] UHD only (≥ 1440p)")
-    print("  [f] UHD-CQ21 only (≥ 1440p, CQ 21 for grainy older film)")
+    print("  [f] UHD-FILM only (≥ 1440p, CQ 21 for grainy older film)")
     print("  [h] HD only (720–1439p)")
     print("  [s] SD only (< 720p)")
     choice = _prompt("Choice [a]: ", default="a",
@@ -2881,7 +2915,7 @@ def _wizard_pick_tier() -> tuple[str, ...]:
     if choice == "u":
         return ("UHD",)
     if choice == "f":
-        return ("UHD-CQ21",)
+        return ("UHD-FILM",)
     if choice == "h":
         return ("HD",)
     if choice == "s":
@@ -3120,7 +3154,7 @@ def _preprocess_argv(argv: list[str]) -> list[str]:
     # the legitimate `<path>` positional rather than the typo'd
     # subcommand. Cutoff 0.7 + path-existence check together filter
     # almost all real bare paths (which contain `/` and exist on disk)
-    # while still catching SD/HD/UHD/UHD-CQ21 typos.
+    # while still catching SD/HD/UHD/UHD-FILM typos.
     if not Path(first).exists():
         suggestions = difflib.get_close_matches(
             first, KNOWN_SUBCOMMANDS, n=1, cutoff=0.7,
