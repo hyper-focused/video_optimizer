@@ -136,5 +136,57 @@ class KnownSubcommandsRegistryTest(unittest.TestCase):
         self.assertIn("UHD", KNOWN_SUBCOMMANDS)
 
 
+class SubcommandTypoHintTests(unittest.TestCase):
+    """Typo of a subcommand should produce a 'did you mean' hint, not
+    fall through to the bare-invocation rewrite. Without this hint the
+    user gets argparse's "unrecognized arguments: <legitimate-path>"
+    error pointing at the wrong token."""
+
+    def test_typo_of_preset_name_is_caught(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                _preprocess_argv(["bin", "UHD-QC21", "/some/path"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("UHD-CQ21", buf.getvalue())
+        self.assertIn("Did you mean", buf.getvalue())
+
+    def test_typo_of_subcommand_is_caught(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            with self.assertRaises(SystemExit):
+                _preprocess_argv(["bin", "wizrd"])
+        self.assertIn("wizard", buf.getvalue())
+
+    def test_existing_path_is_not_hijacked_by_typo_check(self):
+        # /tmp exists on every supported platform — a bare-path
+        # invocation against it must NOT be misclassified as a typo,
+        # even though `tmp` is close-ish to other tokens.
+        result = _preprocess_argv(["bin", "/tmp"])
+        # Falls through to the standard rewrite.
+        self.assertEqual(
+            result,
+            ["bin", "optimize", "/tmp", "--bare-invocation"],
+        )
+
+    def test_nonexistent_path_with_no_close_match_falls_through(self):
+        # A path that doesn't exist AND isn't close to any subcommand
+        # should still fall through to the bare-invocation rewrite —
+        # argparse / cmd_optimize will produce a "path not found" error.
+        # (Don't pre-empt with our own check for arbitrary bad paths.)
+        result = _preprocess_argv(
+            ["bin", "/nonexistent/totally-bogus-path"],
+        )
+        self.assertEqual(
+            result,
+            ["bin", "optimize", "/nonexistent/totally-bogus-path",
+             "--bare-invocation"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

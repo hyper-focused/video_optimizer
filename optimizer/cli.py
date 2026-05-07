@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import difflib
 import json
 import os
 import re
@@ -3074,6 +3075,26 @@ def _preprocess_argv(argv: list[str]) -> list[str]:
         return argv
     if first in KNOWN_SUBCOMMANDS:
         return argv
+    # Typo-of-subcommand check. If `first` looks like an attempted
+    # subcommand (close to a known one and isn't an existing path on
+    # disk), exit early with a "did you mean" hint instead of falling
+    # through to the bare-invocation rewrite — that path produces
+    # confusing argparse "unrecognized arguments" errors that point at
+    # the legitimate `<path>` positional rather than the typo'd
+    # subcommand. Cutoff 0.7 + path-existence check together filter
+    # almost all real bare paths (which contain `/` and exist on disk)
+    # while still catching SD/HD/UHD/UHD-CQ21 typos.
+    if not Path(first).exists():
+        suggestions = difflib.get_close_matches(
+            first, KNOWN_SUBCOMMANDS, n=1, cutoff=0.7,
+        )
+        if suggestions:
+            print(
+                f"video_optimizer: '{first}' is not a known subcommand. "
+                f"Did you mean '{suggestions[0]}'?",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     # Preserve argv[0] (prog name) so the caller's argv[1:] slice still works.
     return [argv[0], "optimize", first, *argv[2:], "--bare-invocation"]
 
