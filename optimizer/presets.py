@@ -81,6 +81,26 @@ PRESETS: dict[str, dict[str, object]] = {
         # Override per run with --no-hw-decode if a specific title trips it.
         "hw_decode": True,
     },
+    "UHD-CQ21": {
+        # Looser CQ for UHD sources where the default UHD preset (CQ 15)
+        # over-allocates bits. The Princess Bride 2160p remux is the
+        # canonical example: heavy film grain + low scene-motion makes
+        # av1_qsv try to preserve every grain particle, producing a 49 GB
+        # output from a 47 GB source. CQ 21 collapses the grain budget
+        # to something archive-reasonable (~20 GB/h on the same iGPU)
+        # while staying perceptually transparent at typical viewing
+        # distances. Use for: pre-2000 live-action 4K remasters, any
+        # title where the source is grain-dominated rather than detail-
+        # dominated. Opt-in only — `./video_optimizer.py UHD-CQ21 PATH`.
+        "label": "≥1440p / grainy older film at UHD (AV1 + MKV, CQ 21)",
+        "target": "av1+mkv",
+        "quality": 21,
+        "rewrite_codec": True,
+        "reencode_tag": True,
+        "keep_langs": "en,und",
+        "min_height": 1440,
+        "hw_decode": True,
+    },
 }
 
 
@@ -107,9 +127,10 @@ PRESETS: dict[str, dict[str, object]] = {
 # The wizard reads this dict — don't duplicate the numbers anywhere else.
 
 EST_SECONDS_PER_FILE: dict[str, int] = {
-    "SD":  300,    # ~5 min — typical 480p, CPU decode + GPU encode
-    "HD":  900,    # ~15 min — 1080p remux, Battlemage iGPU @ ~220 fps
-    "UHD": 3600,   # ~1 hour — 2160p HDR remux, Battlemage iGPU @ ~40–55 fps
+    "SD":       300,    # ~5 min — typical 480p, CPU decode + GPU encode
+    "HD":       900,    # ~15 min — 1080p remux, Battlemage iGPU @ ~220 fps
+    "UHD":      3600,   # ~1 hour — 2160p HDR remux, Battlemage iGPU @ ~40–55 fps
+    "UHD-CQ21": 2400,   # ~40 min — looser CQ encodes a touch faster than UHD
 }
 
 
@@ -158,6 +179,40 @@ AV1_QSV_BASE: dict[str, str] = {
     "refs": "5",                     # reference frames
     "profile": "main",
 }
+
+
+# --------------------------------------------------------------------------- #
+# Post-encode bloat fallback (consumed by cli._execute_encode)
+# --------------------------------------------------------------------------- #
+
+# When an encoded UHD output ends up nearly the same size as (or larger
+# than) the source, the default UHD CQ (15) is over-allocating bits to
+# preserve grain that doesn't perceptually need it. The Princess Bride
+# 2160p remux is the canonical case: 47 GB source → 49 GB output at CQ 15.
+#
+# `BLOAT_RATIO_THRESHOLD` is the trigger: if `out_size >= src_size * this`,
+# we delete the output and re-encode once at `RELAXED_UHD_CQ`. 0.95 keeps
+# the second encode rare (most UHD encodes land at 0.4–0.7) but catches
+# the grain-dominated bloat cases reliably.
+#
+# Triggered only on UHD (>= 1440p) sources where the bloat pattern is real;
+# 1080p AV1 encodes occasionally come out bigger than over-bitrated 1080p
+# h264 sources but the perceptual stakes / storage delta are too small to
+# justify a re-encode there. Override per run with `--no-auto-relax-cq`.
+
+BLOAT_RATIO_THRESHOLD: float = 0.95
+RELAXED_UHD_CQ: int = 21
+
+# Mid-encode bloat checkpoints: fractions of source duration at which
+# we stat the output file and project the final size as
+# `out_size / completion_ratio`. If the projection trips
+# `BLOAT_RATIO_THRESHOLD` at any checkpoint, ffmpeg is killed early and
+# the apply layer retries at `RELAXED_UHD_CQ` (same path as the
+# post-encode check). Two checkpoints catch grain-dominated bloat
+# within the first 10–20% of wall-clock instead of after a full hour
+# on UHD; a clean encode that has a high-bitrate intro will normalise
+# below the threshold by 20% and run to completion.
+BLOAT_CHECKPOINTS: tuple[float, ...] = (0.10, 0.20)
 
 
 # --------------------------------------------------------------------------- #

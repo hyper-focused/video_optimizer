@@ -21,9 +21,12 @@ from .db import DEFAULT_DB_PATH, Database
 from .models import ProbeResult, probe_from_dict
 from .presets import (
     BITRATE_FLAG_TABLE,
+    BLOAT_CHECKPOINTS,
+    BLOAT_RATIO_THRESHOLD,
     EST_SECONDS_PER_FILE,
     MIN_PROBE_SIZE_BYTES,
     PRESETS,
+    RELAXED_UHD_CQ,
 )
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
@@ -240,6 +243,37 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
                     help="Enable zero-copy QSV decode->encode pipeline. "
                          "Off by default; safe to enable when the source "
                          "codecs are modern (H.264/HEVC/AV1).")
+    # Default DV handling for both P7 and P8 is the simple ffmpeg-bsf
+    # strip path (`dovi_rpu=strip=true`). The dovi_tool-based P7 → P8
+    # conversion pipeline is preserved but opt-in: it requires both
+    # dovi_tool and mkvmerge on PATH, writes a ~50 GB temp file, and
+    # has been the source of NAS-wedge / mkvmerge-muxer pain in the
+    # field. Reach for it only when a specific P7 source fails the
+    # strip-only attempt.
+    ap.add_argument("--dv-p7-convert", action="store_true",
+                    help="For Profile 7 sources: run the dovi_tool "
+                         "convert + mkvmerge pipeline before encoding "
+                         "instead of the default RPU-strip-only path. "
+                         "Requires dovi_tool and mkvmerge on PATH.")
+    # Auto-relax-CQ: bloat fallback for grain-dominated UHD. Two checks
+    # share this flag:
+    #   1. Mid-encode: ffmpeg's -progress stream is sampled at the
+    #      BLOAT_CHECKPOINTS fractions of source duration; if the output
+    #      file's projected final size (out_size / completion_ratio)
+    #      crosses BLOAT_RATIO_THRESHOLD * source_size, ffmpeg is
+    #      killed early and the encode is retried at CQ 21. Saves the
+    #      ~50 minutes of wasted GPU time the post-encode check
+    #      otherwise burns on a UHD bloat.
+    #   2. Post-encode: belt-and-braces. If a UHD encode somehow lands
+    #      bloated despite passing both checkpoints (e.g. the bloat is
+    #      concentrated in the last third of the source), the same
+    #      retry triggers from the size of the finished output.
+    ap.add_argument("--no-auto-relax-cq", action="store_false",
+                    dest="auto_relax_cq", default=True,
+                    help="Disable the UHD bloat fallback. Default: a "
+                         "UHD encode whose mid-encode projection or "
+                         "final output is nearly as big as the source "
+                         "is retried once at CQ 21.")
     # Compat audio: when a kept track is hi-res lossless (TrueHD, DTS-HD MA,
     # FLAC, multichannel PCM), also emit AAC 5.1 @ 640k and AAC 2.0 @ 320k
     # so devices that can't decode lossless still play sound. On by default.
@@ -745,10 +779,12 @@ def _plan_probe_gate(db: Database, pr,
     if stall_count >= 2:
         return "stalled"
     if pr.dv_profile is not None and encoder.dv_strategy(pr.dv_profile) is None:
-        # Profile 5 (custom DV colorspace, no HDR10 base) and Profile 7
-        # without dovi_tool installed both fall here. Profile 8.x and
-        # Profile 7 with dovi_tool available are admitted; the apply
-        # layer routes them through the strip / convert prep pipeline.
+        # Profile 5 (custom DV colorspace, no HDR10 base) is the only
+        # profile that always falls here; the strip-only path now
+        # admits both P7 and P8.x by default. Plan-time we don't know
+        # whether the user will pass --dv-p7-convert at apply time,
+        # but `dv_strategy(7)` returns "p8_strip" with the default
+        # kwarg, so P7 clears this gate too.
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
@@ -1091,18 +1127,55 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
     so the temp stream-copy stays on the same filesystem; try/finally
     guarantees teardown even on encode failure.
     """
+    # Dry-run short-circuit: print what the encode argv would look like
+    # and stop. Crucially this runs *before* `_prepare_dv_source`, which
+    # would otherwise spend hours stream-copying a 50 GB DV source into
+    # a `.vo_dv_prep_*` work dir on the NAS — exactly what a dry run
+    # exists to avoid. The printed argv references `pr.path` (the real
+    # source); the DV-prep step would have substituted a stripped temp
+    # file, but for dry-run inspection the original-path version is
+    # what the user wants to see anyway.
+    if args.dry_run:
+        cmd, desc = _build_apply_command(
+            dec, pr, output_path, target_container,
+            enc_name, keep_langs, args,
+        )
+        print(f"    DRY RUN ({desc}) → {output_path}")
+        print("    " + " ".join(cmd))
+        db.stamp_decision_run(dec["id"], run_id,
+                              expected_path=pr.path)
+        return "dry_run", 0
+
     dv_prep_dir: Path | None = None
     source_for_encode: str | None = pr.path
     try:
         if pr.dv_profile is not None:
-            dv_prep_dir, source_for_encode = _prepare_dv_source(pr, args)
+            dv_prep_dir, source_for_encode, dv_err = _prepare_dv_source(pr, args)
             if source_for_encode is None:
-                # Strategy was None (P5 / P7-without-dovi_tool). Plan
-                # gate should have caught this; defensive belt-and-braces.
-                db.mark_decision(dec["id"], "skipped",
-                                 error="dv_no_prep_strategy", run_id=run_id,
-                                 expected_path=pr.path)
-                return "skipped", 0
+                # Two distinct cases — must be reported differently:
+                #   dv_err is None  → no strategy applies (P5, or P7
+                #     without --dv-p7-convert tools). Plan gate should
+                #     normally have caught this; treat as 'skipped'
+                #     with a policy code.
+                #   dv_err is set   → strategy ran but the underlying
+                #     ffmpeg/dovi_tool/mkvmerge command crashed. Treat
+                #     as 'failed' with the captured error so the user
+                #     sees the real cause (e.g. The Housemaid 2025's
+                #     HDR10Plus+DV combo failing the strip bsf), not a
+                #     misleading "skipped" placeholder.
+                if dv_err is None:
+                    db.mark_decision(
+                        dec["id"], "skipped",
+                        error="dv_no_prep_strategy", run_id=run_id,
+                        expected_path=pr.path,
+                    )
+                    return "skipped", 0
+                db.mark_decision(
+                    dec["id"], "failed",
+                    error=dv_err, run_id=run_id,
+                    expected_path=pr.path,
+                )
+                return "failed", 0
 
         cmd, desc = _build_apply_command(
             dec, pr, output_path, target_container,
@@ -1110,45 +1183,68 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
             source_override=source_for_encode,
         )
 
-        if args.dry_run:
-            print(f"    DRY RUN ({desc}) → {output_path}")
-            print("    " + " ".join(cmd))
-            db.stamp_decision_run(dec["id"], run_id,
-                                  expected_path=pr.path)
-            return "dry_run", 0
-
         label = f"[{idx}/{total}] {Path(pr.path).name}: "
-        return _execute_encode(db, dec, pr, cmd, desc, output_path, args, label)
+        status, saved = _execute_encode(
+            db, dec, pr, cmd, desc, output_path, args, label,
+        )
+        if status != "bloat_retry":
+            return status, saved
+
+        # Bloat fallback: rebuild the encode argv at the relaxed CQ
+        # and run once more. _execute_encode has already deleted the
+        # bloated output. The original CQ is restored after the retry
+        # so the next file in the queue starts from the preset default.
+        original_cq = getattr(args, "quality", None)
+        args._cq_retried = True  # noqa: SLF001
+        args.quality = RELAXED_UHD_CQ
+        try:
+            retry_cmd, retry_desc = _build_apply_command(
+                dec, pr, output_path, target_container,
+                enc_name, keep_langs, args,
+                source_override=source_for_encode,
+            )
+            return _execute_encode(
+                db, dec, pr, retry_cmd, retry_desc, output_path, args, label,
+            )
+        finally:
+            args.quality = original_cq
+            args._cq_retried = False  # noqa: SLF001
     finally:
         if dv_prep_dir is not None:
             shutil.rmtree(dv_prep_dir, ignore_errors=True)
 
 
-def _prepare_dv_source(pr: ProbeResult,
-                       args: argparse.Namespace) -> tuple[Path | None, str | None]:
-    """Run the appropriate DV pre-stage; return (work_dir, prepared_path).
+def _prepare_dv_source(
+    pr: ProbeResult,
+    args: argparse.Namespace,
+) -> tuple[Path | None, str | None, str | None]:
+    """Run the appropriate DV pre-stage; return (work_dir, prepared_path, error).
 
-    Profile 8.x: stream-copy with `dovi_rpu=strip` bsf. Single ffmpeg
-    subprocess, ~5-10 minutes on a 50 GB UHD remux (I/O-bound). Output
-    is a clean HDR10 MKV that the QSV pipeline accepts.
+    Three-tuple disambiguates two distinct "couldn't produce a prepared
+    source" cases that the caller needs to handle differently:
 
-    Profile 7: not yet implemented in code — returns (None, None) so
-    the caller skips the file. The plan-gate is supposed to catch this
-    case (admit only when `dovi_tool` is on PATH); the apply-side
-    handler is the next step. Documented in TODO.md.
-
-    Returns:
-      (work_dir, prepared_source_path) on success — caller `rmtree`s
-        work_dir in finally to clean up the temp stream-copy.
-      (None, None) on no-op or unimplemented strategy — caller treats
-        as "skip this source."
+      * No strategy applies (P5, or P7 with `--dv-p7-convert` but the
+        tools are missing). Plan gate should usually have caught this.
+        Return: (None, None, None) — caller marks the row 'skipped'
+        with a policy code.
+      * Strategy ran but the ffmpeg/dovi_tool/mkvmerge command failed
+        at runtime (e.g. The Housemaid 2025: HDR10Plus + DV combo
+        that the bsf can't handle). Return: (None, None, err_msg) —
+        caller marks the row 'failed' with the captured error so the
+        user sees the real ffmpeg exit context, not a generic
+        "skipped" placeholder.
+      * Success. Return: (work_dir, prepared_source_path, None) —
+        caller `rmtree`s work_dir in finally to clean up the temp.
 
     The work_dir lives next to the source on its own filesystem so the
     ~50 GB temp file write doesn't traverse a slow NAS link or fill /tmp.
     """
-    strategy = encoder.dv_strategy(pr.dv_profile)
+    strategy = encoder.dv_strategy(
+        pr.dv_profile,
+        allow_p7_convert=getattr(args, "dv_p7_convert", False),
+    )
     if strategy is None:
-        return None, None
+        return None, None, None
 
     src = Path(pr.path)
     work_dir = Path(tempfile.mkdtemp(
@@ -1160,28 +1256,24 @@ def _prepare_dv_source(pr: ProbeResult,
         print(f"    DV Profile {pr.dv_profile}: stripping RPU "
               f"(temp file: {prepared.name})")
         cmd = encoder.build_dv_strip_command(pr, prepared)
-        timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
-        ok, err = encoder.run_ffmpeg(
-            cmd, pr.duration_seconds,
-            timeout_seconds=timeout, verbose=args.verbose,
-            label="    DV-strip ",
-        )
+        ok, err = _run_encode_ffmpeg(cmd, pr, args, label="    DV-strip ")
         if not ok:
             shutil.rmtree(work_dir, ignore_errors=True)
             print(f"    FAIL: DV strip failed: {err[:200]}")
-            return None, None
-        return work_dir, str(prepared)
+            return None, None, f"dv_strip_failed: {err[:800]}"
+        return work_dir, str(prepared), None
 
     if strategy == "p7_convert":
         ok = _run_dv_p7_pipeline(pr, work_dir, prepared, args)
         if not ok:
             shutil.rmtree(work_dir, ignore_errors=True)
-            return None, None
-        return work_dir, str(prepared)
+            return None, None, "dv_p7_pipeline_failed"
+        return work_dir, str(prepared), None
 
-    # Unknown strategy string — defensive fallback.
+    # Unknown strategy string — defensive fallback (would indicate a
+    # new strategy added to dv_strategy() without updating this dispatch).
     shutil.rmtree(work_dir, ignore_errors=True)
-    return None, None
+    return None, None, f"dv_unknown_strategy: {strategy}"
 
 
 def _run_dv_p7_pipeline(pr: ProbeResult, work_dir: Path,
@@ -1239,11 +1331,9 @@ def _run_dv_p7_pipeline(pr: ProbeResult, work_dir: Path,
 
     # Stage 3: strip RPU on raw HEVC → raw HEVC (no container
     # involved, so the matroska timestamp issue doesn't apply).
-    timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
-    ok, err = encoder.run_ffmpeg(
+    ok, err = _run_encode_ffmpeg(
         encoder.build_dv_p7_strip_raw_command(p8_hevc, stripped_hevc),
-        pr.duration_seconds, timeout_seconds=timeout,
-        verbose=args.verbose, label="    DV-P7-strip ",
+        pr, args, label="    DV-P7-strip ",
     )
     if not ok:
         print(f"    FAIL: DV P7 strip failed: {err[:200]}")
@@ -1373,32 +1463,161 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                     label: str = "") -> tuple[str, int]:
     """Run ffmpeg, finalise the output path, update the decision row."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
     print(f"    {desc} → {output_path}")
     if args.verbose:
+        timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
         timeout_label = "disabled" if timeout in (None, 0) else f"{timeout}s"
         print(f"    timeout: {timeout_label}")
 
-    ok, err = encoder.run_ffmpeg(cmd, pr.duration_seconds,
-                                 timeout_seconds=timeout,
-                                 verbose=args.verbose,
-                                 label=label,
-                                 source_fps=pr.frame_rate)
+    bloat_checker = _maybe_make_bloat_checker(pr, output_path, args)
+    ok, err = _run_encode_ffmpeg(
+        cmd, pr, args, label=label, bloat_checker=bloat_checker,
+    )
     if not ok:
+        # A mid-encode bloat trip looks like an ffmpeg failure here
+        # because run_ffmpeg returned (False, "bloat_projection ..."),
+        # but the caller wants the retry path, not a terminal failure.
+        if encoder.BLOAT_PROJECTION_REASON in err:
+            print(f"    bloat detected mid-encode: {err}")
+            print(f"    will retry at CQ {RELAXED_UHD_CQ}")
+            _unlink_partial_output(output_path)
+            return "bloat_retry", 0
         print(f"    FAIL: {err}")
         # Clean up partial output so re-runs don't trip on it.
-        if output_path.exists():
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
+        _unlink_partial_output(output_path)
         db.mark_decision(dec["id"], "failed", error=err[:1000],
                          run_id=getattr(args, "_apply_run_id", None),
                          expected_path=pr.path)
         return "failed", 0
 
+    # Post-encode bloat check (UHD only, before any disposal). If the
+    # output is nearly as big as the source, we throw it away and let
+    # the caller retry at a looser CQ. Must happen before _finalize_output
+    # so replace mode hasn't moved the source to recycle yet.
+    if _should_retry_for_bloat(pr, output_path, args):
+        out_size = _safe_stat_size(output_path)
+        ratio = out_size / pr.size if pr.size else 0
+        print(f"    bloat detected: output {out_size / 1024 ** 3:.2f} GB "
+              f"vs source {pr.size / 1024 ** 3:.2f} GB "
+              f"(ratio {ratio:.2f}); retrying at CQ {RELAXED_UHD_CQ}")
+        _unlink_partial_output(output_path)
+        return "bloat_retry", 0
+
     actual_mb = _finalize_output(pr, output_path, args, db, dec)
     return "applied", int(actual_mb * 1024 * 1024)
+
+
+def _maybe_make_bloat_checker(pr: ProbeResult, output_path: Path,
+                              args: argparse.Namespace,
+                              ) -> "encoder._BloatChecker | None":
+    """Build a mid-encode bloat checker if the same gates apply as the
+    post-encode check, otherwise None.
+
+    Same predicate logic as `_should_retry_for_bloat` (UHD source,
+    auto-relax enabled, current CQ < relaxed, not already retried) but
+    runs before the encode rather than after — so we can kill ffmpeg
+    early instead of waiting for it to finish a doomed encode.
+    """
+    if not getattr(args, "auto_relax_cq", True):
+        return None
+    if getattr(args, "_cq_retried", False):
+        return None
+    if pr.height < 1440:
+        return None
+    cur_cq = getattr(args, "quality", None)
+    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
+        return None
+    if not pr.size:
+        return None
+    return encoder._BloatChecker(  # noqa: SLF001
+        source_size=pr.size,
+        output_path=output_path,
+        threshold=BLOAT_RATIO_THRESHOLD,
+        checkpoints=BLOAT_CHECKPOINTS,
+    )
+
+
+def _safe_stat_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _run_encode_ffmpeg(
+    cmd: list[str], pr: ProbeResult, args: argparse.Namespace,
+    *, label: str = "",
+    bloat_checker: "encoder._BloatChecker | None" = None,
+) -> tuple[bool, str]:
+    """Standard wrapper around `encoder.run_ffmpeg` for encode-class jobs.
+
+    Centralises the boilerplate every encode-side ffmpeg invocation
+    needs: timeout derived from `args.timeout` + source duration,
+    `source_fps=pr.frame_rate` (so the progress display can fall back
+    to the frame counter when the muxer's `out_time_ms` lags), and
+    `verbose` plumbed from `args`. Without this wrapper it's easy to
+    forget `source_fps` at a new callsite — the DV-strip path missed
+    it for a while and produced bogus % / ETA on every DV source
+    until that was caught.
+
+    Use for encode and any encode-shaped helper (DV strip, P7 strip,
+    main av1_qsv encode). Don't use for the small ffprobe-style
+    invocations in `validate_output` etc. — those have their own
+    short-timeout shape.
+    """
+    timeout = _resolve_timeout(args.timeout, pr.duration_seconds)
+    return encoder.run_ffmpeg(
+        cmd, pr.duration_seconds,
+        timeout_seconds=timeout,
+        verbose=args.verbose,
+        label=label,
+        source_fps=pr.frame_rate,
+        bloat_checker=bloat_checker,
+    )
+
+
+def _unlink_partial_output(path: Path) -> None:
+    """Remove a partial encode output, ignoring "missing" / "no permission" /
+    "filesystem went away on the NAS" errors. Used wherever we throw away
+    an in-progress output: bloat-retry deletes it before re-encoding;
+    encode-failure cleanup deletes it before marking the row failed. None
+    of those callers can do anything useful if unlink itself fails — and
+    the next run's plan-gate will catch a stale orphan via the
+    `existing_output` check anyway."""
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _should_retry_for_bloat(pr: ProbeResult, output_path: Path,
+                            args: argparse.Namespace) -> bool:
+    """Decide whether to throw the encode away and retry at relaxed CQ.
+
+    Triggers when *all* of these are true:
+      - Auto-relax is enabled (default; --no-auto-relax-cq disables).
+      - We have not already retried this file (one retry cap).
+      - Source is UHD (height >= 1440). 1080p AV1 occasionally bloats
+        relative to over-bitrated h264, but the storage delta isn't
+        worth a doubled encode budget there.
+      - The current CQ is tighter than the relaxed CQ — otherwise the
+        retry would re-run with the same (or looser) settings.
+      - Output size >= source size * BLOAT_RATIO_THRESHOLD.
+    """
+    if not getattr(args, "auto_relax_cq", True):
+        return False
+    if getattr(args, "_cq_retried", False):
+        return False
+    if pr.height < 1440:
+        return False
+    cur_cq = getattr(args, "quality", None)
+    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
+        return False
+    if not pr.size:
+        return False
+    return _safe_stat_size(output_path) >= pr.size * BLOAT_RATIO_THRESHOLD
 
 
 def cmd_list_encoders(args: argparse.Namespace) -> int:  # noqa: ARG001
@@ -2616,12 +2835,15 @@ def _wizard_pick_tier() -> tuple[str, ...]:
     print("Which resolution tier(s) should be re-encoded?")
     print("  [a] All tiers (UHD + HD + SD)                              [default]")
     print("  [u] UHD only (≥ 1440p)")
+    print("  [f] UHD-CQ21 only (≥ 1440p, CQ 21 for grainy older film)")
     print("  [h] HD only (720–1439p)")
     print("  [s] SD only (< 720p)")
     choice = _prompt("Choice [a]: ", default="a",
-                     choices=["a", "u", "h", "s"])
+                     choices=["a", "u", "f", "h", "s"])
     if choice == "u":
         return ("UHD",)
+    if choice == "f":
+        return ("UHD-CQ21",)
     if choice == "h":
         return ("HD",)
     if choice == "s":

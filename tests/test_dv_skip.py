@@ -81,6 +81,81 @@ class DvSkipTests(unittest.TestCase):
         self.assertEqual(summary.get("dv_blocked"), 1)
 
 
+class DvStripCommandShapeTests(unittest.TestCase):
+    """`build_dv_strip_command` must scope the bsf to v:0, not bare v.
+
+    Run #166 caught this: The Housemaid 2025 (DV P7 + JPEG cover art)
+    crashed the strip with `Error initializing bitstream filter:
+    dovi_rpu — Codec 'mjpeg' (7) is not supported`. The bsf only
+    handles hevc + av1; bare `-bsf:v` applies to every video stream
+    including the embedded JPEG cover, while `-bsf:v:0` targets only
+    the primary HEVC track and leaves the cover art untouched.
+    """
+
+    def test_bsf_targets_first_video_stream_only(self):
+        from optimizer.encoder import build_dv_strip_command
+        from tests._fixtures import make_probe
+        pr = make_probe(height=2160, dv_profile=8)
+        pr.path = "/movies/x.mkv"
+        cmd = build_dv_strip_command(pr, Path("/movies/x.dv-prepped.mkv"))
+        # The whole-stream form must NOT be present.
+        self.assertNotIn("-bsf:v", cmd,
+                         "bare -bsf:v leaked; will crash on sources with "
+                         "non-DV video streams (e.g. JPEG cover art)")
+        # The scoped form must be present and followed by the strip filter.
+        self.assertIn("-bsf:v:0", cmd)
+        idx = cmd.index("-bsf:v:0")
+        self.assertEqual(cmd[idx + 1], "dovi_rpu=strip=true")
+
+
+class DvStrategyDefaultsTests(unittest.TestCase):
+    """`encoder.dv_strategy` per-profile dispatch.
+
+    Default (allow_p7_convert=False) puts P7 on the same simple
+    `dovi_rpu=strip=true` bsf path as P8 — the dovi_tool +
+    mkvmerge pipeline is opt-in. Pinned because the historical
+    default (P7 → "p7_convert" when tools are present) caused
+    NAS-wedge / mkvmerge-muxer pain in the field; reverting it
+    silently would re-introduce that.
+    """
+
+    def test_p5_always_skipped(self):
+        from optimizer import encoder
+        self.assertIsNone(encoder.dv_strategy(5))
+        self.assertIsNone(encoder.dv_strategy(5, allow_p7_convert=True))
+
+    def test_p8_is_strip(self):
+        from optimizer import encoder
+        self.assertEqual(encoder.dv_strategy(8), "p8_strip")
+
+    def test_p7_default_is_strip_not_convert(self):
+        from optimizer import encoder
+        self.assertEqual(encoder.dv_strategy(7), "p8_strip")
+
+    def test_p7_convert_opt_in_requires_both_tools(self):
+        from unittest.mock import patch
+
+        from optimizer import encoder
+        # Both present → convert pipeline.
+        with patch.object(encoder, "has_dovi_tool", return_value=True), \
+             patch.object(encoder, "has_mkvmerge", return_value=True):
+            self.assertEqual(
+                encoder.dv_strategy(7, allow_p7_convert=True),
+                "p7_convert",
+            )
+        # Either missing → None (fail closed; user opted in but env can't honour it).
+        with patch.object(encoder, "has_dovi_tool", return_value=False), \
+             patch.object(encoder, "has_mkvmerge", return_value=True):
+            self.assertIsNone(
+                encoder.dv_strategy(7, allow_p7_convert=True),
+            )
+        with patch.object(encoder, "has_dovi_tool", return_value=True), \
+             patch.object(encoder, "has_mkvmerge", return_value=False):
+            self.assertIsNone(
+                encoder.dv_strategy(7, allow_p7_convert=True),
+            )
+
+
 def _p(path: str, *, dv_profile: int | None) -> object:
     """make_probe wrapper: 2160p source over the UHD bitrate flag threshold."""
     pr = make_probe(

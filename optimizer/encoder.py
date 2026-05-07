@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -193,32 +194,46 @@ def has_mkvmerge() -> bool:
     return _mkvmerge_cache is not None
 
 
-def dv_strategy(dv_profile: int | None) -> str | None:
+def dv_strategy(dv_profile: int | None, *,
+                allow_p7_convert: bool = False) -> str | None:
     """Pick the prep strategy for a given DV profile, or None to skip.
 
     Returns one of:
       "p8_strip"   — single-pass `dovi_rpu=strip` via ffmpeg bsf, then
-                     encode the HDR10 base layer to AV1. Covers
-                     Profile 8.x — the modern UHD majority.
-      "p7_convert" — multi-stage: extract HEVC, `dovi_tool convert -m 2`
-                     to flatten P7 → P8, re-mux + strip RPU, then encode.
-                     Requires dovi_tool on PATH.
+                     encode the HDR10 base layer to AV1. The default
+                     for both Profile 8.x (clean HDR10 base) and
+                     Profile 7 (gambles on the BL being HDR10-decodable
+                     after RPU strip).
+      "p7_convert" — multi-stage: extract HEVC, `dovi_tool convert
+                     --discard` to flatten P7 → P8, re-mux + strip RPU,
+                     then encode. Requires dovi_tool *and* mkvmerge on
+                     PATH. Opt-in via `--dv-p7-convert` because the
+                     pipeline is fragile (long temp files, NAS write
+                     latency, mkvmerge muxer quirks) and the strip-only
+                     path is a viable first attempt for most P7 sources.
       None         — skip permanently. Profile 5 (custom DV-only colour
-                     space, no clean HDR10 fallback) and Profile 7 when
-                     dovi_tool is missing both fall here.
+                     space, no clean HDR10 fallback) is the only profile
+                     that always falls here; P7 with `allow_p7_convert`
+                     but the tools missing also lands here so the user
+                     gets an explicit failure rather than a silent
+                     downgrade.
     """
     if dv_profile is None:
         return None  # not DV; caller shouldn't have asked
     if dv_profile == 5:
         return None  # P5 has no clean HDR10 base layer
     if dv_profile == 7:
-        # P7 path requires BOTH external tools: dovi_tool to flatten
-        # P7 → P8.1 (drop the EL), and mkvmerge to mux the converted
-        # raw HEVC back with the original audio/subs (ffmpeg's matroska
-        # muxer can't handle raw-HEVC stream-copy on B-frame content).
-        if has_dovi_tool() and has_mkvmerge():
-            return "p7_convert"
-        return None
+        if allow_p7_convert:
+            # User opted into the dovi_tool pipeline. Both tools must
+            # be present — fail closed rather than silently fall back.
+            if has_dovi_tool() and has_mkvmerge():
+                return "p7_convert"
+            return None
+        # Default: try the simple ffmpeg bsf strip. Many P7 sources
+        # have an HDR10-compatible base layer that decodes cleanly
+        # once the RPU SEIs are gone; if a specific source wedges,
+        # the user can opt back into p7_convert.
+        return "p8_strip"
     if dv_profile == 8:
         return "p8_strip"
     # Profile 4 / 9 / 10 (rare or AV1-native) — be conservative, skip
@@ -229,10 +244,20 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
     """Return ffmpeg argv that produces `prepared_path` from `probe.path`.
 
     Stream-copies every track, applying the `dovi_rpu=strip` bitstream
-    filter on the video track to remove DV RPU SEI messages. Output is
-    a clean HDR10 MKV that the QSV pipeline accepts without wedging.
-    Use for Profile 8.x sources; Profile 7 needs `dovi_tool` first
-    (see `build_dv_p7_extract_command` + `build_dv_p7_remux_command`).
+    filter on the *primary* video track (`v:0`) to remove DV RPU SEI
+    messages. Output is a clean HDR10 MKV that the QSV pipeline accepts
+    without wedging. Use for Profile 8.x sources; Profile 7 needs
+    `dovi_tool` first (see `build_dv_p7_extract_command` +
+    `build_dv_p7_remux_command`).
+
+    Stream specifier `v:0` (not bare `v`) is load-bearing: many remuxes
+    embed a JPEG cover-art / poster as an additional video stream
+    (e.g. The Housemaid 2025 has a 600x900 mjpeg attached pic). The
+    bsf only supports hevc and av1; applying it to the mjpeg attached
+    pic crashes ffmpeg with `Error initializing bitstream filter:
+    dovi_rpu`. `v:0` scopes the bsf to the real video track only;
+    every other stream is mapped via `-map 0` and stream-copied
+    untouched (including the cover art).
     """
     return [
         "ffmpeg", "-hide_banner", "-nostdin", "-y",
@@ -242,7 +267,9 @@ def build_dv_strip_command(probe: ProbeResult, prepared_path: Path) -> list[str]
         # The bsf has named options; `strip` is a boolean (default false).
         # Bare `dovi_rpu=strip` is parsed as "strip is the value of an
         # implicit option" and rejected. Must be `strip=true` (or `strip=1`).
-        "-bsf:v", "dovi_rpu=strip=true",
+        # Stream specifier `v:0` keeps the bsf off non-DV video streams
+        # like JPEG cover art (see docstring).
+        "-bsf:v:0", "dovi_rpu=strip=true",
         "-progress", "pipe:1", "-nostats",
         str(prepared_path),
     ]
@@ -329,8 +356,7 @@ def validate_output(probe: ProbeResult,
         return False, (f"ffprobe exit {result.returncode}: "
                        f"{result.stderr.strip()[:200]}")
     try:
-        import json as _json
-        info = _json.loads(result.stdout or "{}")
+        info = json.loads(result.stdout or "{}")
     except ValueError as e:
         return False, f"ffprobe output not JSON: {e}"
     streams = info.get("streams") or []
@@ -1164,6 +1190,60 @@ class _ProgressState:
     speed: float = 0.0             # speed multiplier vs realtime (e.g. 1.8x)
 
 
+# Sentinel substring marking a kill triggered by `_BloatChecker`. The
+# apply layer matches on this to convert a "fail" into a retry rather
+# than a terminal failure. Callers that want to act on it should look
+# for `BLOAT_PROJECTION_REASON in err`, not equality — the rest of the
+# string carries human-readable context.
+BLOAT_PROJECTION_REASON = "bloat_projection"
+
+
+class _BloatChecker:
+    """Mid-encode size projection.
+
+    At each `checkpoints` fraction (0..1) of source duration, stat the
+    output file and project final size as `out_size / completion_ratio`.
+    If the projection >= `source_size * threshold`, `check()` returns
+    a kill verdict the progress loop honours. Each checkpoint is
+    consumed once — re-entering at the same threshold is a no-op so a
+    healthy encode that wobbles around 10% won't trigger repeatedly.
+    """
+
+    def __init__(self, source_size: int, output_path: Path,
+                 threshold: float, checkpoints: tuple[float, ...]):
+        self.source_size = source_size
+        self.output_path = output_path
+        self.threshold = threshold
+        # Sorted ascending so we always check the next-earliest first.
+        self._remaining = sorted(c for c in checkpoints if 0 < c < 1)
+
+    def check(self, current_seconds: float,
+              duration_seconds: float) -> tuple[bool, str]:
+        if not self._remaining or duration_seconds <= 0 or self.source_size <= 0:
+            return False, ""
+        ratio_done = current_seconds / duration_seconds
+        if ratio_done < self._remaining[0]:
+            return False, ""
+        # Crossed at least one checkpoint; consume it.
+        crossed = self._remaining.pop(0)
+        try:
+            out_size = self.output_path.stat().st_size
+        except OSError:
+            return False, ""
+        if ratio_done < 0.01 or out_size <= 0:
+            return False, ""
+        projected = out_size / ratio_done
+        if projected >= self.source_size * self.threshold:
+            return True, (
+                f"{BLOAT_PROJECTION_REASON} at {crossed * 100:.0f}%: "
+                f"output {out_size / 1024 ** 3:.2f} GB, "
+                f"projecting {projected / 1024 ** 3:.1f} GB vs source "
+                f"{self.source_size / 1024 ** 3:.2f} GB "
+                f"(threshold {self.threshold:.2f})"
+            )
+        return False, ""
+
+
 def _format_bar(fraction: float, width: int = 20) -> str:
     """Return a textual progress bar at the given fraction (0..1)."""
     fraction = max(0.0, min(1.0, fraction))
@@ -1298,6 +1378,7 @@ def _stream_progress_until_done(proc: subprocess.Popen,
                                 *, label: str = "",
                                 stall_seconds: int = 300,
                                 source_fps: float = 0.0,
+                                bloat_checker: _BloatChecker | None = None,
                                 ) -> tuple[bool, str]:
     """Pump ffmpeg progress lines until EOF.
 
@@ -1346,6 +1427,12 @@ def _stream_progress_until_done(proc: subprocess.Popen,
                           f"frame={last_frames})")
         if timeout_active and now - start > timeout_seconds:
             return True, f"timeout after {timeout_seconds}s"
+        if bloat_checker is not None:
+            should_kill, reason = bloat_checker.check(
+                state.current_seconds, duration_seconds,
+            )
+            if should_kill:
+                return True, reason
     return False, ""
 
 
@@ -1354,7 +1441,9 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
                stall_seconds: int = 300,
                verbose: bool = False,
                label: str = "",
-               source_fps: float = 0.0) -> tuple[bool, str]:
+               source_fps: float = 0.0,
+               bloat_checker: _BloatChecker | None = None,
+               ) -> tuple[bool, str]:
     """Run ffmpeg with single-line progress; enforce wall-clock + stall caps.
 
     timeout_seconds: positive int caps wall-clock; 0 or None disables the cap.
@@ -1386,6 +1475,7 @@ def run_ffmpeg(cmd: list[str], duration_seconds: float, *,
             proc, duration_seconds, timeout_seconds, start,
             label=label, stall_seconds=stall_seconds,
             source_fps=source_fps,
+            bloat_checker=bloat_checker,
         )
         if should_kill:
             proc.kill()

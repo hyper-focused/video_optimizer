@@ -165,13 +165,20 @@ the dry-run first if you want to see what would happen:
 ### Encode only one resolution tier
 
 ```bash
-./video_optimizer.py UHD /mnt/nas/media/Movies        # 4K only
-./video_optimizer.py HD  /mnt/nas/media/Movies        # 1080p / 720p
-./video_optimizer.py SD  /mnt/nas/media/Movies        # below 720p
+./video_optimizer.py UHD      /mnt/nas/media/Movies   # 4K, CQ 15 (archive-grade)
+./video_optimizer.py UHD-CQ21 /mnt/nas/media/Movies   # 4K, CQ 21 (looser; for grain-dominated film)
+./video_optimizer.py HD       /mnt/nas/media/Movies   # 1080p / 720p
+./video_optimizer.py SD       /mnt/nas/media/Movies   # below 720p
 ```
 
 Useful when UHD is taking ~1h/file and you want HD's quicker batch first,
 or when you've already done UHD and want to clean up the rest.
+
+**`UHD-CQ21`** is for grain-heavy older films at UHD (Princess Bride, etc.)
+where the default UHD CQ over-allocates bits to grain and produces an
+output near or larger than the source. You usually don't need to invoke
+this manually — the default `UHD` preset includes a bloat fallback that
+detects this mid-encode and retries at CQ 21 automatically.
 
 ### Test on a few files first
 
@@ -308,6 +315,7 @@ from `--help` for tidiness, but functional.
 | `<bare path>` | Implicit `optimize` (all three tiers) |
 | `optimize PATH` | Explicit form of the above |
 | `SD PATH` / `HD PATH` / `UHD PATH` | Same pipeline, single tier |
+| `UHD-CQ21 PATH` | UHD tier at CQ 21 — for grain-dominated older film where the default CQ bloats |
 | `wizard` | Interactive prompts → full pipeline |
 | `cleanup` | Remove originals from the most recent (or `--run N`) successful run |
 | `doctor` | Preflight checks: ffmpeg, encoders, GPU device, db |
@@ -347,8 +355,9 @@ clobber existing work." Out of the box, it will not encode:
 - Files with the `REENCODE` token in their own filename
 - Files that have hit the encoder watchdog twice (chronic stalls — see
   `replace-list` for the manual-action queue)
-- Dolby Vision sources (see below — most are skipped today; planned
-  default flips to "strip the DV layer, encode as HDR10")
+- Dolby Vision **Profile 5** sources (no clean HDR10 fallback). Profile 7
+  and Profile 8 sources are admitted; the apply layer strips the DV
+  metadata and encodes the HDR10 base layer to AV1.
 
 Each skip class has an `--allow-*` opt-in flag if you genuinely want to
 re-encode those files anyway.
@@ -357,33 +366,33 @@ re-encode those files anyway.
 
 ## Dolby Vision
 
-DV sources are the awkward case. `av1_qsv` consistently wedges on them
-(Profile 7 stalls at frame 0; Profile 8 stalls partway through), so the
-tool currently skips DV at plan time. The plan is to strip the DV layer
-and encode the source as plain HDR10 — most modern UHD content has an
-HDR10-compatible base layer underneath the DV metadata, so this is a
-clean fallback that preserves the wide colour gamut and high luma range
-without losing any image data the player can use today.
+`av1_qsv` consistently wedges on DV sources (Profile 7 stalls at frame
+0; Profile 8 stalls partway through). The fix is to strip the DV
+metadata before encoding so what reaches `av1_qsv` is a plain HDR10
+stream — most modern UHD content has an HDR10-compatible base layer
+underneath the DV metadata, so this preserves the wide colour gamut and
+high luma range without losing any image data the player can use today.
 
-| DV Profile | Default behavior (planned) | Why |
+| DV Profile | Default behavior | Why |
 |---|---|---|
-| **Profile 8.x** (most modern UHD WEB-DLs and recent Blu-rays) | Strip DV RPU via `dovi_rpu=strip`, encode the HDR10 base layer to AV1 | Base layer is already HDR10-compatible; strip is a one-pass bitstream operation |
-| **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement layers) | Convert P7 → P8 via `dovi_tool` first, then strip + encode | Plain strip leaves orphan enhancement layer NALs that confuse the encoder; `dovi_tool convert -m 2` flattens them |
+| **Profile 8.x** (most modern UHD WEB-DLs and recent Blu-rays) | Strip DV RPU via ffmpeg's `dovi_rpu=strip=true` bitstream filter, encode the HDR10 base layer to AV1 | Base layer is already HDR10-compatible; strip is a one-pass bsf operation |
+| **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement layers) | Same RPU strip as P8 by default. The P7→P8 `dovi_tool convert` pipeline is preserved but opt-in via `--dv-p7-convert` | The simple strip path works on most modern P7 sources and keeps the apply pipeline single-pass. The conversion pipeline remains available for stubborn P7 sources where strip-only fails |
 | **Profile 5** (Apple TV+, some Vudu) | Skip permanently | Base layer is *not* HDR10 — it's a custom DV-only colour space that requires the RPU to map. Stripping leaves a green/over-saturated mess; no clean HDR10 fallback exists |
 
-**Profile 10 (DV preserved through AV1)** — the bleeding-edge approach
-of carrying DV metadata through into the AV1 output as Profile 10
-OBU side-data — is on the radar but not the default. It depends on
-`dovi_tool inject-rpu`'s AV1 support and on player ecosystems
-recognising the resulting Profile 10 stream. We'll revisit when the
-tooling stabilises and Plex/PMS / shield TVs / other players have
-mainstream Profile 10 support.
+**`--dv-p7-convert`** runs the multi-stage P7 → P8 conversion using
+`dovi_tool convert --discard` followed by `mkvmerge` to re-mux the
+stripped raw HEVC bitstream with the original audio and subtitles.
+Requires both `dovi_tool` and `mkvmerge` on `PATH` (see Install section);
+the apply gate fails closed if either is missing rather than silently
+falling back. Reach for it only when a specific P7 source fails the
+strip-only attempt.
 
-**Current state**: the strip path isn't wired into the apply pipeline
-yet — DV sources still get skipped via the `dv` plan-gate verdict. The
-above table describes the planned default. Until the strip lands, the
-manual recipes from the conversation logs are the workaround for users
-who want to re-encode a specific DV title.
+**Profile 10 (DV preserved through AV1)** — carrying DV metadata into
+the AV1 output as Profile 10 OBU side-data — is on the radar but not
+the default. It depends on `dovi_tool inject-rpu`'s AV1 support and on
+player ecosystems recognising the resulting Profile 10 stream. We'll
+revisit when tooling stabilises and Plex / Shield / other players have
+mainstream Profile 10 support.
 
 ---
 
