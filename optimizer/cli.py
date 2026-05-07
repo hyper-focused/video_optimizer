@@ -1570,27 +1570,44 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
     return "applied", int(actual_mb * 1024 * 1024)
 
 
+def _bloat_check_applies(pr: ProbeResult, args: argparse.Namespace) -> bool:
+    """Shared precondition for both the mid-encode bloat checker and
+    the post-encode bloat retry. Both call this; the post-encode path
+    additionally checks the actual output-vs-source size ratio after
+    these gates pass.
+
+    Triggers when *all* of these are true:
+      - Auto-relax is enabled (default; --no-auto-relax-cq disables).
+      - We have not already retried this file (one retry cap).
+      - Source is UHD (height >= 1440). 1080p AV1 occasionally bloats
+        relative to over-bitrated h264, but the storage delta isn't
+        worth a doubled encode budget there.
+      - The current CQ is tighter than the relaxed CQ — otherwise the
+        retry would re-run with the same (or looser) settings.
+      - We know the source size (sanity for the projection math).
+    """
+    if not getattr(args, "auto_relax_cq", True):
+        return False
+    if getattr(args, "_cq_retried", False):
+        return False
+    if pr.height < 1440:
+        return False
+    cur_cq = getattr(args, "quality", None)
+    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
+        return False
+    if not pr.size:
+        return False
+    return True
+
+
 def _maybe_make_bloat_checker(pr: ProbeResult, output_path: Path,
                               args: argparse.Namespace,
                               ) -> "encoder._BloatChecker | None":
-    """Build a mid-encode bloat checker if the same gates apply as the
-    post-encode check, otherwise None.
-
-    Same predicate logic as `_should_retry_for_bloat` (UHD source,
-    auto-relax enabled, current CQ < relaxed, not already retried) but
-    runs before the encode rather than after — so we can kill ffmpeg
-    early instead of waiting for it to finish a doomed encode.
-    """
-    if not getattr(args, "auto_relax_cq", True):
-        return None
-    if getattr(args, "_cq_retried", False):
-        return None
-    if pr.height < 1440:
-        return None
-    cur_cq = getattr(args, "quality", None)
-    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
-        return None
-    if not pr.size:
+    """Build a mid-encode bloat checker if the gates apply, otherwise
+    None. Same precondition as the post-encode `_should_retry_for_bloat`
+    check but runs before the encode rather than after, so a doomed
+    encode is killed early instead of running to completion."""
+    if not _bloat_check_applies(pr, args):
         return None
     return encoder._BloatChecker(  # noqa: SLF001
         source_size=pr.size,
@@ -1646,9 +1663,9 @@ def _unlink_partial_output(path: Path) -> None:
     encode-failure cleanup deletes it before marking the row failed. None
     of those callers can do anything useful if unlink itself fails — and
     the next run's plan-gate will catch a stale orphan via the
-    `existing_output` check anyway."""
-    if not path.exists():
-        return
+    `existing_output` check anyway. Unconditional unlink + ignore
+    OSError covers both "file missing" (FileNotFoundError) and
+    "couldn't unlink" without a separate exists() pre-check."""
     try:
         path.unlink()
     except OSError:
@@ -1659,26 +1676,12 @@ def _should_retry_for_bloat(pr: ProbeResult, output_path: Path,
                             args: argparse.Namespace) -> bool:
     """Decide whether to throw the encode away and retry at relaxed CQ.
 
-    Triggers when *all* of these are true:
-      - Auto-relax is enabled (default; --no-auto-relax-cq disables).
-      - We have not already retried this file (one retry cap).
-      - Source is UHD (height >= 1440). 1080p AV1 occasionally bloats
-        relative to over-bitrated h264, but the storage delta isn't
-        worth a doubled encode budget there.
-      - The current CQ is tighter than the relaxed CQ — otherwise the
-        retry would re-run with the same (or looser) settings.
-      - Output size >= source size * BLOAT_RATIO_THRESHOLD.
+    Shared `_bloat_check_applies` gates plus the actual output-vs-source
+    ratio check. The mid-encode `_BloatChecker` covers the same gates
+    but takes a projection-based decision; this is the post-encode
+    belt-and-braces check on the finished file size.
     """
-    if not getattr(args, "auto_relax_cq", True):
-        return False
-    if getattr(args, "_cq_retried", False):
-        return False
-    if pr.height < 1440:
-        return False
-    cur_cq = getattr(args, "quality", None)
-    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
-        return False
-    if not pr.size:
+    if not _bloat_check_applies(pr, args):
         return False
     return _safe_stat_size(output_path) >= pr.size * BLOAT_RATIO_THRESHOLD
 
@@ -2587,10 +2590,7 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
                          error=f"validation: {err}",
                          run_id=run_id, expected_path=pr.path)
         return 0.0
-    try:
-        out_size = output_path.stat().st_size
-    except OSError:
-        out_size = 0
+    out_size = _safe_stat_size(output_path)
     actual_mb = (pr.size - out_size) / (1024 * 1024)
 
     if args.mode == "beside":
