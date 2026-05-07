@@ -202,7 +202,7 @@ class CmdApplyBesideE2ETests(unittest.TestCase):
                 )
 
             def fake_execute(db, dec, pr, cmd, desc, output_path,
-                             args, label=""):
+                             args, label="", **_kw):
                 """Stand-in for the real ffmpeg invocation: write a
                 small output file, finalise via the real `_finalize_output`,
                 return the same shape as `_execute_encode`."""

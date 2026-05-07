@@ -1206,6 +1206,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         label = f"[{idx}/{total}] {Path(pr.path).name}: "
         status, saved = _execute_encode(
             db, dec, pr, cmd, desc, output_path, args, label,
+            encode_probe=encode_probe,
         )
         if status != "bloat_retry":
             return status, saved
@@ -1231,6 +1232,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
             )
             return _execute_encode(
                 db, dec, pr, retry_cmd, retry_desc, output_path, args, label,
+                encode_probe=encode_probe,
             )
         finally:
             args.quality = original_cq
@@ -1508,8 +1510,21 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
 def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                     cmd: list[str], desc: str, output_path: Path,
                     args: argparse.Namespace,
-                    label: str = "") -> tuple[str, int]:
-    """Run ffmpeg, finalise the output path, update the decision row."""
+                    label: str = "",
+                    encode_probe: ProbeResult | None = None,
+                    ) -> tuple[str, int]:
+    """Run ffmpeg, finalise the output path, update the decision row.
+
+    `encode_probe` (when set) is the probe of the file ffmpeg actually
+    reads — different from `pr` only when DV strip pre-pass produced a
+    smaller intermediate (RPU stripped + alternate audio/sub streams
+    pre-discarded). The bloat math compares output size against the
+    encoder's *input* size (the stripped intermediate), not the
+    original source — otherwise a heavy-multi-track source can pass
+    the bloat check just because audio stripping shrank the
+    denominator, masking the case where the encoder didn't actually
+    compress the video. Falls back to `pr` when no DV prep ran.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"    {desc} → {output_path}")
     if args.verbose:
@@ -1517,7 +1532,11 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
         timeout_label = "disabled" if timeout in (None, 0) else f"{timeout}s"
         print(f"    timeout: {timeout_label}")
 
-    bloat_checker = _maybe_make_bloat_checker(pr, output_path, args)
+    # The bloat math operates on the encoder's input file. When DV
+    # strip ran, that's the stripped intermediate; otherwise it's the
+    # original source.
+    bloat_pr = encode_probe if encode_probe is not None else pr
+    bloat_checker = _maybe_make_bloat_checker(bloat_pr, output_path, args)
     ok, err = _run_encode_ffmpeg(
         cmd, pr, args, label=label, bloat_checker=bloat_checker,
     )
@@ -1552,14 +1571,17 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
         return "failed", 0
 
     # Post-encode bloat check (UHD only, before any disposal). If the
-    # output is nearly as big as the source, we throw it away and let
-    # the caller retry at a looser CQ. Must happen before _finalize_output
-    # so replace mode hasn't moved the source to recycle yet.
-    if _should_retry_for_bloat(pr, output_path, args):
+    # output is nearly as big as the encoder's input, we throw it
+    # away and let the caller retry at a looser CQ. Compare against
+    # `bloat_pr` (the stripped intermediate when DV prep ran), not
+    # `pr` — see the docstring for why. Must happen before
+    # _finalize_output so replace mode hasn't moved the source to
+    # recycle yet.
+    if _should_retry_for_bloat(bloat_pr, output_path, args):
         out_size = _safe_stat_size(output_path)
-        ratio = out_size / pr.size if pr.size else 0
+        ratio = out_size / bloat_pr.size if bloat_pr.size else 0
         print(f"    bloat detected: output {out_size / 1024 ** 3:.2f} GB "
-              f"vs source {pr.size / 1024 ** 3:.2f} GB "
+              f"vs encoder input {bloat_pr.size / 1024 ** 3:.2f} GB "
               f"(ratio {ratio:.2f}); retrying at CQ {RELAXED_UHD_CQ} "
               f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
               flush=True)

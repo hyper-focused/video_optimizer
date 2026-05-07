@@ -261,7 +261,7 @@ class ApplyOneRetryTests(unittest.TestCase):
                 seen: list[tuple[int, str | None]] = []
 
                 def fake_execute(_db, _dec, _pr, _cmd, _desc,
-                                 _out, args_, _label):
+                                 _out, args_, _label, **_kw):
                     seen.append((args_.quality,
                                  getattr(args_, "encoder_preset", None)))
                     if len(seen) == 1:
@@ -494,6 +494,117 @@ class ExecuteEncodeMidEncodeBloatTests(unittest.TestCase):
                     "SELECT status FROM decisions WHERE id = ?", (dec_id,),
                 ).fetchone())
             self.assertEqual(final["status"], "pending")
+
+
+class BloatChecksAgainstEncoderInputTests(unittest.TestCase):
+    """When DV strip pre-trims audio/sub streams, the encoder reads
+    a smaller intermediate file than the original source. The bloat
+    check must compare output size against that *encoder input*, not
+    the original source — otherwise heavy-multi-track sources can
+    pass the bloat threshold simply because audio stripping shrank
+    the denominator, masking the case where the encoder didn't
+    actually compress the video.
+    """
+
+    def test_post_encode_bloat_uses_encode_probe_size_not_pr_size(self):
+        """SPR-shaped scenario: original 100 GB (with ~10 GB of audio
+        we'd discard), stripped intermediate 90 GB, encoder output
+        88 GB. Vs original (100 GB): ratio 0.88, would NOT trip the
+        0.95 threshold. Vs stripped (90 GB): ratio 0.978, WOULD trip
+        the threshold. The bloat check must use the stripped size."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "src.mkv"
+            source.write_bytes(b"x" * 1024)
+            output = tmp_path / "src.AV1.REENCODE.mkv"
+            output.write_bytes(b"y" * 88_000)  # 88 KB stand-in for 88 GB
+
+            # `pr` reflects the original source (100 KB stand-in for 100 GB).
+            pr = make_probe(height=2160)
+            pr.path = str(source)
+            pr.size = 100_000
+
+            # `encode_probe` reflects the stripped intermediate
+            # (90 KB stand-in for 90 GB).
+            encode_probe = make_probe(height=2160)
+            encode_probe.path = str(source) + ".dv-prepped.mkv"
+            encode_probe.size = 90_000
+
+            db_path = tmp_path / "state.db"
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("apply", None, {})
+                dec_id = db.insert_pending_decision(
+                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
+                    run_id=run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?", (dec_id,),
+                ).fetchone())
+
+                args = _args()
+                args._apply_run_id = run_id  # noqa: SLF001
+
+                # ffmpeg "succeeds" (no kill); the post-encode size
+                # check decides whether to retry.
+                with patch.object(cli_mod.encoder, "run_ffmpeg",
+                                  return_value=(True, "")):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        status, _ = cli_mod._execute_encode(
+                            db, row, pr, ["ffmpeg"], "encode (stub)",
+                            output, args, "test: ",
+                            encode_probe=encode_probe,
+                        )
+
+            # The bloat check should fire (output 88K / encode_probe
+            # 90K = 0.978 ratio, > 0.95 threshold) — even though
+            # vs `pr` (100K) the ratio is only 0.88 and would have
+            # passed.
+            self.assertEqual(status, "bloat_retry")
+            self.assertIn("encoder input", buf.getvalue())
+
+    def test_no_dv_prep_falls_back_to_pr_size(self):
+        """When no DV prep ran, encode_probe is None at the
+        _execute_encode boundary, so the bloat check naturally
+        falls back to pr.size — same behaviour as before this fix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "src.mkv"
+            source.write_bytes(b"x" * 1024)
+            output = tmp_path / "src.AV1.REENCODE.mkv"
+            output.write_bytes(b"y" * 96_000)  # ratio 0.96 vs 100K source
+
+            pr = make_probe(height=2160)
+            pr.path = str(source)
+            pr.size = 100_000
+
+            db_path = tmp_path / "state.db"
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("apply", None, {})
+                dec_id = db.insert_pending_decision(
+                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
+                    run_id=run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?", (dec_id,),
+                ).fetchone())
+
+                args = _args()
+                args._apply_run_id = run_id  # noqa: SLF001
+
+                with patch.object(cli_mod.encoder, "run_ffmpeg",
+                                  return_value=(True, "")):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        status, _ = cli_mod._execute_encode(
+                            db, row, pr, ["ffmpeg"], "encode (stub)",
+                            output, args, "test: ",
+                        )
+
+            # 0.96 vs pr.size 100_000 trips the 0.95 threshold.
+            self.assertEqual(status, "bloat_retry")
 
 
 class BloatThresholdSanityTests(unittest.TestCase):
