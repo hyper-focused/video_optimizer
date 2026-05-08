@@ -39,7 +39,7 @@ from tests._fixtures import make_probe
 
 def _args(**overrides) -> argparse.Namespace:
     ns = argparse.Namespace(
-        mode="beside",
+        mode="keep",
         quality=15,
         auto_relax_cq=True,
         verbose=False,

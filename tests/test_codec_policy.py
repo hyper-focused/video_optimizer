@@ -215,7 +215,7 @@ class PlanGateSdTests(_GateTestBase):
 
 
 class PlanGateExistingOutputTests(_GateTestBase):
-    """A source with an AV1 REENCODE sibling is skipped (beside-mode prior run).
+    """A source with an AV1 REENCODE sibling is skipped (keep-mode prior run).
 
     This is the load-bearing test for the bug that re-encoded 47 Ronin
     overnight: source filename had no REENCODE marker, but the AV1

@@ -35,7 +35,7 @@ def _args() -> argparse.Namespace:
         auto_relax_cq=True,
         verbose=False,
         timeout=0,
-        mode="beside",
+        mode="keep",
         output_root=None,
         source_root=None,
         rewrite_codec=True,

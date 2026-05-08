@@ -1,7 +1,7 @@
-"""Beside output mode (`--mode beside`): write next to source, never
+"""Keep output mode (`--mode keep`): write next to source, never
 touch the original.
 
-Beside mode was added in CLI v2 phase 1 to replace the old "side mode
+Keep mode was added in CLI v2 phase 1 to replace the old "side mode
 into a parallel directory" default for the friendly `optimize` command.
 The contract:
 
@@ -12,12 +12,12 @@ The contract:
   * `_finalize_output` does *not* recycle, back up, or unlink the
     source — the original stays untouched and the operator (or a
     follow-up `cleanup --run N` command) decides when to remove it.
-  * `cmd_apply` rejects the combination of ``--mode beside`` and
+  * `cmd_apply` rejects the combination of ``--mode keep`` and
     ``--output-root`` because the latter is meaningless without `side`.
 
 These tests pin all three behaviors. The end-to-end test patches
 `encoder.select_encoder` and `_execute_encode` so no real ffmpeg runs;
-it only verifies that `cmd_apply` plumbs the beside contract end-to-end
+it only verifies that `cmd_apply` plumbs the keep contract end-to-end
 (source untouched, output recorded, decision marked completed).
 """
 
@@ -43,15 +43,15 @@ from optimizer.db import Database
 from tests._fixtures import make_probe
 
 
-def _beside_args(**overrides) -> argparse.Namespace:
+def _keep_args(**overrides) -> argparse.Namespace:
     """Build a Namespace that satisfies _compute_output_path / _finalize_output.
 
-    Default knobs match what the v2 `optimize` wizard sets for beside
+    Default knobs match what the v2 `optimize` wizard sets for keep
     mode: rewrite_codec + reencode_tag on (so the output stem differs
     from the source stem), no side-mode roots.
     """
     ns = argparse.Namespace(
-        mode="beside",
+        mode="keep",
         output_root=None,
         source_root=None,
         rewrite_codec=True,
@@ -67,13 +67,13 @@ def _beside_args(**overrides) -> argparse.Namespace:
     return ns
 
 
-class ComputeOutputPathBesideTests(unittest.TestCase):
+class ComputeOutputPathKeepTests(unittest.TestCase):
     """`_compute_output_path` writes to the source's parent directory."""
 
     def test_output_is_sibling_of_source(self):
         pr = make_probe()
         pr.path = "/movies/foo.mkv"
-        out = _compute_output_path(pr, _beside_args(), "av1+mkv")
+        out = _compute_output_path(pr, _keep_args(), "av1+mkv")
         self.assertEqual(out.parent, Path("/movies"))
 
     def test_collision_safe_filename_when_extensions_match(self):
@@ -83,7 +83,7 @@ class ComputeOutputPathBesideTests(unittest.TestCase):
         directory is shared."""
         pr = make_probe()
         pr.path = "/movies/foo.mkv"
-        out = _compute_output_path(pr, _beside_args(), "av1+mkv")
+        out = _compute_output_path(pr, _keep_args(), "av1+mkv")
 
         self.assertNotEqual(out, Path(pr.path))
         self.assertEqual(out.parent, Path(pr.path).parent)
@@ -92,12 +92,12 @@ class ComputeOutputPathBesideTests(unittest.TestCase):
     def test_nested_path_keeps_directory(self):
         pr = make_probe()
         pr.path = "/data/library/Movies/Foo (2020)/Foo (2020).mkv"
-        out = _compute_output_path(pr, _beside_args(), "av1+mkv")
+        out = _compute_output_path(pr, _keep_args(), "av1+mkv")
         self.assertEqual(out.parent, Path(pr.path).parent)
         self.assertEqual(out.name, "Foo.(2020).AV1.REENCODE.mkv")
 
 
-class FinalizeOutputBesideTests(unittest.TestCase):
+class FinalizeOutputKeepTests(unittest.TestCase):
     """`_finalize_output` records the encode without touching the original."""
 
     def test_source_and_output_both_remain_after_finalize(self):
@@ -127,19 +127,19 @@ class FinalizeOutputBesideTests(unittest.TestCase):
                     (dec_id,),
                 ).fetchone())
 
-                args = _beside_args()
+                args = _keep_args()
                 args._apply_run_id = run_id  # noqa: SLF001
 
                 # Stub the post-encode ffprobe validation; the test's
                 # fake output is a tiny zero-content file that wouldn't
                 # pass duration-match against the synthetic 7200s probe,
                 # but the test is about the no-touch contract for
-                # beside mode, not about validation behavior itself.
+                # keep mode, not about validation behavior itself.
                 with patch.object(cli_mod.encoder, "validate_output",
                                   return_value=(True, "")):
                     actual_mb = _finalize_output(pr, output, args, db, row)
 
-            # Source and output both still on disk — beside never
+            # Source and output both still on disk — keep never
             # disposes of the original.
             self.assertTrue(source.exists())
             self.assertTrue(output.exists())
@@ -158,12 +158,12 @@ class FinalizeOutputBesideTests(unittest.TestCase):
 
 
 class CmdApplyValidationTests(unittest.TestCase):
-    """`cmd_apply` rejects --mode beside paired with --output-root."""
+    """`cmd_apply` rejects --mode keep paired with --output-root."""
 
-    def test_beside_with_output_root_is_rejected(self):
+    def test_keep_with_output_root_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
-                mode="beside",
+                mode="keep",
                 output_root=Path(tmp) / "outroot",
                 source_root=None,
                 backup=None,
@@ -177,14 +177,14 @@ class CmdApplyValidationTests(unittest.TestCase):
             with redirect_stderr(buf):
                 rc = cmd_apply(args)
             self.assertEqual(rc, 2)
-            self.assertIn("--mode beside", buf.getvalue())
+            self.assertIn("--mode keep", buf.getvalue())
             self.assertIn("--output-root", buf.getvalue())
 
 
-class CmdApplyBesideE2ETests(unittest.TestCase):
+class CmdApplyKeepE2ETests(unittest.TestCase):
     """Run cmd_apply with `_execute_encode` stubbed: source must remain."""
 
-    def test_beside_apply_leaves_originals_untouched(self):
+    def test_keep_apply_leaves_originals_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "foo.mkv"
@@ -214,7 +214,7 @@ class CmdApplyBesideE2ETests(unittest.TestCase):
                 return "applied", int(actual_mb * 1024 * 1024)
 
             args = argparse.Namespace(
-                mode="beside",
+                mode="keep",
                 output_root=None,
                 source_root=None,
                 backup=None,
@@ -254,13 +254,13 @@ class CmdApplyBesideE2ETests(unittest.TestCase):
                     rc = cmd_apply(args)
 
             self.assertEqual(rc, 0)
-            # Source must still exist — beside mode never disposes of
+            # Source must still exist — keep mode never disposes of
             # the original.
             self.assertTrue(source.exists())
             expected_output = tmp_path / "foo.AV1.REENCODE.mkv"
             self.assertTrue(expected_output.exists())
 
-            # The decision row should be completed with the beside path.
+            # The decision row should be completed with the keep path.
             with sqlite3.connect(str(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 row = dict(conn.execute(

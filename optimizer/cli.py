@@ -196,7 +196,7 @@ def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
     """Attach apply-mode flags governing confirmation, output layout, limits."""
     ap.add_argument("--auto", action="store_true",
                     help="Skip per-file confirmation.")
-    ap.add_argument("--mode", choices=["beside", "side", "replace"],
+    ap.add_argument("--mode", choices=["keep", "side", "replace"],
                     default="side")
     ap.add_argument("--output-root", type=Path,
                     help="Required for --mode side. Mirrored output tree.")
@@ -373,24 +373,24 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
     flags are SUPPRESSed but functional.
     """
     p.add_argument("path", type=Path, help=path_help)
-    p.add_argument("--mode", choices=["beside", "side", "replace"],
+    p.add_argument("--mode", choices=["keep", "side", "replace"],
                    default=None,
-                   help="Output mode. 'beside' writes alongside the source "
+                   help="Output mode. 'keep' writes alongside the source "
                         "and leaves originals untouched (default when "
-                        "neither --output nor --in-place is set). 'side' "
+                        "neither --output nor --replace is set). 'side' "
                         "mirrors output into a separate tree (--output). "
                         "'replace' writes alongside originals and moves "
-                        "the originals into a recycle directory (--in-place).")
+                        "the originals into a recycle directory (--replace).")
     out = p.add_mutually_exclusive_group()
     out.add_argument("--output", type=Path, metavar="DIR",
                      help="Side mode: write new files under DIR mirroring "
                           "PATH's structure. Originals are untouched.")
-    out.add_argument("--in-place", action="store_true",
+    out.add_argument("--replace", action="store_true",
                      help="Replace mode: write new files alongside originals "
                           "and move the originals into a recycle directory "
                           "(see --recycle-to).")
     p.add_argument("--recycle-to", type=Path, default=None, metavar="DIR",
-                   help="With --in-place: recycle directory for displaced "
+                   help="With --replace: recycle directory for displaced "
                         "originals. If omitted, an existing @Recycle / "
                         "#recycle / .Trash under PATH is used; otherwise "
                         "<PATH>/.@Recycle is created.")
@@ -449,9 +449,9 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
             "Run scan, plan, and apply against PATH in a single command, "
             "chaining the UHD, HD, and SD presets so every supported "
             "resolution band is covered. The default output mode is "
-            "'beside': new files land alongside the source and originals "
+            "'keep': new files land alongside the source and originals "
             "stay untouched (see the `cleanup` subcommand for removing "
-            "them). Pass --output DIR for a mirrored tree, or --in-place "
+            "them). Pass --output DIR for a mirrored tree, or --replace "
             "to recycle originals as the run proceeds."
         ),
     )
@@ -674,7 +674,7 @@ def _is_reencoded_filename(path: str) -> bool:
 
     Matches the `REENCODE` token inserted by `--reencode-tag` (case
     insensitive, word-boundary). Used to keep the plan gate from queueing
-    a file we've already processed — without this, an in-place run that
+    a file we've already processed — without this, a replace run that
     chose a non-deletable disposal mode (recycle / backup) would surface
     its own outputs back into a future plan and re-encode them, doubling
     the marker (`...AV1.REENCODE.REENCODE.mkv`) and burning hours.
@@ -706,7 +706,7 @@ def _path_under(candidate: str, root: Path) -> bool:
 def _existing_reencode_sibling(src_path: str) -> Path | None:
     """Return the path of an existing AV1 REENCODE sibling, or None.
 
-    Catches the beside-mode blind spot: when an HEVC/h.264 source has
+    Catches the keep-mode blind spot: when an HEVC/h.264 source has
     already been encoded to AV1 (output sitting next to it as
     `<stem-without-codec-tokens>.AV1.REENCODE.mkv`), a fresh scan that
     re-probes the source still admits it to the plan because the
@@ -751,7 +751,7 @@ def _plan_probe_gate(db: Database, pr,
                      prior run); skipped permanently unless caller passes
                      allow_reencoded=True (`plan --allow-reencoded`).
       "existing_output" — a sibling `.AV1.REENCODE.mkv` already exists
-                     next to the source (beside-mode prior-run output).
+                     next to the source (keep-mode prior-run output).
                      Skipped to avoid overwriting it with a fresh encode;
                      allow_reencoded=True overrides (re-uses the same
                      "I want to re-run already-processed files" gate).
@@ -976,9 +976,9 @@ def _validate_apply_args(args: argparse.Namespace) -> int:
     if args.mode == "side" and not args.output_root:
         print("error: --mode side requires --output-root", file=sys.stderr)
         return 2
-    if args.mode == "beside" and getattr(args, "output_root", None):
-        print("error: --mode beside is incompatible with --output-root "
-              "(beside writes alongside the source)", file=sys.stderr)
+    if args.mode == "keep" and getattr(args, "output_root", None):
+        print("error: --mode keep is incompatible with --output-root "
+              "(keep writes alongside the source)", file=sys.stderr)
         return 2
     if args.backup and getattr(args, "recycle_to", None):
         print("error: --backup and --recycle-to are mutually exclusive "
@@ -1929,7 +1929,7 @@ _RECYCLE_DIR_NAMES: tuple[str, ...] = ("@Recycle", ".@Recycle", "#recycle", ".Tr
 
 
 def _resolve_recycle_dir(path: Path, override: Path | None) -> Path:
-    """Return the recycle directory to use for `optimize --in-place`.
+    """Return the recycle directory to use for `optimize --replace`.
 
     Resolution order: explicit override > existing recycle-named directory
     inside `path` > newly created `path/.@Recycle`. The new dir is created
@@ -1953,18 +1953,18 @@ def _optimize_resolve_paths(
 ) -> tuple[str, Path | None, Path, Path | None] | int:
     """Return (mode, output_root, source_root, recycle_to) or an exit code.
 
-    mode is one of "beside", "side", "replace". Resolution order:
-    explicit --mode wins; else --in-place → replace; else --output → side;
-    else default to beside.
+    mode is one of "keep", "side", "replace". Resolution order:
+    explicit --mode wins; else --replace → replace; else --output → side;
+    else default to keep.
     """
     if args.mode is not None:
         mode = args.mode
-    elif args.in_place:
+    elif args.replace:
         mode = "replace"
     elif args.output is not None:
         mode = "side"
     else:
-        mode = "beside"
+        mode = "keep"
 
     if mode == "replace":
         # Single-file source: resolve recycle/source-root against the
@@ -1982,14 +1982,14 @@ def _optimize_resolve_paths(
                   file=sys.stderr)
             return 2
         return (mode, args.output, args.path, None)
-    # beside
+    # keep
     if args.recycle_to is not None:
         print("error: --recycle-to only applies to --mode replace",
               file=sys.stderr)
         return 2
     if args.output is not None:
-        print("error: --mode beside is incompatible with --output "
-              "(beside writes alongside the source)", file=sys.stderr)
+        print("error: --mode keep is incompatible with --output "
+              "(keep writes alongside the source)", file=sys.stderr)
         return 2
     return (mode, None, args.path, None)
 
@@ -2159,7 +2159,7 @@ def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
     (optimize, SD, HD, UHD, plus the bare-path rewrite). The user
     picked a path-taking subcommand → they want auto-yes encoding
     against the source they pointed at. --confirm opts back into
-    per-file prompts; --output/--in-place/--mode opts out of beside.
+    per-file prompts; --output/--replace/--mode opts out of keep.
 
     The bare-invocation sentinel (`--bare-invocation`) additionally
     flips verbose on; that's the one place where we infer the user
@@ -2167,8 +2167,8 @@ def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
     """
     if not args.auto:
         args.auto = True
-    if args.mode is None and not args.in_place and args.output is None:
-        args.mode = "beside"
+    if args.mode is None and not args.replace and args.output is None:
+        args.mode = "keep"
     if getattr(args, "bare_invocation", False) and not args.verbose:
         args.verbose = True
 
@@ -2182,10 +2182,10 @@ def _print_pipeline_banner(
 ) -> None:
     """Print the `==> <label>:` header for a path-taking pipeline run."""
     print(f"==> {label}: {args.path}")
-    if mode == "beside":
-        print("    output mode: beside (alongside source; originals untouched)")
+    if mode == "keep":
+        print("    output mode: keep (alongside source; originals untouched)")
     elif mode == "replace":
-        print("    output mode: replace (in-place)")
+        print("    output mode: replace (originals moved to recycle)")
         print(f"    recycle to:  {recycle_to}")
     else:
         print("    output mode: side (mirrored output tree)")
@@ -2467,8 +2467,8 @@ def _compute_output_path(pr: ProbeResult, args: argparse.Namespace,
     if args.mode == "replace":
         return src.with_name(new_name)
 
-    if args.mode == "beside":
-        # beside mode: write next to the source; originals stay put. The
+    if args.mode == "keep":
+        # keep mode: write next to the source; originals stay put. The
         # collision-safety guarantee comes from --rewrite-codec +
         # --reencode-tag producing e.g. foo.AV1.REENCODE.mkv from foo.mkv.
         return src.with_name(new_name)
@@ -2615,8 +2615,8 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
     out_size = _safe_stat_size(output_path)
     actual_mb = (pr.size - out_size) / (1024 * 1024)
 
-    if args.mode == "beside":
-        # beside mode never touches the original — the whole point is that
+    if args.mode == "keep":
+        # keep mode never touches the original — the whole point is that
         # the user (or a follow-up cleanup step) decides when to delete
         # them. Skip every disposal branch and record the success.
         db.mark_decision(dec["id"], "completed",
@@ -2668,7 +2668,7 @@ def _classify_cleanup_decision(dec: dict) -> tuple[str, int, str | None]:
     The 3-check guard:
       (a) decisions.output_path exists on disk,
       (b) output is non-empty (stat().st_size > 0),
-      (c) output_path != source_path (paranoid; beside mode makes them
+      (c) output_path != source_path (paranoid; keep mode makes them
           siblings, not the same).
     Plus a sanity check that the source still exists — a no-op cleanup
     on a vanished source is silent noise we'd rather log explicitly.
@@ -2904,7 +2904,7 @@ def _wizard_pick_mode(
     print("  [3] Replace originals (move them to a recycle directory)")
     choice = _prompt("Choice [1]: ", default="1", choices=["1", "2", "3"])
     if choice == "1":
-        return ("beside", None, None)
+        return ("keep", None, None)
     if choice == "2":
         raw = _prompt("  Output directory: ", default="")
         if not raw:
@@ -2964,7 +2964,7 @@ def _wizard_apply_namespace(
         auto=True,
         mode=mode,
         output=output_root,
-        in_place=(mode == "replace"),
+        replace=(mode == "replace"),
         recycle_to=recycle_to,
         limit=limit,
         dry_run=False,

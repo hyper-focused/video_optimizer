@@ -85,7 +85,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
     # ---- 1. happy-path-with-quit --------------------------------------------
 
     def test_quit_at_summary_does_not_encode(self) -> None:
-        """User picks beside-mode + all-tiers then quits at the all/N/quit prompt."""
+        """User picks keep-mode + all-tiers then quits at the all/N/quit prompt."""
         _, scan, plan, optimize, cleanup, _ = self._patch_handlers()
         # path -> mode 1 -> tier 'a' -> 'q' (quit at limit prompt)
         answers = [str(self.lib), "1", "a", "q"]

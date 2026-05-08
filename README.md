@@ -207,20 +207,20 @@ tuning (CQ 21 + `slow`) automatically.
 ### Encode a single file (Radarr / Sonarr post-processing hook)
 
 ```bash
-./video_optimizer.py "/mnt/nas/media/Movies/Foo (2023)/Foo.mkv" --in-place
+./video_optimizer.py "/mnt/nas/media/Movies/Foo (2023)/Foo.mkv" --replace
 ```
 
-The tool accepts a single video file as the path argument; `--in-place`
+The tool accepts a single video file as the path argument; `--replace`
 moves the original to an auto-detected `@Recycle` directory once the
 encode succeeds. Suitable as a post-import hook from Radarr/Sonarr.
 
 ### Replace originals as you go
 
 ```bash
-./video_optimizer.py /mnt/nas/media/Movies --in-place
+./video_optimizer.py /mnt/nas/media/Movies --replace
 ```
 
-`--in-place` recycles each original (atomically, into
+`--replace` recycles each original (atomically, into
 `<library>/.@Recycle` by default) once its encode completes successfully.
 The file is moved, not deleted — recoverable until you empty the
 recycle directory.
@@ -279,11 +279,11 @@ summarized here.
 
 | Flag | Effect |
 |---|---|
-| _(none)_ | **Default**: `beside` mode — outputs land alongside source as `<stem>.AV1.REENCODE.mkv`; originals untouched |
+| _(none)_ | **Default**: `keep` mode — outputs land alongside source as `<stem>.AV1.REENCODE.mkv`; originals untouched |
 | `--output DIR` | Mirror outputs into a separate directory tree under `DIR` |
-| `--in-place` | Replace mode — outputs land alongside source, originals moved to a recycle dir |
-| `--mode {beside,side,replace}` | Explicit mode override |
-| `--recycle-to DIR` | With `--in-place`: explicit recycle directory (default: auto-detect `@Recycle` / `#recycle` / `.Trash` under source, or create `.@Recycle`) |
+| `--replace` | Replace mode — outputs land alongside source, originals moved to a recycle dir |
+| `--mode {keep,side,replace}` | Explicit mode override |
+| `--recycle-to DIR` | With `--replace`: explicit recycle directory (default: auto-detect `@Recycle` / `#recycle` / `.Trash` under source, or create `.@Recycle`) |
 
 ### Run control
 

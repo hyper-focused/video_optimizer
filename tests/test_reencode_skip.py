@@ -1,5 +1,5 @@
 """Plan-time gate: files already tagged REENCODE (this tool's output)
-are skipped permanently to prevent re-encode loops in --in-place runs
+are skipped permanently to prevent re-encode loops in replace runs
 where originals were preserved (recycle / backup) — without the gate,
 the next plan would surface its own outputs as candidates.
 

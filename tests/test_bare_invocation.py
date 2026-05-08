@@ -82,8 +82,8 @@ class PreprocessArgvKnownSubcommandTest(unittest.TestCase):
     def test_preset_subcommand_unchanged(self) -> None:
         # Presets share the dispatcher — `HD` is a subcommand too.
         self.assertEqual(
-            _preprocess_argv(["bin", "HD", "--mode", "beside"]),
-            ["bin", "HD", "--mode", "beside"],
+            _preprocess_argv(["bin", "HD", "--mode", "keep"]),
+            ["bin", "HD", "--mode", "keep"],
         )
 
 
