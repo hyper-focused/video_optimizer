@@ -164,12 +164,23 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
                          "(`-trailer`, `-bts`, `-deleted`, …). Default "
                          "skips them; the crawler also filters extras "
                          "directories at walk time.")
-    pl.add_argument("--allow-hd-hevc", action="store_true",
-                    help="Include HEVC at HD (720..1439) as a re-encode "
-                         "candidate. Default leaves HD HEVC alone — it's "
-                         "already efficient enough that the AV1 savings "
-                         "rarely justify GPU time. Enable for testing or "
-                         "library-wide AV1 consolidation.")
+    pl.add_argument("--allow-low-bitrate", action="store_true",
+                    help="Override the auto-skip for sources whose video "
+                         "bitrate is below the AV1 target for their "
+                         "resolution (1080p < 5 Mbps, 2160p < 16 Mbps, etc.; "
+                         "see BITRATE_FLAG_TABLE in presets.py for the full "
+                         "table). Default skips these — at sub-target source "
+                         "bitrate, AV1 can't yield meaningful savings and may "
+                         "regress perceptual quality.")
+    pl.add_argument("--skip-codecs", default="",
+                    metavar="CODECS",
+                    help="Comma-separated list of source codecs to exclude "
+                         "from the plan (case-insensitive; ffprobe codec "
+                         "names — e.g. `hevc,h264,mpeg2video,vp9`). Sources "
+                         "matching any listed codec are skipped before rule "
+                         "evaluation. Use to opt out of re-encoding codecs "
+                         "you trust (e.g. `--skip-codecs hevc` to leave "
+                         "HEVC libraries alone). Default: empty (no skips).")
     _add_common_db_arg(pl)
 
 
@@ -433,7 +444,9 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
     p.add_argument("--allow-av1", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--allow-extras", action="store_true",
                    help=argparse.SUPPRESS)
-    p.add_argument("--allow-hd-hevc", action="store_true",
+    p.add_argument("--allow-low-bitrate", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--skip-codecs", default="",
                    help=argparse.SUPPRESS)
     p.add_argument("--bare-invocation", action="store_true", default=False,
                    help=argparse.SUPPRESS)
@@ -735,10 +748,32 @@ def _existing_reencode_sibling(src_path: str) -> Path | None:
     return None
 
 
+def _source_below_target_bitrate(pr) -> bool:
+    """True when the source's video bitrate is below the AV1 target for its
+    resolution bucket — re-encoding can't meaningfully save space and risks
+    quality regression on an already-low-bitrate source.
+
+    Threshold comes from BITRATE_FLAG_TABLE's ``target_mbps`` (the bitrate
+    AV1 aims for at this resolution). Sources at or above target are always
+    admitted; sources below it are skipped unless --allow-low-bitrate
+    overrides at the plan layer.
+    """
+    if pr.video_bitrate <= 0:
+        return False
+    bucket = pr.resolution_class
+    entry = BITRATE_FLAG_TABLE.get(bucket)
+    if entry is None:
+        return False
+    target_mbps, _flag_mbps = entry
+    return (pr.video_bitrate / 1_000_000.0) < target_mbps
+
+
 def _plan_probe_gate(db: Database, pr,
                      *, allow_reencoded: bool = False,
                      allow_av1: bool = False,
-                     allow_extras: bool = False) -> str:
+                     allow_extras: bool = False,
+                     allow_low_bitrate: bool = False,
+                     skip_codecs: frozenset[str] | None = None) -> str:
     """Pre-rule filter for one probe.
 
     Returns one of:
@@ -758,6 +793,11 @@ def _plan_probe_gate(db: Database, pr,
       "av1_source" — source codec is AV1; re-encoding is wasteful by
                      default. Caller can pass allow_av1=True to override
                      (`plan --allow-av1`).
+      "skipped_codec" — source codec is in the user-supplied skip set
+                     (e.g. ``--no-hevc``). Default is no skip set.
+      "low_bitrate" — source bitrate is below the AV1 target for its
+                     resolution; re-encoding wouldn't yield meaningful
+                     savings. Override with --allow-low-bitrate.
       "extras"     — filename matches a Plex-style extras suffix
                      (`-trailer`, `-bts`, etc.). Defensive: the crawler
                      normally filters these at walk time, but a probe
@@ -792,8 +832,13 @@ def _plan_probe_gate(db: Database, pr,
         return "reencoded"
     if not allow_reencoded and _existing_reencode_sibling(pr.path) is not None:
         return "existing_output"
-    if not allow_av1 and (pr.video_codec or "").lower() == "av1":
+    codec = (pr.video_codec or "").lower()
+    if not allow_av1 and codec == "av1":
         return "av1_source"
+    if skip_codecs and codec in skip_codecs:
+        return "skipped_codec"
+    if not allow_low_bitrate and _source_below_target_bitrate(pr):
+        return "low_bitrate"
     if not allow_extras and crawler.is_extras_filename(Path(pr.path)):
         return "extras"
     return "ok"
@@ -817,6 +862,12 @@ _PLAN_SKIP_MESSAGES = (
     ("av1_source",      "skipped {n} AV1 sources "
                         "(already at the target codec; pass --allow-av1 "
                         "to re-encode anyway)"),
+    ("skipped_codec",   "skipped {n} sources via --skip-codecs "
+                        "(opted-out codecs; remove from --skip-codecs "
+                        "to re-include)"),
+    ("low_bitrate",     "skipped {n} sources whose video bitrate is below "
+                        "the AV1 target for their resolution "
+                        "(pass --allow-low-bitrate to re-encode anyway)"),
     ("extras",          "skipped {n} extras "
                         "(trailers / BTS / featurettes; pass --allow-extras "
                         "to include them)"),
@@ -835,20 +886,11 @@ def _resolve_enabled_rules(args: argparse.Namespace) -> list[str] | None:
     """Compose the rule-name list for cmd_plan based on flags.
 
     None → RulesEngine uses its default-enabled set (every non-opt-in
-    rule). Otherwise returns an explicit list — either the user's
-    `--rules` override, or the default set extended with whichever
-    opt-in rules have been gated on (`--allow-hd-hevc` for now).
+    rule). Otherwise returns the user's `--rules` override.
     """
     if args.rules:
         return [s.strip() for s in args.rules.split(",")]
-    opt_in_active: list[str] = []
-    if getattr(args, "allow_hd_hevc", False):
-        opt_in_active.append("hd_hevc_opt_in")
-    if not opt_in_active:
-        return None
-    enabled = [n for n, r in rules.RULES.items() if not r.opt_in]
-    enabled.extend(opt_in_active)
-    return enabled
+    return None
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -863,6 +905,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
     allow_reencoded = bool(getattr(args, "allow_reencoded", False))
     allow_av1 = bool(getattr(args, "allow_av1", False))
     allow_extras = bool(getattr(args, "allow_extras", False))
+    allow_low_bitrate = bool(getattr(args, "allow_low_bitrate", False))
+    skip_codecs_raw = getattr(args, "skip_codecs", "") or ""
+    skip_codecs = frozenset(
+        s.strip().lower() for s in skip_codecs_raw.split(",") if s.strip()
+    )
     # Path scope: when a path is supplied (path-pipeline subcommands like
     # SD/HD/UHD/optimize/bare invocation), only probes under that path
     # are eligible for candidate creation. Without this, the plan would
@@ -884,7 +931,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         candidates = []
         counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
                   "av1_source": 0, "extras": 0, "existing_output": 0,
-                  "out_of_scope": 0}
+                  "out_of_scope": 0, "low_bitrate": 0, "skipped_codec": 0}
         # Materialise the probe list so we can mutate the cache (DELETE
         # stale rows) without invalidating the iterator.
         for pr in list(db.iter_probes()):
@@ -894,7 +941,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 continue
             verdict = _plan_probe_gate(
                 db, pr, allow_reencoded=allow_reencoded,
-                allow_av1=allow_av1, allow_extras=allow_extras)
+                allow_av1=allow_av1, allow_extras=allow_extras,
+                allow_low_bitrate=allow_low_bitrate,
+                skip_codecs=skip_codecs)
             if verdict != "ok":
                 counts[verdict] += 1
                 continue
@@ -2127,7 +2176,8 @@ def _run_path_pipeline(args: argparse.Namespace,
         allow_reencoded=False,
         allow_av1=getattr(args, "allow_av1", False),
         allow_extras=getattr(args, "allow_extras", False),
-        allow_hd_hevc=getattr(args, "allow_hd_hevc", False),
+        allow_low_bitrate=getattr(args, "allow_low_bitrate", False),
+        skip_codecs=getattr(args, "skip_codecs", "") or "",
         db=args.db,
     )
     rc = cmd_plan(plan_ns)
@@ -2945,6 +2995,31 @@ def _wizard_pick_tier() -> tuple[str, ...]:
     return ("UHD", "HD", "SD")
 
 
+def _wizard_pick_skip_codecs() -> str:
+    """Prompt for codecs to exclude from the plan. Returns the comma-separated value.
+
+    Default: nothing skipped — the bitrate-floor gate already filters
+    sources too low-bitrate to be worth re-encoding, so opting out by
+    codec is a power-user choice (e.g. "I trust HEVC, leave it alone").
+    """
+    print()
+    print("Are there any source codecs you want to leave alone?")
+    print("  [n] No — re-encode every non-AV1 source                       [default]")
+    print("  [hevc] Skip HEVC sources")
+    print("  [h264] Skip h.264 sources")
+    print("  [other] Enter a custom comma-separated list "
+          "(e.g. `hevc,vp9`)")
+    choice = _prompt("Choice [n]: ", default="n",
+                     choices=["n", "hevc", "h264", "other"])
+    if choice == "n":
+        return ""
+    if choice in ("hevc", "h264"):
+        return choice
+    raw = _prompt("  Codecs to skip (comma-separated, ffprobe names "
+                  "e.g. `hevc,vp9,mpeg2video`): ", default="")
+    return raw.strip()
+
+
 def _wizard_apply_namespace(
     args: argparse.Namespace,
     library: Path,
@@ -2952,6 +3027,7 @@ def _wizard_apply_namespace(
     output_root: Path | None,
     recycle_to: Path | None,
     limit: int,
+    skip_codecs: str = "",
 ) -> argparse.Namespace:
     """Build the Namespace cmd_optimize hands to its preset router.
 
@@ -2979,6 +3055,8 @@ def _wizard_apply_namespace(
         min_size=MIN_PROBE_SIZE_BYTES,
         db=args.db,
         bare_invocation=False,
+        skip_codecs=skip_codecs,
+        allow_low_bitrate=False,
     )
 
 
@@ -2994,7 +3072,8 @@ def _wizard_doctor_preflight(args: argparse.Namespace) -> bool:
     return ans == "y"
 
 
-def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
+def _wizard_run_scan_plan(args: argparse.Namespace, library: Path,
+                          skip_codecs: str = "") -> int:
     """Run scan + plan against `library`. Returns 0 on success, nonzero else."""
     print()
     print(f"==> scan: probing {library}")
@@ -3013,7 +3092,9 @@ def _wizard_run_scan_plan(args: argparse.Namespace, library: Path) -> int:
         cmd="plan", path=library, rules=None,
         target="av1+mkv", json=False,
         keep_langs="en,und", allow_reencoded=False,
-        allow_av1=False, allow_extras=False, allow_hd_hevc=False,
+        allow_av1=False, allow_extras=False,
+        allow_low_bitrate=False,
+        skip_codecs=skip_codecs,
         db=args.db,
     )
     if cmd_plan(plan_ns) != 0:
@@ -3110,7 +3191,9 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
         presets_to_run = _wizard_pick_tier()
 
-        rc = _wizard_run_scan_plan(args, library)
+        skip_codecs = _wizard_pick_skip_codecs()
+
+        rc = _wizard_run_scan_plan(args, library, skip_codecs=skip_codecs)
         if rc != 0:
             return rc
 
@@ -3132,6 +3215,7 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
         apply_ns = _wizard_apply_namespace(
             args, library, mode, output_root, recycle_to, limit,
+            skip_codecs=skip_codecs,
         )
         label = "optimize" if len(presets_to_run) > 1 else presets_to_run[0]
         rc = _run_path_pipeline(apply_ns, presets_to_run, label=label)

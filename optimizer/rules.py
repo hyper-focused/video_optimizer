@@ -33,13 +33,6 @@ _LEGACY_CONTAINERS: frozenset[str] = frozenset({
 _MODERN_CODECS: frozenset[str] = frozenset({"h264", "hevc", "av1", "vp9"})
 
 
-# Codecs older or less efficient than AV1 that benefit from a transcode
-# whenever the source bitrate is at or above the AV1 target bitrate for
-# the file's resolution. h.264 is the dominant case — widely used, still
-# noticeably less efficient than AV1 at matched perceptual quality.
-_INEFFICIENT_CODECS: frozenset[str] = frozenset({"h264"})
-
-
 _MB = 1024.0 * 1024.0
 
 
@@ -52,9 +45,10 @@ class Rule:
     """Base class for rules; subclasses override name and evaluate().
 
     `opt_in=True` rules are excluded from the default-enabled set; the
-    CLI layer adds them only when a corresponding flag is passed
-    (`--allow-hd-hevc` etc.). Used for behaviors the project's stated
-    policy declines to do automatically but exposes as overrides.
+    CLI layer adds them only when a corresponding gating flag is set.
+    Reserved for behaviors the project's stated policy declines to do
+    automatically but exposes as overrides. No opt-in rules ship today;
+    the field is kept to preserve the engine's extension point.
     """
 
     name: str = ""
@@ -165,7 +159,7 @@ class LegacyCodecRule(Rule):
 
 
 # --------------------------------------------------------------------------- #
-# InefficientCodecRule / ContainerMigrationRule
+# HdNonAv1Rule / ContainerMigrationRule
 # --------------------------------------------------------------------------- #
 
 
@@ -189,53 +183,23 @@ def _non_av1_verdict(probe: ProbeResult, name: str, *,
     )
 
 
-class InefficientCodecRule(Rule):
-    """Flag h.264 (and similar) at HD: always a transcode candidate.
+class HdNonAv1Rule(Rule):
+    """At HD (720..1439), anything other than AV1 is a re-encode candidate.
 
-    AV1 is materially more efficient than h.264 at HD perceptual
-    quality. CQ-based encoding preserves quality even when the source
-    is heavily compressed (the worst case is an output similar in
-    size to the source — never a perceptual regression). HEVC at HD
-    is left alone (its efficiency is close enough to AV1 that the
-    re-encode time isn't worth it); SD has its own rule, and UHD is
-    handled by UhdNonAv1Rule.
+    Mirrors UhdNonAv1Rule / SdNonAv1Rule so the three tiers select
+    candidates by the same logic, differing only in their height band
+    and downstream encoding settings (CQ, encoder preset).
     """
 
-    name = "inefficient_codec"
+    name = "hd_non_av1"
     advisory = False
 
     def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        return _codec_set_verdict(
+        return _non_av1_verdict(
             probe, self.name,
-            codec_set=_INEFFICIENT_CODECS,
-            savings_frac=0.30, severity="medium",
-            reason="{codec} at HD; AV1 transcode (CQ-preserved quality)",
             height_band=(720, 1440),
-        )
-
-
-class HdHevcOptInRule(Rule):
-    """Opt-in: HEVC at HD heights as a re-encode candidate.
-
-    Disabled by default — HEVC at 1080p with reasonable bitrate is the
-    project's stated "leave it alone" tier (it's already efficient
-    enough; the AV1 savings rarely justify the GPU time). Enable via
-    `--allow-hd-hevc` for cases where the user wants HEVC HD content
-    re-encoded anyway (testing the DV-strip path against a small
-    HD HEVC source, library-wide consolidation onto AV1, etc.).
-    """
-
-    name = "hd_hevc_opt_in"
-    advisory = False
-    opt_in = True
-
-    def evaluate(self, probe: ProbeResult) -> RuleVerdict:
-        return _codec_set_verdict(
-            probe, self.name,
-            codec_set=frozenset({"hevc"}),
-            savings_frac=0.20, severity="low",
-            reason="hevc at HD; opt-in re-encode (--allow-hd-hevc)",
-            height_band=(720, 1440),
+            savings_frac=0.25, severity="medium",
+            tier_label="HD",
         )
 
 
@@ -338,14 +302,11 @@ class HdrAdvisoryRule(Rule):
 RULES: dict[str, Rule] = {
     "over_bitrate":         OverBitratedRule(),
     "legacy_codec":         LegacyCodecRule(),
-    "inefficient_codec":    InefficientCodecRule(),
+    "hd_non_av1":           HdNonAv1Rule(),
     "uhd_non_av1":          UhdNonAv1Rule(),
     "sd_non_av1":           SdNonAv1Rule(),
     "container_migration":  ContainerMigrationRule(),
     "hdr_advisory":         HdrAdvisoryRule(),
-    # Opt-in rules: excluded from RulesEngine's default-enabled set.
-    # cmd_plan adds these by name when their gating flag is passed.
-    "hd_hevc_opt_in":       HdHevcOptInRule(),
 }
 
 
@@ -359,9 +320,10 @@ class RulesEngine:
 
     def __init__(self, enabled: list[str] | None = None, target: str = "av1+mkv"):
         if enabled is None:
-            # Default: every rule that isn't opt_in. Opt-in rules
-            # (hd_hevc_opt_in, etc.) are explicit policy overrides; the
-            # CLI layer adds them by name when their gating flag fires.
+            # Default: every rule that isn't opt_in. The opt_in field
+            # is reserved as an extension point — no opt-in rules ship
+            # today. The CLI layer would add them by name if a future
+            # gating flag required it.
             self._rules = [r for r in RULES.values() if not r.opt_in]
         else:
             unknown = [k for k in enabled if k not in RULES]

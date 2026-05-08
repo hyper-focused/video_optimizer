@@ -320,6 +320,25 @@ from `--help` for tidiness, but functional.
 | `--allow-reencoded` | Files already tagged `REENCODE` in their filename, AND files whose `.AV1.REENCODE.mkv` sibling already exists |
 | `--allow-av1` | AV1-source files (default: skipped because re-encoding AV1 is wasteful) |
 | `--allow-extras` | Plex-style trailer/extras directories and `-trailer` / `-bts` / etc. filenames |
+| `--allow-low-bitrate` | Sources whose video bitrate is below the AV1 target for their resolution (1080p < 5 Mbps, 2160p < 16 Mbps; see `BITRATE_FLAG_TABLE` in `presets.py`). Default skips them — sub-target sources can't yield meaningful AV1 savings and may regress perceptual quality. |
+
+### Codec opt-out
+
+The default behavior is to re-encode every non-AV1 source to AV1
+regardless of codec. If you want to leave specific source codecs
+untouched (typical case: an HEVC archive you trust), pass
+`--skip-codecs` with a comma-separated list of ffprobe codec names.
+
+| Flag | Effect |
+|---|---|
+| `--skip-codecs hevc` | Skip HEVC sources at the plan gate |
+| `--skip-codecs hevc,vp9` | Skip both HEVC and VP9 |
+| `--skip-codecs h264,mpeg2video,mpeg4` | Skip h.264, MPEG-2 (DVD rips), and MPEG-4 (divx-era) |
+
+Names match `ffprobe -show_streams` output; case-insensitive.
+Common values: `h264`, `hevc`, `vp9`, `mpeg2video`, `mpeg4`,
+`vc1`, `wmv3`. Skipping `av1` is redundant — AV1 sources are
+already auto-skipped by `--allow-av1`'s default.
 
 ### Tuning overrides (advanced; hidden from `--help` for tidiness, but functional)
 

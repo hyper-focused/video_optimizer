@@ -88,7 +88,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         """User picks keep-mode + all-tiers then quits at the all/N/quit prompt."""
         _, scan, plan, optimize, cleanup, _ = self._patch_handlers()
         # path -> mode 1 -> tier 'a' -> 'q' (quit at limit prompt)
-        answers = [str(self.lib), "1", "a", "q"]
+        answers = [str(self.lib), "1", "a", "n", "q"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -104,7 +104,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         """User reaches the final 'Proceed?' prompt and answers no."""
         _, scan, plan, optimize, _, _ = self._patch_handlers()
         # path -> mode 1 -> tier 'a' -> limit 'a' (all) -> confirmation 'n'
-        answers = [str(self.lib), "1", "a", "a", "n"]
+        answers = [str(self.lib), "1", "a", "n", "a", "n"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -132,7 +132,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         """Doctor fails, user answers 'y' and the wizard continues."""
         _, scan, plan, optimize, _, _ = self._patch_handlers(doctor_rc=1)
         # 'y' -> path -> mode 1 -> tier 'a' -> 'q' (quit at summary)
-        answers = ["y", str(self.lib), "1", "a", "q"]
+        answers = ["y", str(self.lib), "1", "a", "n", "q"]
         with patch("builtins.input", side_effect=answers), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
@@ -186,13 +186,14 @@ class WizardPromptSequenceTests(unittest.TestCase):
         """An invalid mode-menu choice should re-ask, not abort."""
         _, scan, plan, optimize, _, _ = self._patch_handlers()
         # path -> '9' (invalid, re-prompted) -> '1' -> tier 'a' -> 'q'
-        answers = [str(self.lib), "9", "1", "a", "q"]
+        answers = [str(self.lib), "9", "1", "a", "n", "q"]
         with patch("builtins.input", side_effect=answers) as inp, \
                 patch("sys.stdout", new_callable=io.StringIO) as out:
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
         self.assertEqual(rc, 0)
-        # Five answers consumed: path + bad-choice + good-choice + tier + quit.
-        self.assertEqual(inp.call_count, 5)
+        # Six answers consumed: path + bad-choice + good-choice + tier
+        # + skip-codecs + quit.
+        self.assertEqual(inp.call_count, 6)
         # The "please choose" hint is the canary for the re-prompt branch
         # in `_prompt`.
         self.assertIn("please choose", out.getvalue())
@@ -214,7 +215,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         with patch.object(cli_mod, "_run_path_pipeline",
                           side_effect=fake_pipeline), \
                 patch("builtins.input",
-                      side_effect=[str(self.lib), "1", "u", "a", "y", "n"]), \
+                      side_effect=[str(self.lib), "1", "u", "n", "a", "y", "n"]), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
         self.assertEqual(rc, 0)
@@ -237,7 +238,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         with patch.object(cli_mod, "_run_path_pipeline",
                           side_effect=fake_pipeline), \
                 patch("builtins.input",
-                      side_effect=[str(self.lib), "1", "a", "a", "n"]), \
+                      side_effect=[str(self.lib), "1", "a", "n", "a", "n"]), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
         self.assertEqual(rc, 0)
@@ -254,7 +255,7 @@ class WizardPromptSequenceTests(unittest.TestCase):
         with patch.object(cli_mod, "_run_path_pipeline",
                           side_effect=fake_pipeline), \
                 patch("builtins.input",
-                      side_effect=[str(self.lib), "1", "a", "a", "y", "n"]), \
+                      side_effect=[str(self.lib), "1", "a", "n", "a", "y", "n"]), \
                 patch("sys.stdout", new_callable=io.StringIO):
             rc = cli_mod.cmd_wizard(_make_args(self.db_path))
         self.assertEqual(rc, 0)

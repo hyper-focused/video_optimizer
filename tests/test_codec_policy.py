@@ -1,12 +1,10 @@
-"""Codec policy: inefficient h.264 (HD) and non-AV1 (UHD) rules + AV1/SD gates.
+"""Codec policy: SD / HD / UHD non-AV1 rules + AV1 plan-gate.
 
 The goal of this policy:
-  - HD h.264 → always a re-encode candidate (CQ-based encode preserves quality;
-    storage savings are typical but not guaranteed for already-compressed sources).
-  - UHD anything-but-AV1 → re-encode candidate (the savings deltas are large at 4K).
+  - Any non-AV1 source at SD / HD / UHD heights is a re-encode candidate.
+    The three tiers differ only in their height band and downstream encoding
+    settings (CQ, encoder preset).
   - AV1 source → plan-time skip (already at the target codec); --allow-av1 to override.
-  - SD source (height < 720) → plan-time skip (would need its own preset/rule set);
-    --allow-sd to override.
 """
 
 from __future__ import annotations
@@ -19,22 +17,22 @@ from optimizer import encoder
 from optimizer.cli import _plan_probe_gate, _should_apply_denoise
 from optimizer.db import Database
 from optimizer.rules import (
-    InefficientCodecRule,
+    HdNonAv1Rule,
     SdNonAv1Rule,
     UhdNonAv1Rule,
 )
 from tests._fixtures import make_probe
 
 # --------------------------------------------------------------------------- #
-# InefficientCodecRule (h.264 at HD)
+# HdNonAv1Rule (any non-AV1 at HD)
 # --------------------------------------------------------------------------- #
 
 
-class InefficientCodecRuleTests(unittest.TestCase):
-    """h.264 in [720, 1440) fires; everything else is a miss."""
+class HdNonAv1RuleTests(unittest.TestCase):
+    """Anything-but-AV1 in [720, 1440) fires; AV1 + out-of-band heights miss."""
 
     def setUp(self):
-        self.rule = InefficientCodecRule()
+        self.rule = HdNonAv1Rule()
 
     def test_h264_1080p_fires(self):
         v = self.rule.evaluate(make_probe(codec="h264", height=1080))
@@ -45,9 +43,14 @@ class InefficientCodecRuleTests(unittest.TestCase):
         v = self.rule.evaluate(make_probe(codec="h264", height=720))
         self.assertTrue(v.fired)
 
+    def test_hevc_at_hd_fires(self):
+        # HEVC at HD is now in scope (default policy: encode any non-AV1
+        # at any tier). Was previously opt-in via --allow-hd-hevc.
+        v = self.rule.evaluate(make_probe(codec="hevc", height=1080))
+        self.assertTrue(v.fired)
+
     def test_h264_below_hd_does_not_fire(self):
-        # 480p falls into SD range; the plan-gate skips it before rule
-        # evaluation, but the rule itself should also not fire on it.
+        # 480p is SD; SdNonAv1 covers it.
         v = self.rule.evaluate(make_probe(codec="h264", height=480))
         self.assertFalse(v.fired)
 
@@ -56,16 +59,8 @@ class InefficientCodecRuleTests(unittest.TestCase):
         v = self.rule.evaluate(make_probe(codec="h264", height=2160))
         self.assertFalse(v.fired)
 
-    def test_hevc_at_hd_does_not_fire(self):
-        v = self.rule.evaluate(make_probe(codec="hevc", height=1080))
-        self.assertFalse(v.fired)
-
     def test_av1_at_hd_does_not_fire(self):
         v = self.rule.evaluate(make_probe(codec="av1", height=1080))
-        self.assertFalse(v.fired)
-
-    def test_vp9_at_hd_does_not_fire(self):
-        v = self.rule.evaluate(make_probe(codec="vp9", height=1080))
         self.assertFalse(v.fired)
 
 
@@ -189,6 +184,119 @@ class PlanGateAv1Tests(_GateTestBase):
         with Database(self.db_path) as db:
             self.assertEqual(
                 _plan_probe_gate(db, self._probe(codec="h264")),
+                "ok",
+            )
+
+
+class PlanGateLowBitrateTests(_GateTestBase):
+    """Sources whose video bitrate is below the AV1 target for their
+    resolution bucket are skipped — re-encoding can't yield meaningful
+    savings and risks perceptual regression on already-compressed sources.
+    """
+
+    def test_1080p_3mbps_skipped(self):
+        # 1080p AV1 target is 5 Mbps; 3 Mbps is below.
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="h264", height=1080,
+                                    video_bitrate=3_000_000),
+                ),
+                "low_bitrate",
+            )
+
+    def test_1080p_3mbps_admitted_with_override(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="h264", height=1080,
+                                    video_bitrate=3_000_000),
+                    allow_low_bitrate=True,
+                ),
+                "ok",
+            )
+
+    def test_2160p_below_target_skipped(self):
+        # 2160p target is 16 Mbps; 12 Mbps falls below.
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="hevc", height=2160,
+                                    video_bitrate=12_000_000),
+                ),
+                "low_bitrate",
+            )
+
+    def test_at_target_bitrate_admitted(self):
+        # Sources at-or-above the AV1 target are admitted.
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="hevc", height=1080,
+                                    video_bitrate=5_500_000),
+                ),
+                "ok",
+            )
+
+    def test_unknown_bitrate_admitted(self):
+        # Source bitrate == 0 means we can't decide; admit (the rule
+        # engine will still gate on its own thresholds).
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="h264", height=1080,
+                                    video_bitrate=0),
+                ),
+                "ok",
+            )
+
+
+class PlanGateSkipCodecsTests(_GateTestBase):
+    """`--skip-codecs hevc,h264,…` filters by source codec at plan time."""
+
+    def test_hevc_skipped_when_in_skip_set(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="hevc", height=1080,
+                                    video_bitrate=20_000_000),
+                    skip_codecs=frozenset({"hevc"}),
+                ),
+                "skipped_codec",
+            )
+
+    def test_h264_admitted_when_only_hevc_skipped(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="h264", height=1080,
+                                    video_bitrate=20_000_000),
+                    skip_codecs=frozenset({"hevc"}),
+                ),
+                "ok",
+            )
+
+    def test_av1_skip_still_takes_precedence(self):
+        # AV1 sources hit the "av1_source" gate before the codec-skip
+        # check, even when "av1" appears in the skip set.
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="av1", height=1080,
+                                    video_bitrate=20_000_000),
+                    skip_codecs=frozenset({"av1"}),
+                ),
+                "av1_source",
+            )
+
+    def test_empty_skip_set_is_a_noop(self):
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                _plan_probe_gate(
+                    db, self._probe(codec="hevc", height=1080,
+                                    video_bitrate=20_000_000),
+                    skip_codecs=frozenset(),
+                ),
                 "ok",
             )
 
