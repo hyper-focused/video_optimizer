@@ -3291,6 +3291,16 @@ def _assert_external_tools_available(cmd: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Dispatches to the chosen subcommand handler."""
+    # Force line-buffering so each print() flushes on \n regardless of
+    # whether stdout is a TTY or a redirected file. Without this,
+    # block-buffered redirects let `flush=True` progress prints (encode
+    # ETA, DV-strip) jump ahead of the un-flushed plan listing — which
+    # is harmless functionally but looks like the apply phase started
+    # in the middle of the candidate dump.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
     if argv is None:
         argv = sys.argv
     argv = _preprocess_argv(argv)
