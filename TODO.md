@@ -183,12 +183,57 @@ why.
 
 ## Encoding
 
+- [ ] **Runtime encoder fallback (av1_qsv → av1_vaapi → CPU)** — today
+      `select_encoder` picks one encoder up-front from `ENCODER_PREFERENCE`
+      and that's the only attempt. If `av1_qsv` wedges or stalls on a
+      specific source, the file is marked failed and (after two strikes)
+      permanently skipped — even when av1_vaapi or CPU might succeed on
+      it. Proposed feature: on a *recoverable* failure (encoder stall, hw
+      driver crash, but not source-validation issues), retry the same
+      file with the next encoder in the auto chain. Caveats: on
+      Battlemage specifically, av1_qsv and av1_vaapi drive the same MFX
+      hardware via the same iHD driver — a wedge in one will likely
+      wedge the other, so this is mostly a sideways move on Intel boxes.
+      The real win is on heterogeneous setups (older Intel iGPU + AMD
+      discrete, or systems where the QSV stack is broken but VAAPI
+      works) and as a lifeline before falling through to libsvtav1.
+      Should be opt-in via something like `--encoder-fallback-chain`
+      because for the common case "this source wedges every encoder"
+      we'd rather fail fast than burn 3× the wall-clock retrying.
+      Implementation note: needs a "recoverable vs not" classification
+      on the encode failure mode — wedging at frame 0 / qsv driver
+      fault → retry; ffprobe-validation mismatch on the output → don't
+      retry (the encoder did something, just wrong).
+
 - [ ] **`av1an` experimental backend (Battlemage dual-MFX exploit)** —
-      Battlemage's BMG-G21 ships with two MFX (media fixed-function)
-      engines vs Alchemist's one. Today we drive a single `av1_qsv`
-      ffmpeg instance per file, which keeps one MFX busy and leaves
-      the second idle. Two angles worth exploring, both gated behind
-      a flag (e.g. `--backend av1an`):
+      Battlemage's BMG-G21 silicon ships with two MFX (media
+      fixed-function) engines vs Alchemist's one — confirmed by Intel
+      marketing and reported by the Jellyfin team on Intel contact.
+      What's **not** confirmed: whether the Xe kernel driver enumerates
+      them as two VCS instances (`vcs0`+`vcs1`) or collapses them into
+      one logical engine. The Lunar Lake Xe2 iGPU on the dev box exposes
+      a single `vcs0` via `/sys/kernel/debug/dri/0/gt1/hw_engines`, but
+      Lunar Lake is the cut-down mobile variant — that doesn't generalise
+      to discrete Battlemage. No public `hw_engines` dump from a B580
+      owner exists, so first thing on this item is verifying the engine
+      count on actual discrete hardware: `sudo cat
+      /sys/kernel/debug/dri/0/gt*/hw_engines | grep -E '^(vcs|vecs)'`
+      and `time ffmpeg ...` ×2 concurrent vs ×1 serial throughput
+      comparison on a real source.
+
+      Known flag worth being aware of:
+      [intel/media-driver issue #1626](https://github.com/intel/media-driver/issues/1626)
+      reports that two concurrent `av1_qsv` ffmpeg processes produce
+      *corrupt output* on Alchemist. Open with no fix. Whether this
+      bug also affects Battlemage is itself something to verify before
+      committing to chunked-parallel encoding on the QSV path. The
+      `av1_vaapi` path may not have the same bug since libva and
+      oneVPL/MFX are different scheduling layers driving the same
+      hardware — testable by running two parallel `av1_vaapi` encodes
+      and validating the output via `ffprobe` + frame-hash comparison.
+
+      Two angles worth exploring, both gated behind a flag (e.g.
+      `--backend av1an`):
 
       **Angle 1 — chunked parallelism for raw throughput.**
       av1an splits a source into scene-aligned chunks and runs N
