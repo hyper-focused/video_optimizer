@@ -1,82 +1,74 @@
 # video_optimizer
 
-A point-and-shoot AV1 transcoder for personal video libraries on Linux.
-Crawls a directory, identifies files worth re-encoding, and re-encodes
-them to AV1 in MKV with hardware acceleration where available.
+> Point a Linux box at a movie library, walk away, come back to a smaller
+> movie library. Originals are still there until you say otherwise.
 
-**Optimized for Intel Arc / Battlemage GPUs** via `av1_qsv`. The
-calibrated presets, lookahead depths, and zero-copy decode→encode
-pipelines are tuned against Intel's QSV stack — that's what was on
-hand during development. NVIDIA (`av1_nvenc` on RTX 4000+) and AMD
-(`av1_vaapi`) work via the encoder fallback chain, but the throughput
-numbers and tier defaults haven't been re-tuned for them. Software
-fallback (`libsvtav1`) is always available.
+`video_optimizer` is a thin wrapper around `ffmpeg` and `ffprobe` that
+re-encodes the AV1-eligible content in your library — and only the
+AV1-eligible content. It's stdlib-only Python 3.10+ (no `pip install`,
+no virtualenv) and is built around four ideas:
 
-```bash
-./video_optimizer.py /mnt/nas/media/Movies        # encode the whole library
-./video_optimizer.py UHD /mnt/nas/media/Movies    # 4K only
-./video_optimizer.py cleanup --apply              # remove originals when satisfied
-```
+1. **You shouldn't have to think.** `./video_optimizer.py /path/to/movies`
+   does the right thing. There's also a wizard if you'd rather click
+   through prompts.
+2. **Calibrated presets per resolution.** UHD, HD, SD, and a UHD-FILM
+   tier for grain-dominated 4K all have their own CQ, encoder preset,
+   and decode pipeline tuned to actually finish in this lifetime.
+3. **Smart skips, dumb defaults.** It auto-skips AV1 sources, prior
+   outputs of itself, low-bitrate sources that wouldn't benefit, and
+   Dolby Vision Profile 5 (where stripping the DV layer leaves a
+   green/over-saturated mess). It also drops in a one-pass DV strip
+   for Profile 7 and 8 sources so `av1_qsv` doesn't wedge on them
+   (which it absolutely will if you let it).
+4. **Originals don't disappear.** The default mode writes outputs
+   alongside the source as `<stem>.AV1.REENCODE.mkv` and leaves the
+   original on disk. A separate `cleanup` step removes the originals
+   when you're satisfied.
+
+**Optimized for Intel Arc / Battlemage** via `av1_qsv`. The presets,
+lookahead depths, and decode pipelines were tuned against Intel's QSV
+stack — that's what was on the workbench. NVIDIA (`av1_nvenc` on RTX
+4000+) and AMD (`av1_vaapi`) work via the encoder fallback chain, but
+the throughput numbers haven't been re-tuned for them. Software
+fallback (`libsvtav1`) is always available and your CPU fans will let
+you know.
 
 ---
 
-## What it does
+## System requirements
 
-`video_optimizer` is a wrapper around `ffmpeg` and `ffprobe` that brings
-three things to the table that a hand-rolled `for f in *.mkv; do ffmpeg
-…; done` loop doesn't:
+**Required**:
 
-- **Calibrated per-tier presets.** UHD (≥1440p), HD (720–1439p), and SD
-  (≤719p) each have their own CQ, GOP, lookahead, and decode pipeline
-  defaults. UHD uses zero-copy QSV decode→encode; HD/SD use CPU decode →
-  GPU encode (faster than zero-copy at <UHD frame sizes on Intel).
-- **Smart candidate selection.** A rules engine identifies what's worth
-  re-encoding (legacy codecs like MPEG-2/VC-1, h.264 at HD, anything
-  non-AV1 at UHD/SD, files in legacy containers like AVI). It also skips
-  things that don't need work: AV1 sources, prior outputs of this tool,
-  Plex-style trailers/extras, and Dolby Vision Profile 5 (no HDR10
-  fallback). Profile 7 and 8 are admitted and have their RPU stripped
-  in a pre-pass before the encode (see "Dolby Vision" below).
-- **Adaptive bitrate fallback.** If a UHD encode's mid-encode size
-  projection at the 10% / 20% / 30% / 50% checkpoints — or its
-  final output — comes out near or above the size of the file
-  ffmpeg is reading, the encode is killed and retried once at the
-  relaxed tuning (CQ 21 + encoder preset `slow` instead of
-  `veryslow`). Catches grain-dominated 4K remasters (Princess
-  Bride, Tron, The Godfather, etc.) where the default CQ
-  over-allocates bits — including cases where the grain density
-  compounds in the second half of the film and the early
-  checkpoints look clean. Finishes the retry ~1.5–2× faster than
-  re-running at `veryslow` would. Silent on healthy encodes; opt
-  out with `--no-auto-relax-cq`.
-- **Library-scale defaults.** Audio collapses to a deterministic 3-stream
-  ladder (best lossless passthrough + Opus 5.1 + AAC 2.0). Subtitles
-  filter to `--keep-langs` (default `en,und`). Originals are preserved by
-  default — outputs land alongside the source with a `.AV1.REENCODE.mkv`
-  suffix, and a separate `cleanup` step removes them when you're ready.
+- **Linux**, with a recent kernel. macOS and Windows are not tested or
+  supported. The QSV/VAAPI hardware paths assume `/dev/dri/renderD128`.
+- **Python 3.10+**. Stdlib only — no third-party packages, no `pip`, no
+  virtualenv. If `python3 --version` returns ≥ 3.10, you're set.
+- **`ffmpeg` 7.0+ and `ffprobe`** on `PATH`. Older `ffmpeg` lacks the
+  `dovi_rpu` bitstream filter the DV strip pipeline needs. Distro
+  versions of `ffmpeg` are sometimes a release behind; check with
+  `ffmpeg -version`.
 
-The result is a tool you can point at a movie library and walk away from,
-that catches the cases where you need to step in (encoder stalls, DV
-content, ambiguous sources) and surfaces them in a per-run report.
+**Optional**:
+
+- **Intel Arc / Battlemage GPU** for the `av1_qsv` fast path. Without
+  hardware AV1, the tool falls back to `libsvtav1` (CPU). It still
+  works; it just runs at "go make a sandwich" speeds instead of
+  "go check on the kettle" speeds.
+- **`dovi_tool` and `mkvmerge`** — only needed if you opt into
+  `--dv-p7-convert` for stubborn Profile 7 sources. Most P7 content
+  works fine with the default ffmpeg-bsf strip; install these only
+  if you hit a P7 source that fails the simpler path.
+
+Run `./video_optimizer.py doctor` after install — it confirms ffmpeg,
+encoder availability, GPU device nodes, and the SQLite state directory.
+Exits non-zero if anything's missing. Friendlier than reading a
+checklist.
 
 ---
 
 ## Install
 
-Stdlib-only Python 3.10+; no `pip install`, no virtualenv. Runtime
-dependencies on `PATH`:
-
-- **`ffmpeg` 7.0+ and `ffprobe`** — required. Older ffmpeg lacks the
-  `dovi_rpu` bitstream filter the DV strip pipeline relies on.
-- **`dovi_tool` and `mkvmerge` (mkvtoolnix-cli)** — *optional*. The
-  default DV path uses ffmpeg's built-in `dovi_rpu=strip=true` bsf
-  for both Profile 7 and Profile 8 sources, which doesn't need either
-  external tool. They're only required when you opt into
-  `--dv-p7-convert` — a more aggressive Profile 7 → Profile 8.1
-  conversion path (`dovi_tool convert --discard` + `mkvmerge` re-mux)
-  for stubborn P7 sources where the strip-only path fails. If your
-  library doesn't trip that case (most won't), you can skip both
-  installs.
+There's no installer. Clone the repo, run the script.
 
 ### Debian / Ubuntu
 
@@ -87,25 +79,11 @@ cd ~/video_optimizer
 ./video_optimizer.py doctor
 ```
 
-For Intel QSV (Arc, Battlemage, recent iGPUs), make sure you have a
-recent kernel and `intel-media-va-driver-non-free` (Debian) /
-`intel-media-va-driver` (Ubuntu). Battlemage specifically needs kernel
-6.13+ (Xe driver) and Mesa 25+.
-
-For the optional `--dv-p7-convert` path (only needed if a specific
-Profile 7 source fails the default strip-only path), install both
-`dovi_tool` and `mkvtoolnix`:
-
-```bash
-# mkvmerge — apt has it
-sudo apt install mkvtoolnix
-
-# dovi_tool — not in apt; pick one
-cargo install dovi_tool                  # Option A: build from source
-# Option B: prebuilt binary
-curl -L "https://github.com/quietvoid/dovi_tool/releases/latest/download/dovi_tool-x86_64-unknown-linux-musl.tar.gz" \
-  | tar xz -C ~/.local/bin/
-```
+For Intel QSV on Arc / Battlemage / recent iGPUs, you'll want a recent
+kernel and `intel-media-va-driver-non-free` (Debian) /
+`intel-media-va-driver` (Ubuntu). **Battlemage specifically** needs
+kernel 6.13+ (Xe driver) and Mesa 25+. If you're on an older kernel,
+`av1_qsv` may not be wired up correctly and `doctor` will tell you so.
 
 ### Fedora
 
@@ -117,11 +95,9 @@ cd ~/video_optimizer
 ./video_optimizer.py doctor
 ```
 
-(Fedora's stock `ffmpeg-free` is built without non-free codecs; RPM
-Fusion's full `ffmpeg` is what you want for a transcode workflow.)
-
-For the optional `--dv-p7-convert` path: `sudo dnf install mkvtoolnix`
-and `cargo install dovi_tool` (no sudo for the latter).
+Fedora's stock `ffmpeg-free` is built without non-free codecs, which
+the rules engine relies on heavily. RPM Fusion's full `ffmpeg` is the
+one you want.
 
 ### Arch Linux
 
@@ -132,71 +108,83 @@ cd ~/video_optimizer
 ./video_optimizer.py doctor
 ```
 
-For the optional `--dv-p7-convert` path: `sudo pacman -S mkvtoolnix-cli`
-plus `dovi_tool` from AUR (`yay -S dovi-tool-bin`) or
-`cargo install dovi_tool`.
-
 ### NVIDIA / AMD
 
-The tool works with NVIDIA (`av1_nvenc` — RTX 4000-series and newer) and
-AMD (`av1_vaapi` via Mesa/AMF) when the hardware supports AV1 encode. No
-config required — `select_encoder` falls back through QSV → NVENC → VAAPI
-→ libsvtav1 (CPU). `./video_optimizer.py list-encoders` shows which
-encoder will be picked for each target on your box.
+The fallback chain is QSV → NVENC → VAAPI → libsvtav1. Drop in an RTX
+4000-series (or newer) for `av1_nvenc`, or a recent AMD card with
+`av1_vaapi` via Mesa/AMF, and `select_encoder` will route to it
+automatically. `./video_optimizer.py list-encoders` shows which
+encoder gets picked for each target on your specific machine.
 
-### Verifying the install
+The presets aren't *re-tuned* for non-Intel hardware — they're tuned
+for Intel QSV and they work fine on other backends, just possibly not
+optimally. If you have data, please send it.
+
+### Optional: `dovi_tool` + `mkvmerge` for stubborn DV Profile 7 sources
+
+Only install these if you hit a Profile 7 source that fails the
+default ffmpeg-bsf strip path. Most P7 content doesn't trip that case.
 
 ```bash
-./video_optimizer.py doctor
-```
+# Debian / Ubuntu
+sudo apt install mkvtoolnix
+cargo install dovi_tool                       # or grab the prebuilt binary:
+curl -L "https://github.com/quietvoid/dovi_tool/releases/latest/download/dovi_tool-x86_64-unknown-linux-musl.tar.gz" \
+  | tar xz -C ~/.local/bin/
 
-`doctor` checks ffmpeg/ffprobe, encoder availability, GPU device nodes
-(`/dev/dri/renderD128` for QSV/VAAPI), and the SQLite state directory
-(`~/.video_optimizer/`). Exits non-zero if anything's missing.
+# Fedora
+sudo dnf install mkvtoolnix && cargo install dovi_tool
+
+# Arch
+sudo pacman -S mkvtoolnix-cli && yay -S dovi-tool-bin
+```
 
 ---
 
-## Common commands
+## Basic usage
 
-The tool's defaults are tuned for "I have a movie library on a NAS,
-encode the AV1-eligible content, leave originals alone until I confirm
-the outputs are good." Most invocations look like one of these.
+The defaults are calibrated for "I have a movie library on a NAS, encode
+the AV1-eligible content, leave originals alone until I confirm the
+outputs are good." Most invocations look like one of these.
 
-### Encode the entire library, leave originals untouched
+### Re-encode the whole library
 
 ```bash
 ./video_optimizer.py /mnt/nas/media/Movies
 ```
 
-Runs the UHD → HD → SD pipeline, writes outputs alongside their sources
-as `<original-stem>.AV1.REENCODE.mkv`, leaves originals untouched. Run
-the dry-run first if you want to see what would happen:
+Walks the path, runs the UHD → HD → SD pipeline, writes outputs
+alongside their sources as `<stem>.AV1.REENCODE.mkv`. Originals are
+**not touched** — that's the whole point of the default mode. Run a
+dry-run first if you'd rather see the plan:
 
 ```bash
 ./video_optimizer.py /mnt/nas/media/Movies --dry-run
 ```
 
-### Encode only one resolution tier
+### Pick a single resolution tier
 
 ```bash
 ./video_optimizer.py UHD      /mnt/nas/media/Movies   # 4K, CQ 15 (archive-grade)
-./video_optimizer.py UHD-FILM /mnt/nas/media/Movies   # 4K, CQ 21 (looser; for grain-dominated film)
+./video_optimizer.py UHD-FILM /mnt/nas/media/Movies   # 4K, CQ 21 (looser; for grainy older film)
 ./video_optimizer.py HD       /mnt/nas/media/Movies   # 1080p / 720p
 ./video_optimizer.py SD       /mnt/nas/media/Movies   # below 720p
 ```
 
-Useful when UHD is taking ~1h/file and you want HD's quicker batch first,
-or when you've already done UHD and want to clean up the rest.
+Useful when UHD is taking ~1 hour per file and you want HD's quicker
+batch first, or when you've already done UHD and want to clean up the
+rest of the library.
 
-**`UHD-FILM`** is for grain-heavy older films at UHD (Princess Bride, etc.)
-where the default UHD CQ over-allocates bits to grain and produces an
-output near or larger than the source. The preset uses CQ 21 and the
-`slow` encoder preset (vs UHD's `veryslow`) — grain-dominated content
-doesn't reward extra RD-search effort, so the cheaper preset trades a
-small efficiency loss for ~1.5–2× faster encodes. You usually don't
-need to invoke this manually — the default `UHD` preset includes a
-bloat fallback that detects this mid-encode and retries at the same
-tuning (CQ 21 + `slow`) automatically.
+### Just one file (Radarr / Sonarr post-processing)
+
+```bash
+./video_optimizer.py "/mnt/nas/media/Movies/Foo (2023)/Foo.mkv" --replace
+```
+
+Pass a single file and it encodes just that file. With `--replace` the
+original gets atomically moved to an auto-detected `@Recycle`
+directory once the encode succeeds. Drop this in as a post-import
+hook from Radarr or Sonarr and forget about it.
 
 ### Test on a few files first
 
@@ -204,38 +192,21 @@ tuning (CQ 21 + `slow`) automatically.
 ./video_optimizer.py UHD /mnt/nas/media/Movies --limit 3
 ```
 
-### Encode a single file (Radarr / Sonarr post-processing hook)
+`--limit N` caps the number of files actually encoded. Useful before
+committing to a full library run.
+
+### The wizard, for when you don't feel like reading help
 
 ```bash
-./video_optimizer.py "/mnt/nas/media/Movies/Foo (2023)/Foo.mkv" --replace
+./video_optimizer.py
 ```
 
-The tool accepts a single video file as the path argument; `--replace`
-moves the original to an auto-detected `@Recycle` directory once the
-encode succeeds. Suitable as a post-import hook from Radarr/Sonarr.
+With no arguments and stdin attached to a TTY, it drops into an
+interactive wizard: prompts for path, output mode, tier scope (All /
+UHD / UHD-FILM / HD / SD), codec exemptions, and a count limit.
+Friendlier than `--help` if you'd rather not memorize flags.
 
-### Replace originals as you go
-
-```bash
-./video_optimizer.py /mnt/nas/media/Movies --replace
-```
-
-`--replace` recycles each original (atomically, into
-`<library>/.@Recycle` by default) once its encode completes successfully.
-The file is moved, not deleted — recoverable until you empty the
-recycle directory.
-
-### Mirror outputs into a separate tree
-
-```bash
-./video_optimizer.py /mnt/nas/media/Movies --output /mnt/backup/encoded
-```
-
-Mirrors the directory structure under `--output`. Originals are
-untouched. Useful when the source filesystem is read-only or when you
-want to keep the encoded library separate.
-
-### Remove originals after a run
+### Remove originals when you're satisfied
 
 ```bash
 ./video_optimizer.py cleanup            # dry-run: list what would be removed
@@ -243,149 +214,166 @@ want to keep the encoded library separate.
 ```
 
 `cleanup` reads the most recent run's completed encodes from the
-database, runs a 3-check safety guard (output exists, output is
+state database, runs a 3-check safety guard (output exists, output is
 non-empty, output ≠ source), and unlinks the originals only when all
-three pass. `--apply` is required to actually delete; without it you
-get a dry-run listing.
+three pass. Without `--apply`, it just prints what it *would* do — the
+nuclear option requires the safety word.
 
-### Interactive guided run
-
-```bash
-./video_optimizer.py
-```
-
-With no arguments and stdin attached to a terminal, drops into a wizard
-that prompts for path, output mode, and tier scope (All / UHD / UHD-FILM
-/ HD / SD), then runs the full pipeline.
-
-### Resume / inspect
+### Inspect
 
 ```bash
-./video_optimizer.py status              # recent runs + pending decisions
+./video_optimizer.py status              # recent runs + any pending decisions
 ./video_optimizer.py doctor              # preflight: ffmpeg / encoders / GPU / db
 ./video_optimizer.py list-encoders       # what ffmpeg encoders are available
 ```
 
-A few additional subcommands exist as power-user escape hatches and
-are hidden from `--help` for tidiness: `scan`, `plan`, `apply`,
-`reprobe`, `replace-list`. They're the building blocks the path-taking
-subcommands compose internally; reach for them only when iterating
-on rule tunings or debugging.
-
 ---
 
-## Flags reference
+## How it actually works
 
-Every path-taking subcommand (`SD`, `HD`, `UHD`, `optimize`, plus the
-bare invocation) shares the same flag surface. Run any of them with
-`--help` for the full inline reference; the most-used flags are
-summarized here.
+The tool is a four-stage pipeline communicating through a SQLite
+database at `~/.video_optimizer/state.db`:
 
-### Output mode (pick at most one)
+```
+  scan  ──►  probe cache (per-file: codec, bitrate, HDR, DV profile, …)
+   │
+   ▼
+  plan  ──►  pending decisions (which files? which target codec?)
+   │
+   ▼
+  apply ──►  encoded outputs + run report
+   │
+   ▼
+  cleanup    (later, when you're satisfied: removes originals)
+```
 
-| Flag | Effect |
-|---|---|
-| _(none)_ | **Default**: `keep` mode — outputs land alongside source as `<stem>.AV1.REENCODE.mkv`; originals untouched |
-| `--output DIR` | Mirror outputs into a separate directory tree under `DIR` |
-| `--replace` | Replace mode — outputs land alongside source, originals moved to a recycle dir |
-| `--mode {keep,side,replace}` | Explicit mode override |
-| `--recycle-to DIR` | With `--replace`: explicit recycle directory (default: auto-detect `@Recycle` / `#recycle` / `.Trash` under source, or create `.@Recycle`) |
+The path-taking subcommands (`optimize`, `SD`, `HD`, `UHD`, `UHD-FILM`,
+the bare invocation, and `wizard`) compose all four stages into one
+command. You don't have to think about scan/plan/apply individually.
+They exist as separate subcommands but are hidden from `--help` —
+power-user escape hatches for debugging rule tunings.
 
-### Run control
+### Output modes
 
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Print planned ffmpeg commands and exit |
-| `--limit N` | Process at most N candidates (0 = no limit) |
-| `--confirm` | Prompt per-file before encoding (default is auto-yes) |
-| `--cleanup-after` | Prompt to remove originals after a successful run |
-| `--no-auto-relax-cq` | Disable the UHD bloat fallback (default on; when on, a UHD encode that projects mid-encode or finishes ≥ 90% of the encoder's input size is retried once at CQ 21 + encoder preset `slow`) |
-| `--verbose` / `-v` | More chatter (timeout labels, preset tunings, etc.) |
+There are three. The default is `keep`, and that's the right answer
+for most cases.
+
+| Mode | Where outputs go | What happens to the original |
+|---|---|---|
+| **`keep`** *(default)* | Alongside the source as `<stem>.AV1.REENCODE.mkv` | Untouched. `cleanup` removes them later. |
+| **`replace`** | Alongside the source | Atomically moved to a recycle dir (auto-detected `@Recycle` / `#recycle` / `.Trash`, or `.@Recycle` is created). |
+| **`side`** | Mirrored under `--output DIR` | Untouched. Useful when the source filesystem is read-only. |
+
+You select via flags: `--replace` for replace mode, `--output DIR` for
+side mode, nothing for the default. Or be explicit with
+`--mode {keep,side,replace}`.
+
+### What gets re-encoded by default
+
+Any source that fires at least one non-advisory rule. The rule set
+covers the obvious cases:
+
+- **Non-AV1 video at any tier** — UHD/HD/SD all queue any non-AV1
+  source by default. AV1 is wildly more efficient than h.264 / HEVC /
+  MPEG-2 / VC-1 / etc., and CQ-based encoding preserves quality.
+- **Over-bitrate sources** — files whose video bitrate exceeds the flag
+  threshold for their resolution (1080p > 10 Mbps, 2160p > 32 Mbps,
+  etc.) — even AV1 sources, if they're abnormally fat.
+- **Container migration** — files in legacy containers (AVI, WMV, etc.)
+  get re-muxed to MKV even when the codec is fine.
+
+### What gets skipped by default
+
+The tool errs heavily on the side of *don't waste GPU time, don't
+clobber existing work*. Out of the box, it skips:
+
+- Files smaller than **100 MB** (likely trailers, samples, or extras)
+- Files in `Trailers/`, `Behind The Scenes/`, `Featurettes/`, etc.,
+  or with `-trailer` / `-bts` / `-deleted` filename suffixes
+- Files whose source codec is **already AV1**
+- Files whose `.AV1.REENCODE.mkv` sibling **already exists** (prior
+  run output sitting next to the source)
+- Files with the `REENCODE` token in their **own filename**
+- Files that hit the encoder watchdog **twice** (chronic stalls — see
+  `replace-list` for the manual-action queue)
+- **Dolby Vision Profile 5** sources (no clean HDR10 fallback)
+- **Low-bitrate sources** below the AV1 target for their resolution
+  (1080p < 5 Mbps, 2160p < 16 Mbps, etc.) — re-encoding wouldn't yield
+  meaningful savings and risks perceptual regression
+
+Each skip class has a corresponding `--allow-*` flag if you really
+want to override it (see "Advanced options" below).
+
+### Audio and subtitles: the 3-stream ladder
+
+Every encode produces a deterministic three-stream audio output:
+
+1. **Stream 0**: highest-quality passthrough (TrueHD or DTS-HD MA wins
+   over the same master's lossy variants)
+2. **Stream 1**: 5.1 tier (Opus 5.1, transcoded from stream 0 if the
+   source doesn't already have one)
+3. **Stream 2**: 2.0 tier (AAC 2.0, transcoded from stream 0)
+
+Subtitle streams are filtered to `--keep-langs` (default `en,und`).
+Image-based subs (PGS / VobSub) are dropped when targeting MP4 since
+MP4 can't carry them; otherwise they pass through.
+
+This replaces an older "keep every audio track in your language" rule
+that was producing 5+ streams on Blu-ray remuxes (parallel TrueHD +
+DTS-HD MA + multiple lossy + foreign-lang) and burning ~10 Mb/s on
+audio overhead. Override the new behavior with `--original-audio` if
+you want every track preserved via stream-copy.
 
 ### Dolby Vision
 
-| Flag | Effect |
-|---|---|
-| _(none)_ | **Default**: ffmpeg-bsf RPU strip on Profile 7 and Profile 8 sources; Profile 5 is skipped |
-| `--dv-p7-convert` | For Profile 7: opt into the dovi_tool convert + mkvmerge re-mux pipeline before encode (slower, requires both external tools on PATH; reach for it only when strip-only fails) |
+`av1_qsv` consistently wedges on DV sources — Profile 7 stalls at
+frame 0, Profile 8 stalls partway through. The fix is to strip the DV
+metadata in a one-pass pre-encode operation so what reaches `av1_qsv`
+is a plain HDR10 stream. Modern UHD content has an HDR10-compatible
+base layer underneath the DV metadata, so this preserves the wide
+colour gamut and high luma range.
 
-### Audio / subtitle overrides
+| DV Profile | Default behavior | Why |
+|---|---|---|
+| **Profile 8.x** (most modern UHD WEB-DLs and recent Blu-rays) | Strip DV RPU via ffmpeg's `dovi_rpu=strip=true` bitstream filter, encode the HDR10 base to AV1 | Base layer is already HDR10-compatible; strip is a one-pass bsf operation |
+| **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement layers) | Same RPU strip as P8. The P7 → P8 `dovi_tool convert` pipeline is preserved but opt-in via `--dv-p7-convert` | The simple strip works on most modern P7 sources and keeps the apply pipeline single-pass |
+| **Profile 5** (Apple TV+, some Vudu) | **Skipped permanently** | Base layer is *not* HDR10 — it's a custom DV-only colour space that requires the RPU to map. Stripping leaves a green/over-saturated mess; no clean fallback exists |
 
-| Flag | Effect |
-|---|---|
-| `--original-audio` | Keep every input audio track via stream-copy (default strips to `--keep-langs` and rebuilds a 3-stream ladder) |
-| `--original-subs` | Keep every input subtitle track via stream-copy (default strips to `--keep-langs`) |
+`--dv-p7-convert` runs the multi-stage P7 → P8 conversion using
+`dovi_tool convert --discard` followed by `mkvmerge` to re-mux.
+Requires both tools on `PATH`; the apply gate fails closed if either
+is missing rather than silently falling back.
 
-### Skip / inclusion overrides (advanced; default behavior is what you want)
+**Profile 10** (DV preserved through AV1 as OBU side-data) is on the
+radar but not implemented. Waiting on `dovi_tool inject-rpu`'s AV1
+support and on player ecosystems (Plex, Shield, etc.) recognising the
+resulting Profile 10 stream.
 
-These flags re-include content the tool skips by default. All hidden
-from `--help` for tidiness, but functional.
+### The UHD bloat fallback
 
-| Flag | What it re-includes |
-|---|---|
-| `--allow-reencoded` | Files already tagged `REENCODE` in their filename, AND files whose `.AV1.REENCODE.mkv` sibling already exists |
-| `--allow-av1` | AV1-source files (default: skipped because re-encoding AV1 is wasteful) |
-| `--allow-extras` | Plex-style trailer/extras directories and `-trailer` / `-bts` / etc. filenames |
-| `--allow-low-bitrate` | Sources whose video bitrate is below the AV1 target for their resolution (1080p < 5 Mbps, 2160p < 16 Mbps; see `BITRATE_FLAG_TABLE` in `presets.py`). Default skips them — sub-target sources can't yield meaningful AV1 savings and may regress perceptual quality. |
+UHD encodes are ambitious: CQ 15 with `veryslow`. Most of the time
+that produces a dramatically smaller file at the same perceptual
+quality. Sometimes — grain-dominated older film, mostly — `av1_qsv`
+spends its bit budget trying to preserve every grain particle and the
+output ends up the same size as (or larger than) the source.
 
-### Codec opt-out
+The bloat fallback catches this. At checkpoints during the encode
+(10%, 20%, 30%, 50%) the tool projects the final output size based on
+bytes-per-second so far. If projected size ≥ 90% of the encoder's
+input, ffmpeg gets killed and the file is retried once with the
+**UHD-FILM** tuning: CQ 21, encoder preset `slow`. The retry finishes
+~1.5–2× faster than `veryslow` would and produces a smaller output —
+counter-intuitive, but the encoder stops trying to preserve grain it
+was never going to compress efficiently anyway.
 
-The default behavior is to re-encode every non-AV1 source to AV1
-regardless of codec. If you want to leave specific source codecs
-untouched (typical case: an HEVC archive you trust), pass
-`--skip-codecs` with a comma-separated list of ffprobe codec names.
+This runs silently. If a UHD encode looks healthy at the checkpoints,
+nothing changes. Disable with `--no-auto-relax-cq` if you have a
+strong opinion about it.
 
-| Flag | Effect |
-|---|---|
-| `--skip-codecs hevc` | Skip HEVC sources at the plan gate |
-| `--skip-codecs hevc,vp9` | Skip both HEVC and VP9 |
-| `--skip-codecs h264,mpeg2video,mpeg4` | Skip h.264, MPEG-2 (DVD rips), and MPEG-4 (divx-era) |
+### The output report
 
-Names match `ffprobe -show_streams` output; case-insensitive.
-Common values: `h264`, `hevc`, `vp9`, `mpeg2video`, `mpeg4`,
-`vc1`, `wmv3`. Skipping `av1` is redundant — AV1 sources are
-already auto-skipped by `--allow-av1`'s default.
-
-### Tuning overrides (advanced; hidden from `--help` for tidiness, but functional)
-
-| Flag | Effect |
-|---|---|
-| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24, UHD-FILM 21; lower = better quality, larger file) |
-| `--keep-langs en,und` | Comma-separated language codes to retain (default `en,und`) |
-| `--hwaccel {auto,qsv,nvenc,vaapi,videotoolbox,software,none}` | Force a specific hw backend (default auto) |
-| `--hw-decode` / `--no-hw-decode` | Override the preset's hw-decode default |
-| `--min-size BYTES` | Skip files below this size at scan time (default 100 MB; accepts `100M`, `1G`, etc.) |
-| `--db PATH` | SQLite state file (default `~/.video_optimizer/state.db`) |
-| `--timeout SEC` | Per-file ffmpeg wall-clock cap (default `max(3600, 6 × duration)`; `0` disables) |
-
-### Subcommands
-
-| Subcommand | What it does |
-|---|---|
-| `<bare path>` | Implicit `optimize` (all three tiers) |
-| `optimize PATH` | Explicit form of the above |
-| `SD PATH` / `HD PATH` / `UHD PATH` | Same pipeline, single tier |
-| `UHD-FILM PATH` | UHD tier at CQ 21 + encoder preset `slow` — for grain-dominated older film where the default CQ bloats; same tuning the UHD bloat fallback retries at |
-| `wizard` | Interactive prompts → full pipeline |
-| `cleanup` | Remove originals from the most recent (or `--run N`) successful run |
-| `doctor` | Preflight checks: ffmpeg, encoders, GPU device, db |
-| `status` | Recent runs + pending decisions |
-| `list-encoders` | What ffmpeg encoders are available, and which gets picked per target |
-
-The following subcommands are hidden from `--help` but remain
-callable as power-user escape hatches:
-
-| Subcommand | What it does |
-|---|---|
-| `scan` / `reprobe` / `plan` / `apply` | Pipeline primitives — useful for iterating on rule tunings |
-| `replace-list` | Files that have stalled twice (candidates for finding a different release) |
-
----
-
-## Output report
-
-After every successful run, `video_optimizer` writes a per-run report to
-`~/.video_optimizer/reports/run-<N>.txt` with one line per file:
+After every run, a plain-text report is written to
+`~/.video_optimizer/reports/run-<N>.txt`:
 
 ```
 OK   3215 MB  /movies/foo.AV1.REENCODE.mkv  (from /movies/foo.mkv)
@@ -393,62 +381,86 @@ FAIL encoder_stalled  /movies/baz.mkv
 SKIP dolby_vision     /movies/qux.mkv
 ```
 
-The same data is in the SQLite db under `decisions_for_run(N)`. The
-`cleanup` subcommand uses it to know which originals are safe to remove.
+The same data lives in the SQLite db. `cleanup` reads it to know
+which originals are safe to remove.
 
 ---
 
-## Default skip behavior at a glance
+## Common options
 
-The tool errs heavily on the side of "don't waste GPU time and don't
-clobber existing work." Out of the box, it will not encode:
-
-- Files smaller than 100 MB (likely trailers, samples, or extras)
-- Files in `Trailers/`, `Behind The Scenes/`, `Featurettes/`, etc.
-  directories, or with `-trailer` / `-bts` / `-deleted` filename suffixes
-- Files whose source codec is already AV1
-- Files whose `.AV1.REENCODE.mkv` sibling already exists (prior run output)
-- Files with the `REENCODE` token in their own filename
-- Files that have hit the encoder watchdog twice (chronic stalls — see
-  `replace-list` for the manual-action queue)
-- Dolby Vision **Profile 5** sources (no clean HDR10 fallback). Profile 7
-  and Profile 8 sources are admitted; the apply layer strips the DV
-  metadata and encodes the HDR10 base layer to AV1.
-
-Each skip class has an `--allow-*` opt-in flag if you genuinely want to
-re-encode those files anyway.
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Print planned ffmpeg commands and exit. No encoding. |
+| `--limit N` | Process at most N candidates (0 = no limit) |
+| `--confirm` | Prompt per-file before encoding (default is auto-yes) |
+| `--cleanup-after` | Prompt to remove originals after a successful run |
+| `--verbose` / `-v` | More chatter (timeout labels, preset tunings, etc.) |
+| `--output DIR` | Mirror outputs into a separate tree under `DIR` |
+| `--replace` | Replace mode: move originals to a recycle dir as encodes complete |
+| `--recycle-to DIR` | With `--replace`: explicit recycle directory |
+| `--mode {keep,side,replace}` | Explicit mode override (rarely needed) |
+| `--no-auto-relax-cq` | Disable the UHD bloat fallback |
+| `--dv-p7-convert` | Use the dovi_tool convert pipeline for stubborn P7 sources |
+| `--original-audio` | Keep every input audio track via stream-copy |
+| `--original-subs` | Keep every input subtitle track via stream-copy |
 
 ---
 
-## Dolby Vision
+## Advanced options
 
-`av1_qsv` consistently wedges on DV sources (Profile 7 stalls at frame
-0; Profile 8 stalls partway through). The fix is to strip the DV
-metadata before encoding so what reaches `av1_qsv` is a plain HDR10
-stream — most modern UHD content has an HDR10-compatible base layer
-underneath the DV metadata, so this preserves the wide colour gamut and
-high luma range without losing any image data the player can use today.
+These are hidden from `--help` for tidiness but remain functional.
+Most are escape hatches for debugging or unusual library shapes.
 
-| DV Profile | Default behavior | Why |
-|---|---|---|
-| **Profile 8.x** (most modern UHD WEB-DLs and recent Blu-rays) | Strip DV RPU via ffmpeg's `dovi_rpu=strip=true` bitstream filter, encode the HDR10 base layer to AV1 | Base layer is already HDR10-compatible; strip is a one-pass bsf operation |
-| **Profile 7** (some UHD Blu-rays with FEL/MEL enhancement layers) | Same RPU strip as P8 by default. The P7→P8 `dovi_tool convert` pipeline is preserved but opt-in via `--dv-p7-convert` | The simple strip path works on most modern P7 sources and keeps the apply pipeline single-pass. The conversion pipeline remains available for stubborn P7 sources where strip-only fails |
-| **Profile 5** (Apple TV+, some Vudu) | Skip permanently | Base layer is *not* HDR10 — it's a custom DV-only colour space that requires the RPU to map. Stripping leaves a green/over-saturated mess; no clean HDR10 fallback exists |
+### Re-include something the tool skips
 
-**`--dv-p7-convert`** runs the multi-stage P7 → P8 conversion using
-`dovi_tool convert --discard` followed by `mkvmerge` to re-mux the
-stripped raw HEVC bitstream with the original audio and subtitles.
-Requires both `dovi_tool` and `mkvmerge` on `PATH` (see Install section);
-the apply gate fails closed if either is missing rather than silently
-falling back. Reach for it only when a specific P7 source fails the
-strip-only attempt.
+| Flag | What it re-includes |
+|---|---|
+| `--allow-reencoded` | Files already tagged `REENCODE`, AND files whose `.AV1.REENCODE.mkv` sibling exists |
+| `--allow-av1` | AV1-source files (default skipped because re-encoding AV1 is wasteful) |
+| `--allow-extras` | Plex-style trailer/extras directories and `-trailer` / `-bts` filenames |
+| `--allow-low-bitrate` | Sources whose video bitrate is below the AV1 target for their resolution |
 
-**Profile 10 (DV preserved through AV1)** — carrying DV metadata into
-the AV1 output as Profile 10 OBU side-data — is on the radar but not
-the default. It depends on `dovi_tool inject-rpu`'s AV1 support and on
-player ecosystems recognising the resulting Profile 10 stream. We'll
-revisit when tooling stabilises and Plex / Shield / other players have
-mainstream Profile 10 support.
+### Skip a codec entirely
+
+The default behavior is to re-encode every non-AV1 source. To leave
+specific codecs alone (typical case: an HEVC archive you trust), pass
+`--skip-codecs` with a comma-separated list of ffprobe codec names:
+
+```bash
+./video_optimizer.py /lib --skip-codecs hevc                  # leave HEVC alone
+./video_optimizer.py /lib --skip-codecs hevc,vp9              # leave HEVC and VP9 alone
+./video_optimizer.py /lib --skip-codecs h264,mpeg2video       # only re-encode HEVC
+```
+
+Names match `ffprobe -show_streams` output; case-insensitive. Common
+values: `h264`, `hevc`, `vp9`, `mpeg2video`, `mpeg4`, `vc1`, `wmv3`.
+(Skipping `av1` is redundant — AV1 sources are already auto-skipped.)
+
+### Tuning overrides
+
+| Flag | Effect |
+|---|---|
+| `--quality N` | Override CQ (UHD default 15, HD 21, SD 24, UHD-FILM 21; lower = better quality, larger file) |
+| `--keep-langs en,und` | Comma-separated language codes to retain |
+| `--hwaccel {auto,qsv,nvenc,vaapi,videotoolbox,software,none}` | Force a specific hw backend |
+| `--hw-decode` / `--no-hw-decode` | Override the preset's hw-decode default |
+| `--min-size BYTES` | Skip files below this size at scan time (default 100 MB; accepts `100M`, `1G`, etc.) |
+| `--db PATH` | SQLite state file (default `~/.video_optimizer/state.db`) |
+| `--timeout SEC` | Per-file ffmpeg wall-clock cap (default `max(3600, 6 × duration)`; `0` disables) |
+
+### Pipeline-primitive subcommands
+
+| Subcommand | What it does |
+|---|---|
+| `scan PATH` | Probe-cache only — populate the db without queueing anything |
+| `plan` | Run rules against the cache, write pending decisions |
+| `apply` | Encode pending decisions |
+| `reprobe PATH` | Force-refresh the probe cache (alias for `scan --no-probe-cache`) |
+| `replace-list` | Files that have hit the encoder watchdog twice (chronic stalls; candidates for finding a different release) |
+
+These are the building blocks the path-taking subcommands compose.
+You only need them if you're iterating on rule tunings or
+investigating a problem.
 
 ---
 
