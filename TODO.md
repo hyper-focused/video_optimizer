@@ -205,6 +205,14 @@ why.
       fault → retry; ffprobe-validation mismatch on the output → don't
       retry (the encoder did something, just wrong).
 
+      Vendor-aware fallback ordering: `av1_vaapi` is **not** a useful
+      fallback for NVIDIA hardware. NVENC isn't bridged through VAAPI
+      on Linux (the existing nvidia-vaapi-driver is decode-only).
+      So an NVIDIA box that fails `av1_nvenc` should skip
+      `av1_vaapi` and go straight to libsvtav1. Detect via "is
+      av1_vaapi available *and* is there a working VAAPI driver
+      (iHD or radeonsi) for it" rather than naive list-walking.
+
 - [ ] **`av1an` experimental backend (Battlemage dual-MFX exploit)** —
       Battlemage's BMG-G21 silicon ships with two MFX (media
       fixed-function) engines vs Alchemist's one — confirmed by Intel
