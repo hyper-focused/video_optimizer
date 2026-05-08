@@ -97,7 +97,7 @@ def _add_min_size_arg(p: argparse.ArgumentParser) -> None:
 
 def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `scan` subcommand."""
-    s = sub.add_parser("scan", help="Crawl a path and probe every video file.")
+    s = sub.add_parser("scan")
     s.add_argument("path", type=Path)
     s.add_argument("--no-recursive", action="store_true",
                    help="Do not descend into subdirectories.")
@@ -120,10 +120,7 @@ def _add_scan_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `reprobe` subcommand (alias for scan --no-probe-cache)."""
-    r = sub.add_parser(
-        "reprobe",
-        help="Force re-probe of files under a path; alias for scan --no-probe-cache.",
-    )
+    r = sub.add_parser("reprobe")
     r.add_argument("path", type=Path)
     r.add_argument("--no-recursive", action="store_true")
     r.add_argument("--workers", type=int, default=None,
@@ -137,8 +134,7 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `plan` subcommand."""
-    pl = sub.add_parser("plan",
-                        help="Run rules over the probe cache and list candidates.")
+    pl = sub.add_parser("plan")
     pl.add_argument("--rules", default=None,
                     help=f"Comma-separated rule names (default: all). "
                          f"Available: {','.join(rules.RULES.keys())}")
@@ -186,7 +182,7 @@ def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_apply_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `apply` subcommand and all its encode/output flags."""
-    ap = sub.add_parser("apply", help="Encode pending candidates.")
+    ap = sub.add_parser("apply")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print planned ffmpeg commands and exit without "
                          "encoding. Use this to preview what would happen "
@@ -352,11 +348,7 @@ def _add_list_encoders_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_replace_list_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `replace-list` subcommand."""
-    rl = sub.add_parser(
-        "replace-list",
-        help="List sources that have hit the av1_qsv encoder watchdog 2+ times "
-             "(candidates for finding a different release).",
-    )
+    rl = sub.add_parser("replace-list")
     _add_common_db_arg(rl)
 
 
@@ -531,7 +523,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="video_optimizer",
         description="Probe + rules + re-encode for video libraries.",
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=True,
+                           metavar="<subcommand>")
     _add_scan_parser(sub)
     _add_reprobe_parser(sub)
     _add_plan_parser(sub)

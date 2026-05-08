@@ -262,9 +262,15 @@ that prompts for path, output mode, and tier scope (All / UHD / UHD-FILM
 
 ```bash
 ./video_optimizer.py status              # recent runs + pending decisions
+./video_optimizer.py doctor              # preflight: ffmpeg / encoders / GPU / db
 ./video_optimizer.py list-encoders       # what ffmpeg encoders are available
-./video_optimizer.py replace-list        # files that have stalled twice
 ```
+
+A few additional subcommands exist as power-user escape hatches and
+are hidden from `--help` for tidiness: `scan`, `plan`, `apply`,
+`reprobe`, `replace-list`. They're the building blocks the path-taking
+subcommands compose internally; reach for them only when iterating
+on rule tunings or debugging.
 
 ---
 
@@ -365,8 +371,14 @@ already auto-skipped by `--allow-av1`'s default.
 | `doctor` | Preflight checks: ffmpeg, encoders, GPU device, db |
 | `status` | Recent runs + pending decisions |
 | `list-encoders` | What ffmpeg encoders are available, and which gets picked per target |
+
+The following subcommands are hidden from `--help` but remain
+callable as power-user escape hatches:
+
+| Subcommand | What it does |
+|---|---|
+| `scan` / `reprobe` / `plan` / `apply` | Pipeline primitives — useful for iterating on rule tunings |
 | `replace-list` | Files that have stalled twice (candidates for finding a different release) |
-| `scan` / `reprobe` / `plan` / `apply` | Pipeline primitives — useful for power users iterating on rule tunings |
 
 ---
 
