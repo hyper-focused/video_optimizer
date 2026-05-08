@@ -227,6 +227,26 @@ nuclear option requires the safety word.
 ./video_optimizer.py list-encoders       # what ffmpeg encoders are available
 ```
 
+### Audit for stragglers (orphan source files)
+
+Sometimes a run finishes but the source files don't get removed —
+maybe `cleanup` was never invoked, maybe a `--replace` run partially
+failed, maybe a previous session was interrupted between encode and
+disposal. The orphan audit walks the library, finds every
+`*.AV1.REENCODE.mkv`, and reports any same-stem source siblings still
+sitting next to it.
+
+```bash
+./audit_orphans.py /mnt/nas/media/Movies                    # read-only listing
+./audit_orphans.py /mnt/nas/media/Movies --json             # machine-readable
+./audit_orphans.py /mnt/nas/media/Movies \
+    --apply --recycle-to /mnt/nas/media/@Recycle/Movies     # actually move them
+```
+
+Read-only by default. `--apply` is required to move anything, and
+preserves the source-dir hierarchy under the recycle directory so
+nothing collides.
+
 ---
 
 ## How it actually works

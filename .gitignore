@@ -39,6 +39,9 @@ clear.py
 cleanup.py
 fix_*.py
 audit_*.py
+# Exception: audit_orphans.py is a committed periodic-spot-check tool,
+# not a one-off — see README.
+!audit_orphans.py
 
 # ffmpeg arg-parsing artifact: bare 'dovi_rpu=strip=true' on a CLI
 # without -bsf:v: gets created as an output file. Belt-and-braces.
