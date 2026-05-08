@@ -28,7 +28,10 @@ state.db-wal
 state.db-shm
 
 # Run logs (archive.sh, optimize, ad-hoc test runs — all .log in this repo
-# are run output, never source).
+# are run output, never source). The conventional landing spot is the
+# top-level `logs/` directory; the bare `*.log` pattern is the
+# belt-and-braces fallback for stragglers landing elsewhere.
+logs/
 *.log
 
 # Local one-shot recovery scripts (not project code)

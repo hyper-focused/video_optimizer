@@ -23,6 +23,20 @@ README's documented filename-rewrite examples. Run before touching
 
 External runtime deps: `ffmpeg` and `ffprobe` on `PATH`. `list-encoders` is the canonical pre-flight to confirm the local ffmpeg has the encoders the user expects (it parses `ffmpeg -encoders` and also reports `/dev/dri/renderD128` for VAAPI).
 
+## Run logs
+
+Stdout from production / test encode runs goes to the top-level `logs/`
+directory (gitignored). Convention is `logs/<DDMMM>-Run<N>.log` (e.g.
+`logs/8May-Run1.log`) or `logs/<short-tag>.log`. When kicking off a
+backgrounded run for the user, redirect there:
+
+```bash
+./video_optimizer.py UHD /mnt/nas/media/Movies > logs/8May-Run1.log 2>&1 &
+```
+
+Don't write run output to `tests/` — that directory is for the unit
+test suite only.
+
 ## Architecture: the pipeline and what glues it
 
 The CLI is a four-stage pipeline whose stages communicate **only through the SQLite db** (default `~/.video_optimizer/state.db`, override with `--db`). There is no in-process pipeline object — each subcommand opens the db, reads what it needs, writes its output rows, and exits.
