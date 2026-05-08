@@ -183,6 +183,65 @@ why.
 
 ## Encoding
 
+- [ ] **`av1an` experimental backend (Battlemage dual-MFX exploit)** —
+      Battlemage's BMG-G21 ships with two MFX (media fixed-function)
+      engines vs Alchemist's one. Today we drive a single `av1_qsv`
+      ffmpeg instance per file, which keeps one MFX busy and leaves
+      the second idle. Two angles worth exploring, both gated behind
+      a flag (e.g. `--backend av1an`):
+
+      **Angle 1 — chunked parallelism for raw throughput.**
+      av1an splits a source into scene-aligned chunks and runs N
+      encoder workers in parallel. With two `av1_qsv` workers pinned
+      to separate `/dev/dri/renderD12*` device nodes (if Battlemage
+      exposes both MFX engines as distinct render nodes; needs
+      verifying — `vainfo` against each node), a single feature-length
+      title could plausibly encode at ~1.7-1.9× our current rate.
+      The same effect is achievable from our own orchestrator by
+      spawning two `av1_qsv` ffmpeg children on adjacent files (see
+      "apply parallelism" TODO above) — that's simpler and avoids
+      av1an's chunked-quality discontinuity issue. So the throughput
+      story alone probably isn't enough to justify av1an.
+
+      **Angle 2 — scene-aware target-quality mode for grain-dominated
+      content.** This is where av1an genuinely earns its place. Today
+      our bloat fallback is binary: detect bloat at a checkpoint, kill
+      the encode, retry the *whole file* at CQ 21 + `slow`. Most of
+      the file didn't need the relaxed tuning — only the grainy
+      stretches did. av1an's `--target-quality` mode does a per-chunk
+      CQ search aiming at a fixed VMAF score, so a single film can
+      have CQ 15 on the clean digital scenes and CQ 22-24 on the
+      grain-dominated reels, without the user (or the orchestrator)
+      having to pre-classify. That's a real quality+size win on
+      titles like Princess Bride, Tron, The Godfather where the
+      grain density varies across the runtime.
+
+      **Caveats** — av1an's first-class encoder is `svt-av1` (CPU);
+      `av1_qsv` support exists but is less well-trodden and may need
+      a custom encoder template. Falling back to svt-av1 + QSV decode
+      is plausible but loses the GPU encode advantage. Concat-time
+      audio handling is encoded once on the coordinator so audio
+      ladder logic stays where it is. External dep: `av1an` binary
+      (Rust, `cargo install av1an` or prebuilt) plus `vmaf` for the
+      target-quality mode. All of this should be opt-in, gated behind
+      `--backend av1an` (or whatever name), and fall through to the
+      current single-instance `av1_qsv` path for users who don't
+      install av1an. Fail-closed at the apply gate if the binary is
+      missing — same pattern as `--dv-p7-convert`.
+
+      **Estimated scope**: probably 300-500 lines including a new
+      `optimizer/backends/av1an.py` (since this is the first time we'd
+      have backend pluralism, the encoder.py/_build_apply_command
+      split would need to grow a backend dispatch). Cleanest path:
+      get the throughput angle working end-to-end first as a proof of
+      concept (validates av1_qsv + av1an integration), then layer
+      target-quality on top. Bench against the existing serial path
+      on the same UHD-FILM titles the bloat fallback fires on; if
+      VMAF-targeted output is materially better than CQ 21 + `slow`
+      retry at comparable wall-clock, the feature graduates from
+      experimental to a recommended preset.
+
+
 - [x] **Multi-language stall pattern (AVC + HEVC)** — landed in
       v0.5.17 as a demuxer-side pre-strip via `_input_discard_args`.
       Diagnosis: hypothesis (2) from the original entry was correct.
