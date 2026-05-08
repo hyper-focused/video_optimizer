@@ -355,6 +355,29 @@ why.
 
 ## Tooling
 
+- [ ] **`audit` subcommand: library health summary** — read-only
+      report on the state of a library, sourced entirely from the
+      existing probe cache + rules engine. Output covers:
+        - file count, total size, codec breakdown (av1 / hevc / h264 /
+          legacy), tier breakdown (UHD / HD / SD)
+        - per-tier candidate counts and projected savings
+        - skip-bucket counts with the reason and the override flag
+          that re-includes them (already-AV1, sub-target bitrate,
+          DV Profile 5, already-reencoded, etc.)
+        - "projected total savings if you encoded everything" headline
+      `--json` flag for the same data as a single object so users can
+      pipe it through awk/jq/Grafana without us having to maintain a
+      dashboard. Stretch: per-codec / per-resolution histogram so
+      grain-prone titles (legacy h264 at HD with 25+ Mbps) surface
+      visually. The motivating use case is the Tdarr-style "what's
+      the state of my library?" question — we already have the data
+      from the probe cache, we just don't summarize it. New subcommand
+      should follow the existing pattern: open the db with the
+      `Database` context manager, frame the work between
+      `start_run("audit")` / `end_run()`, render via a new helper in
+      `optimizer/report.py`. No new state, no new flags on the existing
+      subcommands. Estimated ~150 lines.
+
 - [x] **`archive-uhd.sh` companion to `archive-hd.sh`** — landed
       in v0.5.14 by consolidating into a single `archive.sh` with a
       `--preset hd|uhd` flag (default `hd` for backwards-compat
