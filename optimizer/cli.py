@@ -517,6 +517,35 @@ def _add_wizard_parser(sub: "argparse._SubParsersAction") -> None:
     _add_common_db_arg(wz)
 
 
+def _add_rename_fix_parser(sub: "argparse._SubParsersAction") -> None:
+    """Register the `rename-fix` maintenance subcommand.
+
+    One-shot rename for already-encoded outputs that were written with
+    pre-fix naming (orphaned `+` between stripped codec tokens, and
+    HDR10Plus / DV tokens that don't survive the av1_qsv pipeline). The
+    walk only touches files whose stem already carries the `REENCODE`
+    marker so it can't disturb anything the tool didn't write.
+    """
+    rf = sub.add_parser(
+        "rename-fix",
+        help="Rename existing .REENCODE outputs through the current naming "
+             "rules. Dry-run by default; pass --apply to actually rename.",
+        description=(
+            "Walk PATH for files whose filename stem contains the "
+            "`REENCODE` marker, run the stem through the current av1 "
+            "rewrite rules, and rename to match (along with any same-stem "
+            "sidecars). Use this once after upgrading to clean up old "
+            "outputs whose names advertise DV / HDR10+ that the encode "
+            "path doesn't actually carry."
+        ),
+    )
+    rf.add_argument("path", type=Path,
+                    help="Directory to walk (recursive).")
+    rf.add_argument("--apply", action="store_true",
+                    help="Actually rename. Without this flag, prints a "
+                         "dry-run listing of OLD → NEW and exits.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argparse parser with all subcommands wired up."""
     p = argparse.ArgumentParser(
@@ -537,6 +566,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_preset_parsers(sub)
     _add_cleanup_parser(sub)
     _add_wizard_parser(sub)
+    _add_rename_fix_parser(sub)
     return p
 
 
@@ -2697,7 +2727,7 @@ _FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
 KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
     "scan", "reprobe", "plan", "apply", "status",
     "list-encoders", "replace-list", "doctor",
-    "optimize", "cleanup", "wizard",
+    "optimize", "cleanup", "wizard", "rename-fix",
 }) | frozenset(PRESETS.keys())
 
 
@@ -3163,6 +3193,143 @@ def _wizard_run_cleanup_prompt(args: argparse.Namespace) -> None:
               "later when you're ready.")
 
 
+_REENCODE_STEM_MARKER = re.compile(r"(?<![A-Za-z0-9])REENCODE(?![A-Za-z0-9])",
+                                   re.IGNORECASE)
+
+
+def _has_reencode_marker(stem: str) -> bool:
+    """True if the stem carries the tool's `REENCODE` token as a standalone word."""
+    return bool(_REENCODE_STEM_MARKER.search(stem))
+
+
+def _plan_rename_group(video: Path) -> tuple[str, list[Path]] | None:
+    """For a video file already tagged REENCODE, compute its canonical stem.
+
+    Returns (new_stem, siblings) where siblings is every file in the same
+    directory whose stem == video.stem (the .mkv plus any .nfo / .srt /
+    etc.). Returns None if the stem is already canonical.
+    """
+    new_stem = naming.rewrite_codec_tokens(video.stem, "av1", dotted=True)
+    if new_stem == video.stem:
+        return None
+    siblings = [p for p in video.parent.iterdir()
+                if p.is_file() and p.stem == video.stem]
+    return new_stem, siblings
+
+
+def _collect_rename_plans(
+    root: Path,
+) -> tuple[list[tuple[Path, Path, list[Path]]], list[tuple[Path, Path]]]:
+    """Walk `root` and return (planned, skipped_collisions).
+
+    planned holds (old_video_path, new_video_path, siblings); siblings
+    is every sibling sharing the old stem so sidecars travel with the
+    video. skipped_collisions holds (old, new) pairs where the target
+    name already exists and the rename would clobber.
+    """
+    skip_dirs = crawler._SKIP_DIRS  # noqa: SLF001 — maintenance-only command
+    planned: list[tuple[Path, Path, list[Path]]] = []
+    collisions: list[tuple[Path, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        d = Path(dirpath)
+        for fn in filenames:
+            fp = d / fn
+            if fp.suffix.lower() not in crawler.SUPPORTED_EXTENSIONS:
+                continue
+            if not _has_reencode_marker(fp.stem):
+                continue
+            plan = _plan_rename_group(fp)
+            if plan is None:
+                continue
+            new_stem, siblings = plan
+            new_video = fp.with_name(f"{new_stem}{fp.suffix}")
+            if new_video.exists() and new_video != fp:
+                collisions.append((fp, new_video))
+                continue
+            planned.append((fp, new_video, siblings))
+    return planned, collisions
+
+
+def _print_rename_plan(
+    root: Path,
+    planned: list[tuple[Path, Path, list[Path]]],
+    collisions: list[tuple[Path, Path]],
+) -> None:
+    print(f"{len(planned)} file(s) to rename under {root}:\n")
+    for old_video, new_video, siblings in planned:
+        print(f"  {old_video.name}")
+        print(f"  → {new_video.name}")
+        extras = [s for s in siblings
+                  if s.suffix.lower() != old_video.suffix.lower()]
+        for s in extras:
+            print(f"    + sidecar: {s.name} → {new_video.stem}{s.suffix}")
+        print()
+    if collisions:
+        print(f"{len(collisions)} file(s) skipped — target already exists:")
+        for old, new in collisions:
+            print(f"  {old.name}\n    ↛ {new.name} (exists)")
+        print()
+
+
+def _apply_rename_plan(
+    planned: list[tuple[Path, Path, list[Path]]],
+) -> tuple[int, list[tuple[Path, str]]]:
+    renamed = 0
+    failed: list[tuple[Path, str]] = []
+    for _old_video, new_video, siblings in planned:
+        new_stem = new_video.stem
+        for s in siblings:
+            target = s.with_name(f"{new_stem}{s.suffix}")
+            if target.exists() and target != s:
+                failed.append((s, f"target exists: {target.name}"))
+                continue
+            try:
+                s.rename(target)
+                renamed += 1
+            except OSError as exc:
+                failed.append((s, str(exc)))
+    return renamed, failed
+
+
+def cmd_rename_fix(args: argparse.Namespace) -> int:
+    """Rename existing .REENCODE outputs through the current av1 naming rules.
+
+    Walks `args.path` for video files whose stem carries the `REENCODE`
+    token (the marker every preset-driven encode appends), runs each
+    stem through `naming.rewrite_codec_tokens(stem, 'av1')`, and renames
+    when the result differs. Same-stem sidecars (.nfo, .srt, etc.) move
+    with the video so Radarr/Sonarr metadata stays paired. Dry-run by
+    default; `--apply` performs the rename via `Path.rename`. Skips any
+    rename whose target already exists.
+    """
+    root = args.path
+    if not root.is_dir():
+        print(f"path is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    planned, collisions = _collect_rename_plans(root)
+
+    if not planned and not collisions:
+        print(f"no .REENCODE files in {root} need renaming")
+        return 0
+
+    _print_rename_plan(root, planned, collisions)
+
+    if not args.apply:
+        print("dry run; pass --apply to perform the renames")
+        return 0
+
+    renamed, failed = _apply_rename_plan(planned)
+    print(f"renamed {renamed} file(s)")
+    if failed:
+        print(f"{len(failed)} failure(s):")
+        for path, why in failed:
+            print(f"  {path.name}: {why}")
+        return 1
+    return 0
+
+
 def cmd_wizard(args: argparse.Namespace) -> int:
     """Interactive prompt-based workflow.
 
@@ -3320,6 +3487,7 @@ def main(argv: list[str] | None = None) -> int:
         "optimize": cmd_optimize,
         "cleanup": cmd_cleanup,
         "wizard": cmd_wizard,
+        "rename-fix": cmd_rename_fix,
     }
     # Preset subcommands all dispatch to the same wrapper.
     for preset_name in PRESETS:

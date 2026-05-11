@@ -66,6 +66,102 @@ class CodecRewriteTests(unittest.TestCase):
             "Movie.2010.1080p-GRP.HEVC",
         )
 
+    def test_joined_codec_pair_drops_orphan_plus(self):
+        """`HEVC+H.265` pairs collapse cleanly without leaving a stray `+`.
+
+        Real-world example from the TRON: Ares (2025) WEB-DL release; left
+        a `.+.` in the rewritten name before this was handled.
+        """
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "TRON.Ares.2025.WEBDL-2160p.HEVC.EAC35.1.HEVC+H.265", "av1",
+            ),
+            "TRON.Ares.2025.WEBDL-2160p.EAC35.1.AV1",
+        )
+
+    def test_av1_target_substitutes_dv_hdr10plus_with_hdr10(self):
+        """av1_qsv loses HDR10+ dynamic + DV RPU, but the static HDR10 base
+        layer survives. Substitute the first DV/HDR10+ token with `HDR10`
+        so the filename advertises what's actually in the container.
+        """
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "TRON.Ares.2025.WEBDL-2160p.HEVC.DV.HDR10Plus.EAC35.1.HEVC+H.265",
+                "av1",
+            ),
+            "TRON.Ares.2025.WEBDL-2160p.HDR10.EAC35.1.AV1",
+        )
+
+    def test_av1_target_preserves_static_hdr10_token(self):
+        """Static HDR10 (mastering display + MaxCLL) IS preserved by av1_qsv."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2020.Bluray-2160p.HDR10.HEVC", "av1",
+            ),
+            "Movie.2020.Bluray-2160p.HDR10.AV1",
+        )
+
+    def test_av1_target_substitutes_dolby_vision_with_hdr10(self):
+        """`Dolby Vision` and `HDR10+` both substitute to HDR10."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2024.Dolby.Vision.HDR10+.HEVC", "av1",
+            ),
+            "Movie.2024.HDR10.AV1",
+        )
+
+    def test_av1_target_dv_only_gains_hdr10(self):
+        """DV Profile 7/8 sources have an HDR10 base layer; after RPU strip
+        the file is plain HDR10 and must be labelled so."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2024.Remux-2160p.DV.TrueHD.Atmos7.1.HEVC", "av1",
+            ),
+            "Movie.2024.Remux-2160p.HDR10.TrueHD.Atmos7.1.AV1",
+        )
+
+    def test_av1_target_hdr10plus_only_gains_hdr10(self):
+        """HDR10+ source loses dynamic metadata but keeps static HDR10."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2024.WEBDL-2160p.HDR10Plus.EAC3.HEVC", "av1",
+            ),
+            "Movie.2024.WEBDL-2160p.HDR10.EAC3.AV1",
+        )
+
+    def test_av1_target_does_not_duplicate_when_hdr10_already_present(self):
+        """If the source filename already says `HDR10`, just strip the lost
+        DV/HDR10+ tokens — don't insert a second HDR10."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2024.Remux-2160p.DV.HDR10.TrueHD.HEVC", "av1",
+            ),
+            "Movie.2024.Remux-2160p.HDR10.TrueHD.AV1",
+        )
+
+    def test_av1_target_does_not_add_hdr10_to_sdr_sources(self):
+        """SDR source (no DV / HDR / HDR10+ tokens) must not gain HDR10."""
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2010.Bluray-1080p.HEVC", "av1"),
+            "Movie.2010.Bluray-1080p.AV1",
+        )
+
+    def test_dv_inside_other_words_not_stripped(self):
+        """`DV` is short — make sure it doesn't eat `DVD` or similar."""
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2010.DVDRip.HEVC", "av1"),
+            "Movie.2010.DVDRip.AV1",
+        )
+
+    def test_hevc_target_keeps_hdr10plus_and_dv(self):
+        """Targeting hevc preserves DV/HDR10+ tokens (they can survive)."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2024.DV.HDR10Plus.x264-GRP", "hevc",
+            ),
+            "Movie.2024.DV.HDR10Plus-GRP.HEVC",
+        )
+
 
 class StyleDetectionTests(unittest.TestCase):
     def test_dotted_dominant(self):
