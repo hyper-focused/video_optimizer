@@ -369,6 +369,46 @@ radar but not implemented. Waiting on `dovi_tool inject-rpu`'s AV1
 support and on player ecosystems (Plex, Shield, etc.) recognising the
 resulting Profile 10 stream.
 
+#### Output filename reflects what's actually in the container
+
+The encoded file's name is scrubbed to match what survives the av1
+pipeline so Plex / Jellyfin / Radarr don't try to map streams that
+aren't there:
+
+| Source filename token | In the AV1 output | Why |
+|---|---|---|
+| `DV`, `DoVi`, `Dolby.Vision` | Removed (or substituted with `HDR10` — see below) | RPU is stripped before the encoder sees the frames |
+| `HDR10Plus`, `HDR10+` | Removed (or substituted with `HDR10`) | `av1_qsv` doesn't carry the SMPTE 2094-40 dynamic metadata |
+| `HDR10`, `HDR` | Preserved | Static mastering display + MaxCLL flow through implicitly |
+
+When the source advertised DV or HDR10+ but no plain `HDR10` token,
+the first stripped token is replaced with `HDR10` to keep the file
+labelled as HDR. DV Profile 7/8 sources always have an HDR10 base
+layer, so this faithfully reflects the residual stream. If `HDR10` is
+already in the name, it isn't duplicated; if the source was SDR, no
+spurious `HDR10` is injected.
+
+Example: `Movie.2024.Remux-2160p.DV.HDR10Plus.TrueHD.HEVC.mkv` →
+`Movie.2024.Remux-2160p.HDR10.TrueHD.AV1.REENCODE.mkv`.
+
+#### Cleaning up legacy outputs: `rename-fix`
+
+Encodes from before this scrubbing landed have filenames that
+overstate what's in the container (claiming DV / HDR10+ that the
+av1_qsv pipeline stripped). `rename-fix` walks a tree, runs each
+existing `.REENCODE` stem through the current rules, and renames in
+place — including same-stem sidecars (`.nfo`, `.srt`, …) so Radarr /
+Sonarr metadata stays paired. Dry-run by default; `--apply` performs
+the rename. Targets that already exist are skipped, never overwritten.
+
+```bash
+./video_optimizer.py rename-fix /path/to/library          # preview
+./video_optimizer.py rename-fix /path/to/library --apply  # do it
+```
+
+Only files whose stem carries the tool's `REENCODE` marker are
+considered, so this is safe to point at a mixed library.
+
 ### The UHD bloat fallback
 
 UHD encodes are ambitious: CQ 15 with `veryslow`. Most of the time
@@ -477,6 +517,7 @@ values: `h264`, `hevc`, `vp9`, `mpeg2video`, `mpeg4`, `vc1`, `wmv3`.
 | `apply` | Encode pending decisions |
 | `reprobe PATH` | Force-refresh the probe cache (alias for `scan --no-probe-cache`) |
 | `replace-list` | Files that have hit the encoder watchdog twice (chronic stalls; candidates for finding a different release) |
+| `rename-fix PATH` | Rename existing `.REENCODE` outputs through the current naming rules (scrubs DV / HDR10+ tokens that don't survive `av1_qsv`). Dry-run by default; `--apply` to perform |
 
 These are the building blocks the path-taking subcommands compose.
 You only need them if you're iterating on rule tunings or
