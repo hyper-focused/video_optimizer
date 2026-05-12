@@ -121,43 +121,36 @@ PRESETS: dict[str, dict[str, object]] = {
 # Source codecs that benefit from forced HW decode regardless of preset
 # --------------------------------------------------------------------------- #
 
-# Codecs whose libavcodec software decoder doesn't reliably keep pace with
-# av1_qsv's ~220 fps HD supply rate on this hardware, and which Battlemage
-# MFX can hardware-decode. Routing these through `-hwaccel qsv` keeps the
-# pipeline zero-copy GPU-to-GPU and unblocks the encoder.
+# Source codecs to force through the QSV hardware decoder regardless of
+# preset. Currently empty.
 #
-# Membership criteria (BOTH must hold):
-#   1. libavcodec's software decode for this codec is single-threaded or
-#      only weakly multi-threaded, so CPU decode caps below encoder supply.
-#   2. ffmpeg exposes a QSV decoder for it on this Battlemage build
-#      (h264, hevc, av1, mpeg2, vc1, vp8, vp9, mjpeg, vvc — confirmed via
-#      `ffmpeg -decoders | grep _qsv`).
+# Past membership: `vc1` and `vp9` were added on the theory that their
+# weakly-threaded libavcodec decoders starve av1_qsv at HD. That analysis
+# turned out to be empirically wrong on Battlemage MFX: `vc1_qsv` wedged
+# at frame 0 on Lethal Weapon 1987 (a representative 1080p VC-1 Blu-ray
+# remux), no progress for 13+ minutes, watchdog couldn't fire because
+# ffmpeg emitted no progress lines at all. Same failure signature as
+# the DV-on-UHD wedge.
 #
-# Why each entry is here:
-#   - `vc1`:  effectively single-threaded (overlap-smoothing + loop-filter
-#             dependencies cross slice boundaries; libavcodec has no frame
-#             threading). Measured 126 fps for a 1080p Blu-ray remux on Thor
-#             — av1_qsv encoder thread sat at 6% CPU waiting.
-#   - `vp9`:  tile threading works *when the source was tile-encoded* (modern
-#             YouTube), but older WebM rips without tiles fall back to weakly
-#             threaded slice decode (~100-150 fps at 1080p). Defensive flip:
-#             unnecessary hwaccel cost is negligible, unbreached starvation is
-#             expensive.
+# Lesson: "ffmpeg exposes <codec>_qsv" is necessary but not sufficient.
+# The QSV decoder paths for legacy codecs (VC-1, VP9) are corner-case-
+# prone on this hardware; the CPU-decode path is slower but reliable.
+# Throughput cost: VC-1 HD encodes run at ~126 fps instead of ~220 fps.
+# We trade that against not stalling the queue.
 #
-# Why some likely-looking candidates are NOT here:
-#   - `wmv3` / `wmv1` / `wmv2`: single-threaded software decode, but no QSV
-#     decoder exposed for these codec IDs. Adding would crash. Future option:
-#     bsf-wrap WMV3 as VC-1 and route through vc1_qsv (TODO).
-#   - `mpeg4` (XviD/DivX): slice-threaded software decode is fast enough, and
-#     no QSV decoder for MPEG-4 Part 2 on modern Intel silicon anyway.
-#   - `rv30` / `rv40` / `cinepak` / `indeo`: no QSV decoder, also nearly
-#     nonexistent in real archives.
+# Membership criteria for adding a codec back in:
+#   1. ffmpeg exposes the QSV decoder (`ffmpeg -decoders | grep _qsv`).
+#   2. libavcodec's software decoder is meaningfully behind the encoder
+#      supply rate, *measured* on this hardware (not extrapolated from
+#      threading-model arguments).
+#   3. The QSV decoder reaches the encoder on a representative source
+#      from the user's library without wedging — verified empirically,
+#      not assumed from spec-sheet support.
 #
-# Used by cli._build_apply_command to override hw_decode upward for matching
-# source codecs. The complementary direction (forcing hw_decode off for codecs
-# the QSV decoder can't handle) is not needed today — every codec Battlemage
-# can encode to, it can also decode from.
-SLOW_CPU_DECODE_CODECS: frozenset[str] = frozenset({"vc1", "vp9"})
+# Until criterion 3 is satisfied for any specific codec, this set stays
+# empty. cli._build_apply_command still consults it; the override is just
+# a no-op today.
+SLOW_CPU_DECODE_CODECS: frozenset[str] = frozenset()
 
 
 # --------------------------------------------------------------------------- #

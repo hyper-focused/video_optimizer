@@ -128,8 +128,25 @@ class Candidate:
 
     @property
     def total_projected_savings_mb(self) -> float:
-        """Sum of per-rule projected savings (MB), ignoring None entries."""
-        return sum(v.projected_savings_mb or 0.0 for v in self.fired)
+        """Best (largest) per-rule projected savings, capped at source size.
+
+        Per-rule projections are NOT orthogonal contributions — they're
+        competing estimates of the same encode. `over_bitrate`,
+        `legacy_codec`, and `hd_non_av1` all fire together on a typical
+        VC-1 or MPEG-2 1080p remux and each independently predicts what
+        the AV1 output will save. Summing them produced obviously wrong
+        totals (Lethal Weapon 1987: 23 GB source, 32.4 GB "projected
+        savings"), so we use max instead.
+
+        Cap at 95% of source size: even an aggressive AV1 encode keeps
+        the audio tracks + a minimum video bitrate, so savings can't
+        plausibly exceed ~95% of source.
+        """
+        if not self.fired:
+            return 0.0
+        best = max((v.projected_savings_mb or 0.0) for v in self.fired)
+        size_mb = (self.probe.size or 0) / (1024 * 1024)
+        return min(best, size_mb * 0.95)
 
     @property
     def rule_names(self) -> list[str]:

@@ -506,12 +506,12 @@ class EncoderDenoiseIntegrationTests(unittest.TestCase):
 
 
 class CodecAwareHwDecodeTests(unittest.TestCase):
-    """VC-1 sources should be routed through QSV HW decode even when the
-    preset (HD/SD) defaults `hw_decode` to False, because libavcodec's VC-1
-    decoder is single-threaded and starves the av1_qsv encoder otherwise.
-
-    Pins the behaviour added to `_build_apply_command`: codec-aware override
-    of `hw_decode` for codecs in `SLOW_CPU_DECODE_CODECS`.
+    """`SLOW_CPU_DECODE_CODECS` is currently empty after the VC-1 hwaccel
+    attempt wedged at frame 0 on Lethal Weapon 1987. These tests pin two
+    things: (a) the override mechanism in `_build_apply_command` still
+    works (so any future additions to the set will route correctly), and
+    (b) the codecs we previously had in the set (VC-1, VP9) now stay on
+    the preset's `hw_decode` default — CPU decode for HD.
     """
 
     def _build(self, codec: str, *, hw_decode_default: bool = False,
@@ -549,55 +549,79 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
             return cmd, desc
         return cmd
 
-    def test_vc1_source_forces_hw_decode(self):
-        """HD-preset default (hw_decode=False) is overridden to True for VC-1."""
+    def test_vc1_source_stays_on_cpu_at_hd_default(self):
+        """Empirical: vc1_qsv wedges at frame 0 on at least one Blu-ray
+        VC-1 source (Lethal Weapon 1987). VC-1 was removed from
+        SLOW_CPU_DECODE_CODECS pending evidence the QSV path is reliable.
+        """
         cmd = self._build("vc1", hw_decode_default=False)
-        joined = " ".join(cmd)
-        self.assertIn("-hwaccel qsv", joined)
-        self.assertIn("-hwaccel_output_format qsv", joined)
+        self.assertNotIn("-hwaccel", cmd)
+
+    def test_vp9_source_stays_on_cpu_at_hd_default(self):
+        """VP9 was added defensively alongside VC-1; pulled back at the
+        same time pending empirical evidence on Battlemage.
+        """
+        cmd = self._build("vp9", hw_decode_default=False)
+        self.assertNotIn("-hwaccel", cmd)
 
     def test_h264_source_keeps_preset_default(self):
-        """H.264 stays on CPU decode at the HD preset's default."""
+        """H.264 at HD stays on CPU decode (frame-threaded; keeps up with
+        av1_qsv supply rate at ~220 fps)."""
         cmd = self._build("h264", hw_decode_default=False)
         self.assertNotIn("-hwaccel", cmd)
 
     def test_mpeg2_source_keeps_preset_default(self):
-        """MPEG-2 software decode is frame-threaded and fast — no override."""
+        """MPEG-2 software decode is slice-threaded; ~220 fps on Thor."""
         cmd = self._build("mpeg2video", hw_decode_default=False)
         self.assertNotIn("-hwaccel", cmd)
 
-    def test_vc1_respects_explicit_hw_decode_true(self):
-        """UHD preset / explicit override stays True (no double-toggle)."""
-        cmd = self._build("vc1", hw_decode_default=True)
-        joined = " ".join(cmd)
-        self.assertIn("-hwaccel qsv", joined)
-
-    def test_vp9_source_forces_hw_decode(self):
-        """VP9 software decode degrades to single-thread on non-tile streams,
-        and Battlemage has a vp9_qsv decoder — defensive flip."""
-        cmd = self._build("vp9", hw_decode_default=False)
+    def test_explicit_hw_decode_true_still_works(self):
+        """UHD preset / explicit user override still routes through QSV.
+        The empty SLOW_CPU_DECODE_CODECS only affects the codec-aware
+        upward override; an explicit True from the preset/CLI is untouched.
+        """
+        cmd = self._build("hevc", hw_decode_default=True)
         joined = " ".join(cmd)
         self.assertIn("-hwaccel qsv", joined)
         self.assertIn("-hwaccel_output_format qsv", joined)
 
-    def test_vp8_source_keeps_preset_default(self):
-        """VP8 is too rare in HD libraries to bother with — guard against
-        accidental inclusion if SLOW_CPU_DECODE_CODECS grows."""
-        cmd = self._build("vp8", hw_decode_default=False)
-        self.assertNotIn("-hwaccel", cmd)
+    def test_override_mechanism_intact_for_future_additions(self):
+        """Mechanism guard: if a codec is added back to
+        SLOW_CPU_DECODE_CODECS, `_build_apply_command` must still flip
+        hw_decode to True for it. Verifies via monkey-patching the set
+        with a temporary entry rather than rebuilding the import.
+        """
+        import argparse
+        import json as _json
+        from pathlib import Path
+        from unittest.mock import patch
 
-    def test_wmv3_source_keeps_preset_default(self):
-        """WMV3 has slow CPU decode but no QSV decoder — it stays on CPU
-        to avoid an ffmpeg startup failure under `-hwaccel qsv`."""
-        cmd = self._build("wmv3", hw_decode_default=False)
-        self.assertNotIn("-hwaccel", cmd)
+        from optimizer.cli import _build_apply_command
+
+        pr = make_probe(codec="vc1", height=1080, video_bitrate=20_000_000)
+        dec = {"rules_fired_json": _json.dumps(["hd_non_av1"])}
+        args = argparse.Namespace(
+            hw_decode=False, quality=21, compat_audio=True,
+            original_audio=False, original_subs=False,
+            encoder_preset="veryslow", qsv_overrides={},
+        )
+        with patch("optimizer.cli.SLOW_CPU_DECODE_CODECS",
+                   frozenset({"vc1"})):
+            cmd, _desc = _build_apply_command(
+                dec, pr, Path("/tmp/out.mkv"),
+                target_container="mkv", enc_name="av1_qsv",
+                keep_langs=["en", "und"], args=args,
+            )
+        self.assertIn("-hwaccel qsv", " ".join(cmd))
 
     # ----- descriptor format -----
 
-    def test_descriptor_reports_qsv_decode_for_vc1(self):
-        """Live log lines should advertise QSV decode for hwaccel'd codecs."""
-        _cmd, desc = self._build("vc1", hw_decode_default=False, return_desc=True)
-        self.assertIn("decode vc1 (QSV)", desc)
+    def test_descriptor_reports_qsv_decode_when_hw_decode_on(self):
+        """Descriptor advertises QSV decode when the UHD preset / explicit
+        override sets hw_decode=True. Uses a HEVC source (which the UHD
+        preset would actually pick up)."""
+        _cmd, desc = self._build("hevc", hw_decode_default=True, return_desc=True)
+        self.assertIn("decode hevc (QSV)", desc)
         self.assertIn("encode via av1_qsv", desc)
 
     def test_descriptor_reports_cpu_decode_for_h264(self):
@@ -605,6 +629,12 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
         _cmd, desc = self._build("h264", hw_decode_default=False, return_desc=True)
         self.assertIn("decode h264 (CPU)", desc)
         self.assertIn("encode via av1_qsv", desc)
+
+    def test_descriptor_reports_cpu_decode_for_vc1_at_hd_default(self):
+        """Companion to the policy change: VC-1 at HD now stays on CPU
+        decode, so the descriptor must reflect that (was QSV pre-rollback)."""
+        _cmd, desc = self._build("vc1", hw_decode_default=False, return_desc=True)
+        self.assertIn("decode vc1 (CPU)", desc)
 
     def test_descriptor_omits_dv_strip_when_not_requested(self):
         """Regression guard: the prior `source_override is not None` check
@@ -617,6 +647,80 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
         """When the caller actually ran the strip, the descriptor advertises it."""
         _cmd, desc = self._build("hevc", return_desc=True, dv_pre_pass=True)
         self.assertIn("(+ DV strip pre-pass)", desc)
+
+
+# --------------------------------------------------------------------------- #
+# Candidate.total_projected_savings_mb
+# --------------------------------------------------------------------------- #
+
+
+class CandidateProjectedSavingsTests(unittest.TestCase):
+    """Per-rule projections are competing estimates of the same encode, not
+    additive contributions. Pin: take max, cap at 95% of source size.
+
+    Canary case from production: Lethal Weapon 1987 — 23 GB source, three
+    rules fired (over_bitrate, legacy_codec, hd_non_av1) summing to 32.4
+    GB of "projected savings", impossibly larger than the source.
+    """
+
+    def _candidate(self, *, source_mb: float, per_rule_mb: list[float]):
+        """Build a Candidate with N fired rules, each projecting given MB."""
+        from optimizer.models import Candidate, RuleVerdict
+        pr = make_probe(codec="vc1", height=1080)
+        pr.size = int(source_mb * 1024 * 1024)
+        fired = [
+            RuleVerdict(rule=f"rule_{i}", fired=True,
+                        reason="t", severity="medium",
+                        projected_savings_mb=mb, notes={})
+            for i, mb in enumerate(per_rule_mb)
+        ]
+        return Candidate(probe=pr, fired=fired, target="av1+mkv",
+                         remux_only=False, is_hdr=False)
+
+    def test_takes_max_not_sum_of_overlapping_estimates(self):
+        """Three rules predicting 18 / 11 / 5 GB savings should NOT add to
+        34 GB — they describe the same re-encode. Max wins (18 GB)."""
+        cand = self._candidate(
+            source_mb=23_000,
+            per_rule_mb=[18_000, 11_000, 5_000],
+        )
+        self.assertEqual(cand.total_projected_savings_mb, 18_000)
+
+    def test_caps_at_95_percent_of_source_size(self):
+        """over_bitrate can overshoot on grain-heavy older sources where
+        bitrate × duration > size. Cap to keep the displayed number
+        plausible (95% leaves room for the audio track survivors)."""
+        cand = self._candidate(
+            source_mb=10_000,
+            per_rule_mb=[25_000],  # rule overshoot
+        )
+        # 95% of 10 000 = 9 500.
+        self.assertEqual(cand.total_projected_savings_mb, 9_500)
+
+    def test_handles_none_savings_from_advisory_rules(self):
+        """hdr_advisory has projected_savings_mb=None and must be ignored,
+        not crash the max() call."""
+        from optimizer.models import Candidate, RuleVerdict
+        pr = make_probe(codec="hevc", height=2160)
+        pr.size = 50_000 * 1024 * 1024
+        fired = [
+            RuleVerdict(rule="hdr_advisory", fired=True, reason="t",
+                        severity="medium", projected_savings_mb=None,
+                        notes={}),
+            RuleVerdict(rule="uhd_non_av1", fired=True, reason="t",
+                        severity="high", projected_savings_mb=15_000,
+                        notes={}),
+        ]
+        cand = Candidate(probe=pr, fired=fired, target="av1+mkv",
+                         remux_only=False, is_hdr=True)
+        self.assertEqual(cand.total_projected_savings_mb, 15_000)
+
+    def test_returns_zero_for_no_fired_rules(self):
+        """Defensive: degenerate candidate with no rules → 0 savings.
+        (In normal flow we wouldn't construct such a Candidate, but
+        max([]) crashes; verify the guard.)"""
+        cand = self._candidate(source_mb=10_000, per_rule_mb=[])
+        self.assertEqual(cand.total_projected_savings_mb, 0.0)
 
 
 if __name__ == "__main__":
