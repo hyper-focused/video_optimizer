@@ -515,7 +515,9 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
     """
 
     def _build(self, codec: str, *, hw_decode_default: bool = False,
-               denoise_codec: str | None = None):
+               denoise_codec: str | None = None,
+               return_desc: bool = False,
+               dv_pre_pass: bool = False):
         import argparse
         import json as _json
         from pathlib import Path
@@ -535,13 +537,16 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
             encoder_preset="veryslow",
             qsv_overrides={},
         )
-        cmd, _kind = _build_apply_command(
+        cmd, desc = _build_apply_command(
             dec, pr, Path("/tmp/out.mkv"),
             target_container="mkv",
             enc_name="av1_qsv",
             keep_langs=["en", "und"],
             args=args,
+            dv_pre_pass=dv_pre_pass,
         )
+        if return_desc:
+            return cmd, desc
         return cmd
 
     def test_vc1_source_forces_hw_decode(self):
@@ -586,6 +591,32 @@ class CodecAwareHwDecodeTests(unittest.TestCase):
         to avoid an ffmpeg startup failure under `-hwaccel qsv`."""
         cmd = self._build("wmv3", hw_decode_default=False)
         self.assertNotIn("-hwaccel", cmd)
+
+    # ----- descriptor format -----
+
+    def test_descriptor_reports_qsv_decode_for_vc1(self):
+        """Live log lines should advertise QSV decode for hwaccel'd codecs."""
+        _cmd, desc = self._build("vc1", hw_decode_default=False, return_desc=True)
+        self.assertIn("decode vc1 (QSV)", desc)
+        self.assertIn("encode via av1_qsv", desc)
+
+    def test_descriptor_reports_cpu_decode_for_h264(self):
+        """H.264 at HD stays on CPU; descriptor must say so."""
+        _cmd, desc = self._build("h264", hw_decode_default=False, return_desc=True)
+        self.assertIn("decode h264 (CPU)", desc)
+        self.assertIn("encode via av1_qsv", desc)
+
+    def test_descriptor_omits_dv_strip_when_not_requested(self):
+        """Regression guard: the prior `source_override is not None` check
+        unconditionally appended '+ DV strip pre-pass' on every encode, even
+        for plain H.264 sources. The new gate is `dv_pre_pass=True` only."""
+        _cmd, desc = self._build("h264", return_desc=True, dv_pre_pass=False)
+        self.assertNotIn("DV strip pre-pass", desc)
+
+    def test_descriptor_includes_dv_strip_when_requested(self):
+        """When the caller actually ran the strip, the descriptor advertises it."""
+        _cmd, desc = self._build("hevc", return_desc=True, dv_pre_pass=True)
+        self.assertIn("(+ DV strip pre-pass)", desc)
 
 
 if __name__ == "__main__":

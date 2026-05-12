@@ -1230,6 +1230,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
     # (matroska renumbers the kept streams contiguously), so we
     # re-probe the stripped file and use the new probe.
     encode_probe: ProbeResult = pr
+    dv_pre_pass_ran = False
     try:
         # DV strip pre-pass is UHD-only. The whole purpose of the pre-pass
         # is to feed the av1_qsv UHD pipeline a clean HDR10 stream (RPU
@@ -1284,11 +1285,13 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
             # was to remove DV) so the apply layer doesn't try to
             # re-prep an already-stripped temp file.
             encode_probe = probe.probe_file(Path(source_for_encode))
+            dv_pre_pass_ran = True
 
         cmd, desc = _build_apply_command(
             dec, encode_probe, output_path, target_container,
             enc_name, keep_langs, args,
             source_override=source_for_encode,
+            dv_pre_pass=dv_pre_pass_ran,
         )
 
         label = f"[{idx}/{total}] {Path(pr.path).name}: "
@@ -1317,6 +1320,7 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                 dec, encode_probe, output_path, target_container,
                 enc_name, keep_langs, args,
                 source_override=source_for_encode,
+                dv_pre_pass=dv_pre_pass_ran,
             )
             return _execute_encode(
                 db, dec, pr, retry_cmd, retry_desc, output_path, args, label,
@@ -1547,6 +1551,7 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                          args: argparse.Namespace,
                          *,
                          source_override: str | None = None,
+                         dv_pre_pass: bool = False,
                          ) -> tuple[list[str], str]:
     """Pick remux vs encode and build the corresponding ffmpeg argv.
 
@@ -1555,6 +1560,13 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
     strip pipeline (the prepared HDR10 stream-copy replaces the
     original DV source for the encode stage; audio/subtitle indices
     and metadata still come from the probe of the original).
+
+    `dv_pre_pass` is a presentation-only flag controlling whether the
+    returned descriptor advertises "+ DV strip pre-pass". The caller
+    sets this iff the strip actually ran; deriving it from
+    `source_override is not None` doesn't work because every regular
+    apply call passes a non-None source_override (initialized to the
+    probe path), which led to non-DV encodes being mislabelled.
     """
     add_compat = getattr(args, "compat_audio", True)
     original_audio = bool(getattr(args, "original_audio", False))
@@ -1593,14 +1605,19 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         encoder_preset=getattr(args, "encoder_preset", None),
         qsv_overrides=getattr(args, "qsv_overrides", None),
     )
-    desc = f"encode via {enc_name}"
+    # Pipeline-shaped descriptor: "decode <codec> (<path>) → encode via <name>".
+    # `path` is QSV when hw_decode is on (zero-copy GPU→GPU), CPU otherwise
+    # (libavcodec software decode feeds the QSV encoder via system memory).
+    src_codec = (pr.video_codec or "?").lower()
+    decode_path = "QSV" if hw_decode else "CPU"
+    desc = f"decode {src_codec} ({decode_path}) → encode via {enc_name}"
     if denoise:
         desc += " (+ denoise pre-pass)"
     if original_audio:
         desc += " (+ original audio passthrough)"
     if original_subs:
         desc += " (+ original subs passthrough)"
-    if source_override is not None:
+    if dv_pre_pass:
         desc += " (+ DV strip pre-pass)"
     return cmd, desc
 
