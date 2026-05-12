@@ -118,6 +118,49 @@ PRESETS: dict[str, dict[str, object]] = {
 
 
 # --------------------------------------------------------------------------- #
+# Source codecs that benefit from forced HW decode regardless of preset
+# --------------------------------------------------------------------------- #
+
+# Codecs whose libavcodec software decoder doesn't reliably keep pace with
+# av1_qsv's ~220 fps HD supply rate on this hardware, and which Battlemage
+# MFX can hardware-decode. Routing these through `-hwaccel qsv` keeps the
+# pipeline zero-copy GPU-to-GPU and unblocks the encoder.
+#
+# Membership criteria (BOTH must hold):
+#   1. libavcodec's software decode for this codec is single-threaded or
+#      only weakly multi-threaded, so CPU decode caps below encoder supply.
+#   2. ffmpeg exposes a QSV decoder for it on this Battlemage build
+#      (h264, hevc, av1, mpeg2, vc1, vp8, vp9, mjpeg, vvc — confirmed via
+#      `ffmpeg -decoders | grep _qsv`).
+#
+# Why each entry is here:
+#   - `vc1`:  effectively single-threaded (overlap-smoothing + loop-filter
+#             dependencies cross slice boundaries; libavcodec has no frame
+#             threading). Measured 126 fps for a 1080p Blu-ray remux on Thor
+#             — av1_qsv encoder thread sat at 6% CPU waiting.
+#   - `vp9`:  tile threading works *when the source was tile-encoded* (modern
+#             YouTube), but older WebM rips without tiles fall back to weakly
+#             threaded slice decode (~100-150 fps at 1080p). Defensive flip:
+#             unnecessary hwaccel cost is negligible, unbreached starvation is
+#             expensive.
+#
+# Why some likely-looking candidates are NOT here:
+#   - `wmv3` / `wmv1` / `wmv2`: single-threaded software decode, but no QSV
+#     decoder exposed for these codec IDs. Adding would crash. Future option:
+#     bsf-wrap WMV3 as VC-1 and route through vc1_qsv (TODO).
+#   - `mpeg4` (XviD/DivX): slice-threaded software decode is fast enough, and
+#     no QSV decoder for MPEG-4 Part 2 on modern Intel silicon anyway.
+#   - `rv30` / `rv40` / `cinepak` / `indeo`: no QSV decoder, also nearly
+#     nonexistent in real archives.
+#
+# Used by cli._build_apply_command to override hw_decode upward for matching
+# source codecs. The complementary direction (forcing hw_decode off for codecs
+# the QSV decoder can't handle) is not needed today — every codec Battlemage
+# can encode to, it can also decode from.
+SLOW_CPU_DECODE_CODECS: frozenset[str] = frozenset({"vc1", "vp9"})
+
+
+# --------------------------------------------------------------------------- #
 # Per-tier wall-clock estimate per file (consumed by the wizard's plan summary)
 # --------------------------------------------------------------------------- #
 

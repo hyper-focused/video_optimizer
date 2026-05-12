@@ -40,6 +40,30 @@ why.
       committing to >2 workers. Target: ~1.7× wall-clock speedup on
       dual-engine hardware vs sequential.
 
+- [ ] **WMV3 → vc1_qsv via bitstream filter (HW-decode fallback for legacy WMV)**
+      `optimizer/presets.SLOW_CPU_DECODE_CODECS` flips VC-1 and VP9 to
+      `-hwaccel qsv -hwaccel_output_format qsv` automatically — those are
+      the only single-threaded-decode codecs that *also* have a QSV decoder
+      exposed on Battlemage (`vc1_qsv`, `vp9_qsv`). WMV3 (and to a lesser
+      extent WMV2) hits the same single-threaded software-decode trap but
+      has no `wmv3_qsv`, so it's currently excluded.
+
+      WMV3 *is* VC-1 Simple/Main profile on the wire — only the codec ID
+      differs. A bitstream filter (`-bsf:v vc1_asftorcv` or repackaging via
+      `-codec:v vc1` on input) can present a WMV3 stream to `vc1_qsv`.
+      Worth a feasibility spike on one of the user's WMV3 files (if any
+      exist — modern libraries rarely have any) before committing code.
+
+      If it works: add `wmv3` to `SLOW_CPU_DECODE_CODECS` plus a small
+      branch in `_build_apply_command` that injects the bsf when source
+      codec is `wmv3`. If it doesn't: leave WMV3 on the CPU-decode floor
+      and add a one-line note to README "Known limitations" that legacy
+      WMV files encode at ~half the typical HD rate.
+
+      Skip if no WMV3 sources exist in the user's library — purely
+      preventive code with no measured benefit is the kind of complexity
+      `feedback_flag_minimalism` argues against.
+
 ## Robustness
 
 - [x] **Filter NAS / OS system directories during crawl** — landed

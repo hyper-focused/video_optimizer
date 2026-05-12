@@ -500,5 +500,93 @@ class EncoderDenoiseIntegrationTests(unittest.TestCase):
         self.assertNotIn("qsv", " ".join(cmd))
 
 
+# --------------------------------------------------------------------------- #
+# Codec-aware HW decode override (_build_apply_command)
+# --------------------------------------------------------------------------- #
+
+
+class CodecAwareHwDecodeTests(unittest.TestCase):
+    """VC-1 sources should be routed through QSV HW decode even when the
+    preset (HD/SD) defaults `hw_decode` to False, because libavcodec's VC-1
+    decoder is single-threaded and starves the av1_qsv encoder otherwise.
+
+    Pins the behaviour added to `_build_apply_command`: codec-aware override
+    of `hw_decode` for codecs in `SLOW_CPU_DECODE_CODECS`.
+    """
+
+    def _build(self, codec: str, *, hw_decode_default: bool = False,
+               denoise_codec: str | None = None):
+        import argparse
+        import json as _json
+        from pathlib import Path
+
+        from optimizer.cli import _build_apply_command
+
+        pr = make_probe(codec=codec, height=1080, video_bitrate=20_000_000)
+        # rules_fired must contain something non-container so the function
+        # takes the encode path (not the remux-only short-circuit).
+        dec = {"rules_fired_json": _json.dumps(["hd_non_av1"])}
+        args = argparse.Namespace(
+            hw_decode=hw_decode_default,
+            quality=21,
+            compat_audio=True,
+            original_audio=False,
+            original_subs=False,
+            encoder_preset="veryslow",
+            qsv_overrides={},
+        )
+        cmd, _kind = _build_apply_command(
+            dec, pr, Path("/tmp/out.mkv"),
+            target_container="mkv",
+            enc_name="av1_qsv",
+            keep_langs=["en", "und"],
+            args=args,
+        )
+        return cmd
+
+    def test_vc1_source_forces_hw_decode(self):
+        """HD-preset default (hw_decode=False) is overridden to True for VC-1."""
+        cmd = self._build("vc1", hw_decode_default=False)
+        joined = " ".join(cmd)
+        self.assertIn("-hwaccel qsv", joined)
+        self.assertIn("-hwaccel_output_format qsv", joined)
+
+    def test_h264_source_keeps_preset_default(self):
+        """H.264 stays on CPU decode at the HD preset's default."""
+        cmd = self._build("h264", hw_decode_default=False)
+        self.assertNotIn("-hwaccel", cmd)
+
+    def test_mpeg2_source_keeps_preset_default(self):
+        """MPEG-2 software decode is frame-threaded and fast — no override."""
+        cmd = self._build("mpeg2video", hw_decode_default=False)
+        self.assertNotIn("-hwaccel", cmd)
+
+    def test_vc1_respects_explicit_hw_decode_true(self):
+        """UHD preset / explicit override stays True (no double-toggle)."""
+        cmd = self._build("vc1", hw_decode_default=True)
+        joined = " ".join(cmd)
+        self.assertIn("-hwaccel qsv", joined)
+
+    def test_vp9_source_forces_hw_decode(self):
+        """VP9 software decode degrades to single-thread on non-tile streams,
+        and Battlemage has a vp9_qsv decoder — defensive flip."""
+        cmd = self._build("vp9", hw_decode_default=False)
+        joined = " ".join(cmd)
+        self.assertIn("-hwaccel qsv", joined)
+        self.assertIn("-hwaccel_output_format qsv", joined)
+
+    def test_vp8_source_keeps_preset_default(self):
+        """VP8 is too rare in HD libraries to bother with — guard against
+        accidental inclusion if SLOW_CPU_DECODE_CODECS grows."""
+        cmd = self._build("vp8", hw_decode_default=False)
+        self.assertNotIn("-hwaccel", cmd)
+
+    def test_wmv3_source_keeps_preset_default(self):
+        """WMV3 has slow CPU decode but no QSV decoder — it stays on CPU
+        to avoid an ffmpeg startup failure under `-hwaccel qsv`."""
+        cmd = self._build("wmv3", hw_decode_default=False)
+        self.assertNotIn("-hwaccel", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

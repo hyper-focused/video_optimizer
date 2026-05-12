@@ -29,6 +29,7 @@ from .presets import (
     PRESETS,
     RELAXED_UHD_CQ,
     RELAXED_UHD_ENCODER_PRESET,
+    SLOW_CPU_DECODE_CODECS,
 )
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
@@ -1556,9 +1557,19 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
     # denoise lands in the HD preset (height < 1440), which already
     # defaults hw_decode=False. The UHD preset never sees a denoise
     # candidate because its resolution gate is min_height=1440.
+    hw_decode = bool(getattr(args, "hw_decode", False))
+    # Force HW decode for source codecs whose libavcodec decoder is
+    # single-threaded (VC-1 today). The HD preset defaults this to False
+    # because frame-threaded H.264 decode keeps up with av1_qsv on CPU;
+    # VC-1 caps one core and starves the encoder. Skip the flip when the
+    # denoise filter is active (CPU filter can't ride a QSV-surface chain)
+    # — never co-occurs today (denoise gates only fire on H.264/SD), but
+    # the guard keeps the contract explicit.
+    if not denoise and (pr.video_codec or "").lower() in SLOW_CPU_DECODE_CODECS:
+        hw_decode = True
     cmd = encoder.build_encode_command(
         pr, output_path, enc_name, args.quality, keep_langs,
-        target_container, hw_decode=getattr(args, "hw_decode", False),
+        target_container, hw_decode=hw_decode,
         add_compat_audio=add_compat,
         denoise=denoise,
         original_audio=original_audio,
