@@ -15,12 +15,10 @@ SUPPORTED_EXTENSIONS = frozenset({
 })
 
 
-# Directory names to skip during recursive walk. These are NAS-server
-# system directories (Synology, QNAP) and OS metadata dirs whose contents
-# either masquerade as video files (Synology's `.@__thumb` re-uses source
-# filenames + extensions for JPEG thumbnails — passes the extension
-# filter, ffprobe reports them as 1-frame mjpeg) or are recycled/snapshot
-# duplicates we don't want to re-process.
+# NAS-server (Synology / QNAP) system dirs whose contents either
+# masquerade as video (`.@__thumb` reuses source filenames for JPEG
+# thumbnails — passes the extension filter, ffprobes as 1-frame mjpeg)
+# or are recycled/snapshot duplicates.
 _SKIP_DIRS = frozenset({
     ".@__thumb",          # Synology DSM thumbnail cache
     "@Recycle",           # QNAP recycle bin (visible)
@@ -33,11 +31,8 @@ _SKIP_DIRS = frozenset({
 })
 
 
-# Plex / Sonarr / Radarr "local extras" conventions: trailers, BTS,
-# featurettes, etc. live in dedicated subdirectories or carry specific
-# filename suffixes. None of this is "main feature" content, and a
-# library-scale tool re-encoding hours of trailers per movie is wasted
-# GPU time. Comparison is case-insensitive (lowered name).
+# Plex / Sonarr / Radarr "local extras": trailers, BTS, featurettes.
+# Case-insensitive match (compared against lowered name).
 _EXTRAS_DIRS = frozenset({
     "trailer", "trailers",
     "extra", "extras",

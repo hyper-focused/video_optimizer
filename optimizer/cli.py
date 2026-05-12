@@ -253,31 +253,17 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
                     help="Enable zero-copy QSV decode->encode pipeline. "
                          "Off by default; safe to enable when the source "
                          "codecs are modern (H.264/HEVC/AV1).")
-    # Default DV handling for both P7 and P8 is the simple ffmpeg-bsf
-    # strip path (`dovi_rpu=strip=true`). The dovi_tool-based P7 → P8
-    # conversion pipeline is preserved but opt-in: it requires both
-    # dovi_tool and mkvmerge on PATH, writes a ~50 GB temp file, and
-    # has been the source of NAS-wedge / mkvmerge-muxer pain in the
-    # field. Reach for it only when a specific P7 source fails the
-    # strip-only attempt.
+    # Default DV strategy for P7/P8 is the simple bsf strip. The
+    # dovi_tool P7→P8 conversion is opt-in (requires extra tools, writes
+    # a ~50 GB temp). See NOTES.md#profile-dispatch.
     ap.add_argument("--dv-p7-convert", action="store_true",
                     help="For Profile 7 sources: run the dovi_tool "
                          "convert + mkvmerge pipeline before encoding "
                          "instead of the default RPU-strip-only path. "
                          "Requires dovi_tool and mkvmerge on PATH.")
-    # Auto-relax-CQ: bloat fallback for grain-dominated UHD. Two checks
-    # share this flag:
-    #   1. Mid-encode: ffmpeg's -progress stream is sampled at the
-    #      BLOAT_CHECKPOINTS fractions of source duration; if the output
-    #      file's projected final size (out_size / completion_ratio)
-    #      crosses BLOAT_RATIO_THRESHOLD * source_size, ffmpeg is
-    #      killed early and the encode is retried at CQ 21. Saves the
-    #      ~50 minutes of wasted GPU time the post-encode check
-    #      otherwise burns on a UHD bloat.
-    #   2. Post-encode: belt-and-braces. If a UHD encode somehow lands
-    #      bloated despite passing both checkpoints (e.g. the bloat is
-    #      concentrated in the last third of the source), the same
-    #      retry triggers from the size of the finished output.
+    # Bloat fallback covers two checkpoints: mid-encode (kill + retry
+    # when the projected final size crosses BLOAT_RATIO_THRESHOLD) and
+    # post-encode (same retry from the finished output's size).
     ap.add_argument("--no-auto-relax-cq", action="store_false",
                     dest="auto_relax_cq", default=True,
                     help="Disable the UHD bloat fallback. Default: a "
@@ -845,12 +831,8 @@ def _plan_probe_gate(db: Database, pr,
     if stall_count >= 2:
         return "stalled"
     if pr.dv_profile is not None and encoder.dv_strategy(pr.dv_profile) is None:
-        # Profile 5 (custom DV colorspace, no HDR10 base) is the only
-        # profile that always falls here; the strip-only path now
-        # admits both P7 and P8.x by default. Plan-time we don't know
-        # whether the user will pass --dv-p7-convert at apply time,
-        # but `dv_strategy(7)` returns "p8_strip" with the default
-        # kwarg, so P7 clears this gate too.
+        # P5 falls here (no HDR10 base). P7/P8.x clear because
+        # dv_strategy() returns "p8_strip" with default kwargs.
         return "dv"
     if not allow_reencoded and _is_reencoded_filename(pr.path):
         return "reencoded"
@@ -934,13 +916,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     skip_codecs = frozenset(
         s.strip().lower() for s in skip_codecs_raw.split(",") if s.strip()
     )
-    # Path scope: when a path is supplied (path-pipeline subcommands like
-    # SD/HD/UHD/optimize/bare invocation), only probes under that path
-    # are eligible for candidate creation. Without this, the plan would
-    # happily create candidates from older cache entries outside the
-    # user's requested directory and apply would encode them. The
-    # standalone `plan` subcommand has no path and operates on the
-    # whole cache (existing behavior preserved).
+    # Path-pipeline subcommands scope candidate creation to the supplied
+    # path; bare `plan` has no path and operates on the whole cache.
     scope_path = getattr(args, "path", None)
     if scope_path is not None:
         try:
@@ -1159,11 +1136,9 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         return "deferred", 0
 
     if pr.is_hdr:
-        # av1_qsv main profile carries 10-bit, color metadata is passed
-        # through, and -pix_fmt p010le is pinned for 10-bit sources. That's
-        # the minimum for correctly-tagged HDR output. Mastering display +
-        # MaxCLL SEI are advisory (better tone-mapping on non-reference
-        # displays); not yet forwarded — see encoder._color_passthrough_args.
+        # av1_qsv main profile + 10-bit + color metadata passthrough.
+        # Mastering-display / MaxCLL not forwarded — see
+        # encoder._color_passthrough_args.
         print("    HDR: passthrough (10-bit + BT.2020/PQ tagging)")
 
     if not args.auto and not args.dry_run:
@@ -1197,19 +1172,12 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                                 idx: int, total: int) -> tuple[str, int]:
     """Run DV prep (if needed), build the encode argv, dispatch, cleanup.
 
-    Split from `_apply_one` to keep the validation/gate front-half
-    focused and readable. The DV-prep work_dir lives next to the source
-    so the temp stream-copy stays on the same filesystem; try/finally
-    guarantees teardown even on encode failure.
+    Split from `_apply_one` for readability. DV-prep work_dir lives next
+    to the source (same filesystem for the temp stream-copy); try/finally
+    guarantees teardown on encode failure.
     """
-    # Dry-run short-circuit: print what the encode argv would look like
-    # and stop. Crucially this runs *before* `_prepare_dv_source`, which
-    # would otherwise spend hours stream-copying a 50 GB DV source into
-    # a `.vo_dv_prep_*` work dir on the NAS — exactly what a dry run
-    # exists to avoid. The printed argv references `pr.path` (the real
-    # source); the DV-prep step would have substituted a stripped temp
-    # file, but for dry-run inspection the original-path version is
-    # what the user wants to see anyway.
+    # Dry-run runs *before* _prepare_dv_source so we don't spend hours
+    # writing a 50 GB temp file just to print the argv.
     if args.dry_run:
         cmd, desc = _build_apply_command(
             dec, pr, output_path, target_container,
@@ -1223,30 +1191,13 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
 
     dv_prep_dir: Path | None = None
     source_for_encode: str | None = pr.path
-    # encode_probe is what `_build_apply_command` reasons over for
-    # stream layout. For non-DV sources this is just `pr`; for DV
-    # sources where the strip pre-trims unwanted audio/sub streams,
-    # the strip output's stream layout differs from the source's
-    # (matroska renumbers the kept streams contiguously), so we
-    # re-probe the stripped file and use the new probe.
+    # encode_probe drives stream layout. For DV strip pre-pass, the
+    # stripped file's matroska muxer renumbers kept streams contiguously,
+    # so we re-probe the stripped file and reason from those indices.
     encode_probe: ProbeResult = pr
     dv_pre_pass_ran = False
     try:
-        # DV strip pre-pass is UHD-only. The whole purpose of the pre-pass
-        # is to feed the av1_qsv UHD pipeline a clean HDR10 stream (RPU
-        # stripped, multi-track sources pre-trimmed to dodge QSV decoder
-        # starvation). At HD we don't engage the QSV decoder path on the
-        # default `hw_decode=False`, av1_qsv ignores DV RPU side data on
-        # the encode side, and the static HDR10 mastering display + MaxCLL
-        # flow through implicitly — so the only effect of running the pre-
-        # pass at HD would be a multi-GB stream-copy on the source's
-        # filesystem before encoding starts. Skip it.
-        #
-        # Realistic HD-DV vectors (Apple TV+ 1080p WEB-DL, Profile 8.x with
-        # an HDR10 base layer) encode correctly without the strip; the
-        # filename rewriter already scrubs DV/HDR10+ tokens on the av1
-        # target so the output is labelled HDR10 to match what's actually
-        # in the container.
+        # DV strip pre-pass is UHD-only. See NOTES.md#uhd-only-gate.
         if pr.dv_profile is not None and pr.height >= 1440:
             dv_prep_dir, source_for_encode, dv_err = _prepare_dv_source(
                 pr, args,
@@ -1254,17 +1205,10 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                 target_container=target_container,
             )
             if source_for_encode is None:
-                # Two distinct cases — must be reported differently:
-                #   dv_err is None  → no strategy applies (P5, or P7
-                #     without --dv-p7-convert tools). Plan gate should
-                #     normally have caught this; treat as 'skipped'
-                #     with a policy code.
-                #   dv_err is set   → strategy ran but the underlying
-                #     ffmpeg/dovi_tool/mkvmerge command crashed. Treat
-                #     as 'failed' with the captured error so the user
-                #     sees the real cause (e.g. The Housemaid 2025's
-                #     HDR10Plus+DV combo failing the strip bsf), not a
-                #     misleading "skipped" placeholder.
+                # dv_err is None → no strategy applies (P5, or P7 without
+                # convert tools); mark skipped with a policy code.
+                # dv_err set → strategy crashed at runtime; mark failed
+                # with the captured error so the user sees the real cause.
                 if dv_err is None:
                     db.mark_decision(
                         dec["id"], "skipped",
@@ -1278,12 +1222,6 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                     expected_path=pr.path,
                 )
                 return "failed", 0
-            # Re-probe the stripped file: streams have been pre-trimmed
-            # to the kept set and the muxer renumbered them. The encode
-            # logic must operate on those new indices, not the source's.
-            # Preserve dv_profile=None on the re-probe (the strip's job
-            # was to remove DV) so the apply layer doesn't try to
-            # re-prep an already-stripped temp file.
             encode_probe = probe.probe_file(Path(source_for_encode))
             dv_pre_pass_ran = True
 
@@ -1302,14 +1240,10 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         if status != "bloat_retry":
             return status, saved
 
-        # Bloat fallback: rebuild the encode argv at the relaxed CQ
-        # *and* the relaxed encoder preset, then run once more.
-        # `slow` instead of `veryslow` matches the UHD-FILM preset's
-        # tuning — grain-dominated content the encoder can't compress
-        # efficiently doesn't reward extra RD-search effort.
-        # _execute_encode has already deleted the bloated output. The
-        # originals are restored after the retry so the next file in
-        # the queue starts from the preset defaults.
+        # Bloat fallback: rebuild argv at relaxed CQ + slower encoder
+        # preset, retry once. _execute_encode already deleted the bloated
+        # output. Originals are restored after so the next file starts
+        # from the preset defaults. See NOTES.md#preset-rationale.
         original_cq = getattr(args, "quality", None)
         original_encoder_preset = getattr(args, "encoder_preset", None)
         args._cq_retried = True  # noqa: SLF001
@@ -1344,33 +1278,19 @@ def _prepare_dv_source(
 ) -> tuple[Path | None, str | None, str | None]:
     """Run the appropriate DV pre-stage; return (work_dir, prepared_path, error).
 
-    `keep_langs` + `target_container` are forwarded to the strip
-    command so the demuxer can drop audio/sub streams the encode
-    wouldn't keep anyway, *during* the strip rather than after — for
-    multi-track sources (e.g. Saving Private Ryan: 9 audio + 50 subs)
-    this saves the equivalent NAS write+read of the discarded streams.
-    Caller should re-probe the prepared file because the matroska
-    muxer renumbers the kept streams from 0 and the new indices won't
-    match the original probe's.
+    `keep_langs` + `target_container` flow into the strip's demuxer
+    pre-trim so unwanted audio/sub streams drop during the strip rather
+    than after. See NOTES.md#demuxer-pre-trim-during-strip.
 
-    Three-tuple disambiguates two distinct "couldn't produce a prepared
-    source" cases that the caller needs to handle differently:
+    Three-tuple disambiguates the failure modes:
+      * (None, None, None) — no strategy applies (P5, or P7 without
+        convert tools). Caller marks 'skipped'.
+      * (None, None, err_msg) — strategy ran but the subprocess crashed.
+        Caller marks 'failed' so the real cause surfaces.
+      * (work_dir, path, None) — success. Caller `rmtree`s in finally.
 
-      * No strategy applies (P5, or P7 with `--dv-p7-convert` but the
-        tools are missing). Plan gate should usually have caught this.
-        Return: (None, None, None) — caller marks the row 'skipped'
-        with a policy code.
-      * Strategy ran but the ffmpeg/dovi_tool/mkvmerge command failed
-        at runtime (e.g. The Housemaid 2025: HDR10Plus + DV combo
-        that the bsf can't handle). Return: (None, None, err_msg) —
-        caller marks the row 'failed' with the captured error so the
-        user sees the real ffmpeg exit context, not a generic
-        "skipped" placeholder.
-      * Success. Return: (work_dir, prepared_source_path, None) —
-        caller `rmtree`s work_dir in finally to clean up the temp.
-
-    The work_dir lives next to the source on its own filesystem so the
-    ~50 GB temp file write doesn't traverse a slow NAS link or fill /tmp.
+    work_dir lives next to the source so the ~50 GB temp stays on the
+    same filesystem (no slow NAS link traversal, no /tmp fill).
     """
     strategy = encoder.dv_strategy(
         pr.dv_profile,
@@ -1509,24 +1429,12 @@ def _print_decision_header(dec: dict, pr: ProbeResult, idx: int, total: int) -> 
 
 
 def _should_apply_denoise(pr: ProbeResult) -> bool:
-    """Return True if this source benefits from a software denoise pre-pass.
+    """Soften h.264 macroblock noise before AV1 sees it.
 
-    Triggers in two cases that share the same root cause — sources where
-    AV1's bit budget is at risk of being spent reproducing h.264
-    macroblock noise rather than real picture detail:
-
-      1. SD content (height < 720). SD almost always rides on heavy
-         compression and benefits universally from light cleanup.
-      2. h.264 in the HD band whose source bitrate is below the AV1
-         target bitrate for its resolution bucket. Above the AV1 target,
-         the source has bitrate headroom and a clean re-encode is fine.
-         Below it, the source is already showing artifacts and we want
-         to soften them before AV1 sees them.
-
-    hqdn3d is CPU-only, so callers that pass denoise=True must also
-    disable hw_decode (the QSV zero-copy pipeline can't host a software
-    filter mid-stream). Library-scale assumption: edge-case slowdown on
-    the rare low-bitrate file is preferable to a worse-quality output.
+    Fires for SD (height < 720; heavy compression is the norm) and for
+    HD h.264 below the AV1 target bitrate for its bucket (source is
+    already showing artifacts). hqdn3d is CPU-only — callers must
+    pair with hw_decode=False.
     """
     height = pr.height or 0
     if 0 < height < 720:
@@ -1556,17 +1464,12 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
     """Pick remux vs encode and build the corresponding ffmpeg argv.
 
     `source_override` swaps the `-i` source path while keeping all
-    probe-derived stream layout decisions intact. Used by the DV
-    strip pipeline (the prepared HDR10 stream-copy replaces the
-    original DV source for the encode stage; audio/subtitle indices
-    and metadata still come from the probe of the original).
+    probe-derived stream layout decisions intact (used by the DV
+    strip pre-pass — the stripped temp replaces the source).
 
-    `dv_pre_pass` is a presentation-only flag controlling whether the
-    returned descriptor advertises "+ DV strip pre-pass". The caller
-    sets this iff the strip actually ran; deriving it from
-    `source_override is not None` doesn't work because every regular
-    apply call passes a non-None source_override (initialized to the
-    probe path), which led to non-DV encodes being mislabelled.
+    `dv_pre_pass` is presentation-only: controls whether the descriptor
+    advertises "+ DV strip pre-pass". Caller sets True iff the strip
+    actually ran. See NOTES.md#log-descriptor-format.
     """
     add_compat = getattr(args, "compat_audio", True)
     original_audio = bool(getattr(args, "original_audio", False))
@@ -1580,18 +1483,11 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
                                           source_override=source_override)
         return cmd, "remux"
     denoise = _should_apply_denoise(pr)
-    # No explicit hw_decode override: every code path that triggers
-    # denoise lands in the HD preset (height < 1440), which already
-    # defaults hw_decode=False. The UHD preset never sees a denoise
-    # candidate because its resolution gate is min_height=1440.
     hw_decode = bool(getattr(args, "hw_decode", False))
-    # Force HW decode for source codecs whose libavcodec decoder is
-    # single-threaded (VC-1 today). The HD preset defaults this to False
-    # because frame-threaded H.264 decode keeps up with av1_qsv on CPU;
-    # VC-1 caps one core and starves the encoder. Skip the flip when the
-    # denoise filter is active (CPU filter can't ride a QSV-surface chain)
-    # — never co-occurs today (denoise gates only fire on H.264/SD), but
-    # the guard keeps the contract explicit.
+    # Codec-aware upward override of hw_decode. See NOTES.md#codec-aware-override.
+    # Guarded against denoise: hqdn3d can't ride a QSV-surface chain.
+    # Today denoise never co-occurs with this override (denoise gates fire
+    # on H.264/SD only); the guard keeps the contract explicit.
     if not denoise and (pr.video_codec or "").lower() in SLOW_CPU_DECODE_CODECS:
         hw_decode = True
     cmd = encoder.build_encode_command(
@@ -1605,9 +1501,7 @@ def _build_apply_command(dec: dict, pr: ProbeResult, output_path: Path,
         encoder_preset=getattr(args, "encoder_preset", None),
         qsv_overrides=getattr(args, "qsv_overrides", None),
     )
-    # Pipeline-shaped descriptor: "decode <codec> (<path>) → encode via <name>".
-    # `path` is QSV when hw_decode is on (zero-copy GPU→GPU), CPU otherwise
-    # (libavcodec software decode feeds the QSV encoder via system memory).
+    # Pipeline-shaped descriptor (see NOTES.md#log-descriptor-format).
     src_codec = (pr.video_codec or "?").lower()
     decode_path = "QSV" if hw_decode else "CPU"
     desc = f"decode {src_codec} ({decode_path}) → encode via {enc_name}"
@@ -1660,17 +1554,11 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
         # because run_ffmpeg returned (False, "bloat_projection ..."),
         # but the caller wants the retry path, not a terminal failure.
         if encoder.BLOAT_PROJECTION_REASON in err:
-            # `flush=True` (here and on every other print() in the
-            # bloat-retry path) is load-bearing: stdout is block-
-            # buffered when redirected to a file (e.g. nohup, log
-            # capture), so without an explicit flush the diagnostic
-            # message sits in Python's buffer until the process
-            # exits. The retry happens immediately afterward, so
-            # users tail-ing the log saw the new ffmpeg cmd appear
-            # without the "bloat detected" explanation that produced
-            # it. The progress display in encoder.run_ffmpeg writes
-            # to sys.stderr with explicit flushes; these print()s
-            # need to match that liveness contract.
+            # flush=True is load-bearing for log-tailers: stdout is
+            # block-buffered when redirected to a file, and the retry
+            # fires immediately after — without flushing, the "bloat
+            # detected" diagnostic sits in the buffer past the next
+            # ffmpeg invocation.
             print(f"    bloat detected mid-encode: {err}", flush=True)
             print(f"    will retry at CQ {RELAXED_UHD_CQ} "
                   f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
@@ -1685,13 +1573,9 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                          expected_path=pr.path)
         return "failed", 0
 
-    # Post-encode bloat check (UHD only, before any disposal). If the
-    # output is nearly as big as the encoder's input, we throw it
-    # away and let the caller retry at a looser CQ. Compare against
-    # `bloat_pr` (the stripped intermediate when DV prep ran), not
-    # `pr` — see the docstring for why. Must happen before
-    # _finalize_output so replace mode hasn't moved the source to
-    # recycle yet.
+    # Post-encode bloat check (UHD only, before _finalize_output so
+    # replace mode hasn't recycled the source). Compare against
+    # `bloat_pr` (stripped intermediate) when DV prep ran.
     if _should_retry_for_bloat(bloat_pr, output_path, args):
         out_size = _safe_stat_size(output_path)
         ratio = out_size / bloat_pr.size if bloat_pr.size else 0
@@ -2163,14 +2047,10 @@ def _apply_with_preset_config(args: argparse.Namespace) -> int:
     args.reencode_tag = bool(cfg["reencode_tag"])
     if args.quality is None:
         args.quality = cfg["quality"]
-    # encoder_preset is always taken from PRESETS (not user-overridable
-    # at the CLI surface — it's a tier tuning, not a per-run knob).
+    # encoder_preset is a tier tuning, not a per-run knob — always from PRESETS.
     args.encoder_preset = cfg.get("encoder_preset")
-    # Optional per-preset overrides for the av1_qsv tuning knobs that
-    # otherwise come from AV1_QSV_BASE / AV1_QSV_TIER. Empty dict
-    # ({}) means "use the globals". A preset can override any subset
-    # (e.g. just `gop` for grain-content tuning) without forking the
-    # full base+tier table. See `_qsv_args` for the resolution order.
+    # av1_qsv knob overrides; empty dict = "use AV1_QSV_BASE/TIER globals".
+    # Resolution order: qsv_overrides → AV1_QSV_TIER → AV1_QSV_BASE.
     args.qsv_overrides = cfg.get("qsv_overrides", {})
     if args.keep_langs is None:
         args.keep_langs = cfg["keep_langs"]
@@ -3455,15 +3335,9 @@ def _preprocess_argv(argv: list[str]) -> list[str]:
         return argv
     if first in KNOWN_SUBCOMMANDS:
         return argv
-    # Typo-of-subcommand check. If `first` looks like an attempted
-    # subcommand (close to a known one and isn't an existing path on
-    # disk), exit early with a "did you mean" hint instead of falling
-    # through to the bare-invocation rewrite — that path produces
-    # confusing argparse "unrecognized arguments" errors that point at
-    # the legitimate `<path>` positional rather than the typo'd
-    # subcommand. Cutoff 0.7 + path-existence check together filter
-    # almost all real bare paths (which contain `/` and exist on disk)
-    # while still catching SD/HD/UHD/UHD-FILM typos.
+    # Typo-of-subcommand check: close-match + no-such-path → "did you
+    # mean" instead of the misleading argparse error from the
+    # bare-invocation rewrite path.
     if not Path(first).exists():
         suggestions = difflib.get_close_matches(
             first, KNOWN_SUBCOMMANDS, n=1, cutoff=0.7,
@@ -3501,12 +3375,8 @@ def _assert_external_tools_available(cmd: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Dispatches to the chosen subcommand handler."""
-    # Force line-buffering so each print() flushes on \n regardless of
-    # whether stdout is a TTY or a redirected file. Without this,
-    # block-buffered redirects let `flush=True` progress prints (encode
-    # ETA, DV-strip) jump ahead of the un-flushed plan listing — which
-    # is harmless functionally but looks like the apply phase started
-    # in the middle of the candidate dump.
+    # Force line-buffering so flush=True progress prints don't jump
+    # ahead of the un-flushed plan listing under redirect.
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, OSError):

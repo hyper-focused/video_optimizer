@@ -250,33 +250,16 @@ def build_dv_strip_command(
 ) -> list[str]:
     """Return ffmpeg argv that produces `prepared_path` from `probe.path`.
 
-    Applies the `dovi_rpu=strip` bitstream filter on the *primary*
-    video track (`v:0`) to remove DV RPU SEI messages, AND drops
-    audio/subtitle streams the eventual encode wouldn't keep anyway.
-    Output is a clean HDR10 MKV that the QSV pipeline accepts without
-    wedging. Use for Profile 8.x sources; Profile 7 needs `dovi_tool`
-    first (see `build_dv_p7_extract_command` +
-    `build_dv_p7_remux_command`).
+    Applies `dovi_rpu=strip` on `v:0` (primary video track only — bare
+    `v` crashes on attached JPEG cover art) and pre-discards audio/sub
+    streams the encode won't keep, saving the NAS write+read of those
+    streams. See NOTES.md#bsf-scoping-pitfall and #demuxer-pre-trim-during-strip.
 
-    Stream specifier `v:0` (not bare `v`) is load-bearing: many remuxes
-    embed a JPEG cover-art / poster as an additional video stream
-    (e.g. The Housemaid 2025 has a 600x900 mjpeg attached pic). The
-    bsf only supports hevc and av1; applying it to the mjpeg attached
-    pic crashes ffmpeg with `Error initializing bitstream filter:
-    dovi_rpu`. `v:0` scopes the bsf to the real video track only.
+    Use for Profile 8.x; Profile 7 with `--dv-p7-convert` runs the
+    `dovi_tool extract → mkvmerge remux` path instead.
 
-    Pre-discard rationale: a Saving Private Ryan-shaped source has
-    9 audio streams (TrueHD primary + DTS + 6 AC3 commentary) and
-    50+ subtitle streams. The eventual encode keeps one primary audio
-    and a handful of language-matched subs; the rest are demuxer-side
-    discarded. Doing that discard at strip time means the strip's
-    write of the temp file (and the encode's read of it) skip the
-    audio/subs the encode would have dropped anyway — for an SPR-class
-    source that's ~25-30 GB less NAS write + 25-30 GB less NAS read.
-
-    `keep_langs=None` falls back to the historical "copy every stream"
-    behavior, kept for callers that want a faithful clone of the
-    source minus the RPU.
+    `keep_langs=None` falls back to copy-every-stream for callers that
+    want a faithful clone minus the RPU.
     """
     cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     if keep_langs is not None:
@@ -294,11 +277,8 @@ def build_dv_strip_command(
         "-i", probe.path,
         "-map", "0",
         "-c", "copy",
-        # The bsf has named options; `strip` is a boolean (default false).
-        # Bare `dovi_rpu=strip` is parsed as "strip is the value of an
-        # implicit option" and rejected. Must be `strip=true` (or `strip=1`).
-        # Stream specifier `v:0` keeps the bsf off non-DV video streams
-        # like JPEG cover art (see docstring).
+        # `strip=true` (not bare `strip`) is required — the bsf parses
+        # bare-form as "strip is the value of an implicit option".
         "-bsf:v:0", "dovi_rpu=strip=true",
         "-progress", "pipe:1", "-nostats",
         str(prepared_path),
@@ -412,12 +392,9 @@ def validate_output(probe: ProbeResult,
     if not (0.95 <= ratio <= 1.05):
         return False, (f"duration mismatch: source {src_dur:.1f}s, "
                        f"output {out_dur:.1f}s (ratio {ratio:.2f})")
-    # Output ≥ source guard. AV1 encoded output should always net
-    # smaller than the source on real content; output ≥ source means
-    # the encode misbehaved (usually CQ too low + grainy 4K) and the
-    # result is worse than just keeping the original. Let the user
-    # see the failure, inspect the bloated output, and decide whether
-    # to retry at a higher CQ — without losing the source to cleanup.
+    # Output ≥ source guard: AV1 should net smaller. ≥ source means the
+    # encode misbehaved; fail so the user can inspect before cleanup
+    # disposes of the original.
     try:
         out_size = output_path.stat().st_size
     except OSError as e:
@@ -509,11 +486,9 @@ def _color_passthrough_args(probe: ProbeResult) -> list[str]:
     return args
 
 
-# ISO 639-1 (2-letter) ↔ ISO 639-2 (3-letter) equivalents. ffprobe usually
-# emits 3-letter codes ("eng"), but our --keep-langs default is "en,und";
-# without this expansion an English audio track tagged "eng" would not match
-# the keep set and would only survive via the default-flag fallback (so any
-# secondary English tracks were silently dropped).
+# ISO 639-1 ↔ 639-2 equivalents. ffprobe emits 3-letter codes ("eng");
+# --keep-langs default is "en,und" — without this expansion non-default
+# English tracks would silently fail to match.
 _LANG_EQUIVS: dict[str, str] = {
     "en": "eng", "eng": "en",
     "ja": "jpn", "jpn": "ja",
@@ -536,9 +511,8 @@ def _expand_langs(langs: set[str]) -> set[str]:
     return out
 
 
-# Codecs treated as lossless / hi-res for the compat-track logic. DTS is a
-# special case — DTS-HD MA reports as plain `dts`, so we treat dts as hi-res
-# only when the track has 5.1+ channels (DTS Core 2.0 is not worth shadowing).
+# Lossless / hi-res audio. DTS is conditional — DTS-HD MA reports as plain
+# `dts`, only treat it as hi-res when channels >= 6 (DTS Core 2.0 isn't).
 _LOSSLESS_AUDIO_CODECS = frozenset({"truehd", "mlp", "flac"})
 
 # Higher rank = better source for the AAC compat transcode.
@@ -866,24 +840,14 @@ def _input_discard_args(probe: ProbeResult, keep_langs: list[str],
                         original_subs: bool = False) -> list[str]:
     """Per-input `-discard:<spec> all` flags for streams we won't use.
 
-    Why: ffmpeg's demuxer interleaves packets for every active stream by
-    container timestamp before any decoder sees them. On sources with
-    many parallel audio tracks (8+ language dubs is common on Blu-ray
-    remuxes), the QSV video decoder's input queue can starve through the
-    narrow windows between audio packets and deadlock at frame 0 — the
-    classic multi-language stall pattern. CPU decode survives on more
-    headroom but isn't immune (the older AVC-multilang stall list also
-    pre-dates hw_decode). `-discard:<spec> all` is applied at demux time,
-    so dropped streams never enter the packet queue and never compete
-    for scheduler attention. Must precede `-i`.
+    Drops streams at demux time before the QSV decoder's input queue
+    can starve on the narrow windows between audio packets on multi-
+    track sources (classic frame-0 stall on Blu-ray remuxes with 8+
+    audio dubs). Must precede `-i`. Discard preserves source-side
+    indexing — `-map 0:a:1?` still resolves correctly.
 
-    Discard preserves source-side indexing — `-map 0:a:1?` still resolves
-    to the original audio stream 1 even when audio stream 0 is discarded.
-
-    original_audio=True keeps every audio stream (no discards). The
-    multi-language stall risk re-appears in that case, so the flag is
-    appropriate for users who consciously want every track preserved
-    and accept the throughput tradeoff.
+    `original_audio=True` keeps every audio stream; the multi-language
+    stall risk re-appears, but that's the conscious tradeoff.
     """
     langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
     kept_s = _kept_subtitle_indices(probe, langs, target_container,
@@ -907,22 +871,13 @@ def build_stream_map_args(probe: ProbeResult, keep_langs: list[str],
                           original_subs: bool = False) -> list[str]:
     """Return -map + audio/subtitle codec args for chosen streams.
 
-    Attachments (embedded fonts, cover art, etc.) are intentionally NOT
-    mapped, even for MKV targets. A single source attachment with a
-    missing or undeducible mimetype crashes ffmpeg's matroska muxer:
+    Attachments (embedded fonts, cover art) are intentionally NOT mapped
+    — a single attachment with an undeducible mimetype crashes the
+    matroska muxer ("no mimetype tag … incorrect codec parameters").
+    Fail cost outweighs the rare ASS/SSA font benefit.
 
-      [matroska] Attachment stream N has no mimetype tag and it cannot
-      be deduced from the codec id.
-      [out] Could not write header (incorrect codec parameters?)
-
-    The fail-the-whole-encode cost is far higher than the benefit of
-    preserving embedded fonts (which mostly only matter for ASS/SSA
-    subtitle rendering — anime, rarely live-action archive content).
-    Observed in the wild on iNCEPTiON-grouped Indiana Jones 4 source.
-
-    original_audio=True bypasses the 3-stream ladder entirely and maps
-    every input audio track via stream-copy. Subtitle handling is
-    unaffected.
+    original_audio=True bypasses the 3-stream ladder and stream-copies
+    every input audio track. Subtitle handling is unaffected.
     """
     langs = _expand_langs({(lang or "").lower() for lang in keep_langs})
     args: list[str] = ["-map", "0:v:0"]
@@ -982,56 +937,29 @@ def _qsv_args(encoder: str, quality: int, *,
               qsv_overrides: dict[str, str] | None = None) -> list[str]:
     """Codec args for Intel Quick Sync encoders.
 
-    Tuning resolution order, lowest precedence first:
-      1. `AV1_QSV_BASE` for the tier-independent flag set (extbrc,
-         low_power, bf, refs, profile, …) — matches the validated
-         `videos/ff_uhd_av1.sh` reference script.
-      2. `AV1_QSV_TIER["uhd" or "hd"]` for the height-bucketed knobs
-         (look_ahead_depth, gop). Bucket is decided at runtime from
-         the source's actual height — apply still adapts even if the
-         caller didn't go through a preset.
-      3. `qsv_overrides` (per-preset dict from PRESETS) — wins over
-         the globals when present. Lets a single preset retune any
-         knob without forking the whole base/tier table. Empty/missing
-         → fall back to globals.
+    Tuning resolution order: qsv_overrides → AV1_QSV_TIER (per height
+    bucket) → AV1_QSV_BASE. See NOTES.md#av1_qsv-tuning.
 
-    `encoder_preset` overrides the encoder ladder rung (default
-    AV1_QSV_DEFAULT_ENCODER_PRESET, currently "veryslow"). The PRESETS
-    dispatch threads each tier's `encoder_preset` field through here.
+    `encoder_preset` overrides the ladder rung (default "veryslow").
 
-    Pure ICQ, no -maxrate / -bufsize — on av1_qsv, the combination of
-    extbrc + ICQ + maxrate collapses to a hybrid VBR mode that under-allocates
-    by an order of magnitude (observed ~300 kb/s video at CQ 18 with maxrate
-    12M on a 1080p source). CQ alone gets the expected 4–7 Mb/s.
+    Pure ICQ — no -maxrate / -bufsize. extbrc + ICQ + maxrate collapses
+    to a hybrid VBR that under-allocates by an order of magnitude.
 
-    Bit depth handling: when hw_decode is True, the QSV decode->encode
-    pipeline keeps frames in GPU-resident `qsv` surfaces that natively
-    preserve source bit depth. Pinning -pix_fmt p010le in that path forces
-    a qsv->p010le conversion that ffmpeg's auto_scale filter can't bridge,
-    breaking the encode. So pix_fmt is only pinned when hw_decode is False
-    (SW decode -> QSV encode), where it does prevent stealth downconvert.
+    pix_fmt is pinned only when hw_decode=False. Pinning under
+    hw_decode=True forces a qsv→p010le conversion auto_scale can't
+    bridge. See NOTES.md#bit-depth-and-hw_decode-interaction.
     """
     base = AV1_QSV_BASE
     overrides = qsv_overrides or {}
     chosen_preset = encoder_preset or AV1_QSV_DEFAULT_ENCODER_PRESET
 
     def pick(key: str, source: dict[str, str]) -> str:
-        # Per-preset overrides win, then fall back to the global tier
-        # / base default. Cheap helper (vs a chain of `or`s) so each
-        # av1_qsv knob reads consistently.
+        # Per-preset override wins; otherwise tier/base default.
         return overrides.get(key, source[key])
 
-    # `-global_quality` is scoped to the video stream (`:v`) so the qscale
-    # flag isn't applied to every encoder in the graph. Without the scope,
-    # libopus rejects with "Quality-based encoding not supported" and the
-    # whole encode fails before producing any output.
-    #
-    # `-look_ahead 1` is intentionally absent: it's a family-level QSV
-    # option that only does something on hevc_qsv / h264_qsv. av1_qsv
-    # ignores it (use `-look_ahead_depth` instead) and ffmpeg surfaces a
-    # `Codec AVOption look_ahead ... has not been used` warning per
-    # encode if it's left on. Restore for hevc_qsv / h264_qsv if those
-    # encoders ever come back into the regular path.
+    # `-global_quality:v` scope is load-bearing: without `:v`, libopus
+    # rejects with "Quality-based encoding not supported".
+    # No `-look_ahead 1`: av1_qsv ignores it and warns (use look_ahead_depth).
     a = ["-c:v", encoder, "-preset", chosen_preset,
          "-global_quality:v", str(quality)]
     if encoder == "av1_qsv":
@@ -1457,16 +1385,10 @@ def _stream_progress_until_done(proc: subprocess.Popen,
     # at a few thousand lines per multi-hour encode rather than 7,200/hour.
     render_interval = 0.5 if is_tty else 30.0
     last_render = 0.0
-    # Stall detection: if neither the encoded position (`out_time_ms`) nor
-    # the decoder-side frame count (`frame=`) advances for `stall_seconds`
-    # of wall-clock, the pipeline is genuinely hung. Both signals are
-    # required because av1_qsv with deep lookahead (depth=100, refs=5)
-    # buffers ~150 frames before any presentation timestamp surfaces to
-    # the muxer, so `out_time_ms` can stay at 0 for several minutes on a
-    # working encode (Avengers: Infinity War 2160p remux pinned this
-    # against the v0.5.17 5-min watchdog while writing 441s of clean AV1
-    # to disk). `frame=` advances on every decoded frame, so a real stall
-    # — input queue starvation, hardware deadlock — flatlines both.
+    # Stall detection: both `out_time_ms` and `frame=` must flatline.
+    # Deep-lookahead encodes leave out_time_ms at 0 for minutes on a
+    # working encode (Infinity War pinned this) — frame= is the real
+    # liveness signal. See NOTES.md#stall-watchdog.
     last_out_seconds = 0.0
     last_frames = 0
     stall_anchor_wall = start

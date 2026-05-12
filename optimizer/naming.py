@@ -10,15 +10,9 @@ from __future__ import annotations
 
 import re
 
-# Tokens to strip per target codec. Each entry is a regex *fragment* (without
-# the surrounding word-boundary lookarounds, which are added at compile time).
-#
-# Each list pairs the target's own near-neighbour codec tokens (e.g. AV1 strips
-# H.264/HEVC) with the broader set of legacy video-codec tokens that show up in
-# filenames from the MPEG-2/VC-1/DivX era. Without the legacy entries an
-# `MPEG2`-tagged Blu-ray remux re-encoded to AV1 would still claim MPEG2 in
-# its output filename — see Kingdom.of.Heaven / Pearl.Harbor for canonical
-# examples.
+# Codec tokens scrubbed from the stem per target. Regex fragments — the
+# `(?<![A-Za-z0-9]) … (?![A-Za-z0-9])` word boundaries are added at
+# compile time. See NOTES.md#filename-rewriting.
 _LEGACY_VIDEO_CODEC_TOKENS: list[str] = [
     r"MPEG[. _-]?2(?:video)?", r"XviD", r"DivX", r"VC-?1", r"VP9", r"WMV[0-9]?",
 ]
@@ -38,13 +32,9 @@ _FOREIGN_CODEC_TOKENS: dict[str, list[str]] = {
 }
 
 
-# HDR/DV tokens that don't survive the target encode and should be scrubbed
-# from the rewritten filename so Plex/Jellyfin don't try to map a stream that
-# isn't actually there. av1_qsv (the av1 target's hardware path) carries only
-# the static HDR10 mastering-display + MaxCLL side data; HDR10+ dynamic
-# metadata (SMPTE 2094-40) is dropped, and the Dolby Vision RPU is always
-# stripped by the DV pre-pass. Static HDR10 (`HDR`, `HDR10`) IS preserved, so
-# those tokens stay in the name.
+# HDR / DV tokens that don't survive the target encode. av1_qsv carries
+# static HDR10 only (mastering display + MaxCLL); HDR10+ dynamic and DV
+# RPU are dropped. See NOTES.md#hdr-metadata-token-substitution.
 _LOST_METADATA_TOKENS: dict[str, list[str]] = {
     "av1": [
         r"HDR10Plus", r"HDR10\+",
@@ -87,12 +77,10 @@ def _strip_foreign_tokens(stem: str, target_codec: str) -> str:
 
 
 def _has_hdr_token(stem: str) -> bool:
-    """True if the stem already advertises plain HDR / HDR10 (not HDR10+ / HDR10Plus).
+    """True if the stem already advertises plain HDR / HDR10 (not HDR10+).
 
-    The trailing `+` exclusion matters: `HDR10+` is a *dynamic* metadata
-    marker the av1_qsv pipeline can't preserve, so it must not satisfy
-    the "already labelled HDR" check or we'd skip the HDR10 insert and
-    leave the filename without any HDR token at all.
+    The trailing `+` exclusion is load-bearing: HDR10+ would otherwise
+    satisfy this check and we'd skip the HDR10 substitution.
     """
     return bool(re.search(
         r"(?<![A-Za-z0-9])HDR(?:10|2000)?(?![A-Za-z0-9+])",
@@ -101,20 +89,11 @@ def _has_hdr_token(stem: str) -> bool:
 
 
 def _substitute_lost_metadata_tokens(stem: str, target_codec: str) -> str:
-    """Replace DV / HDR10+ tokens with HDR10 (or drop them if HDR10 is already
-    advertised) so the rewritten name accurately reflects what the encode path
-    actually preserves.
+    """Replace the first DV / HDR10+ token with HDR10, strip the rest.
+    If HDR10 / HDR is already in the stem, just strip everything.
 
-    DV Profile 7/8 sources always carry an HDR10 base layer (Profile 5 is
-    skipped upstream because it has no HDR10 fallback). After the DV RPU
-    is stripped and HDR10+ dynamic metadata is dropped by av1_qsv, the
-    residual stream is plain HDR10 — the filename should say so for
-    Radarr Custom Format matching and downstream library tooling.
-
-    Strategy: substitute the *first* matching token in-place with `HDR10`
-    (preserves position relative to the resolution/audio tags), then
-    strip any remaining matches. If an `HDR10` / `HDR` token is already
-    present, just strip everything — no need to duplicate.
+    See NOTES.md#hdr-metadata-token-substitution for the strategy and
+    why this works for DV Profile 7/8 / HDR10+ sources.
     """
     tokens = _LOST_METADATA_TOKENS.get(target_codec, [])
     if not tokens:
@@ -148,8 +127,7 @@ def _cleanup_separators(stem: str) -> str:
     out = re.sub(r"\s+\.|\.\s+", ".", out)
     out = re.sub(r"\s+-|-\s+", "-", out)
     out = re.sub(r"\.-|-\.", "-", out)
-    # Drop orphaned `+` left behind after stripping a joined token pair
-    # (e.g. `HEVC+H.265` → `+` once both sides are removed).
+    # `HEVC+H.265` leaves a stray `+` after both sides strip — drop it.
     out = re.sub(r"(?<![A-Za-z0-9])\+(?![A-Za-z0-9])", "", out)
     out = re.sub(r"\.{2,}", ".", out)
     return out.strip(" .-_+")
