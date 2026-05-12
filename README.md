@@ -25,7 +25,7 @@ AV1-eligible content. Built around four ideas:
 **Optimized for Intel Arc / Battlemage** via `av1_qsv`. NVIDIA (`av1_nvenc`
 on RTX 4000+) and AMD (`av1_vaapi`) work via the encoder fallback chain;
 the throughput numbers haven't been re-tuned for them. Software fallback
-(`libsvtav1`) is always available and your CPU fans will let you know.
+(`libsvtav1`) is always available if you want to excercise your CPU fan.
 
 For design rationale, calibration history, and failure-mode catalog,
 see [`NOTES.md`](NOTES.md). For the backlog see [`TODO.md`](TODO.md).
@@ -41,8 +41,8 @@ For day-to-day contracts, that's the rest of this file.
 - **`ffmpeg` 7.0+ and `ffprobe`** on `PATH`. Older `ffmpeg` lacks the
   `dovi_rpu` bsf the DV strip pipeline needs.
 - *Optional:* **Intel Arc / Battlemage** for `av1_qsv` speeds. Without
-  hardware AV1, software fallback runs at "go make a sandwich" speeds
-  instead of "go check on the kettle" speeds.
+  hardware AV1, software fallback runs at "go on vacaction" speeds
+  instead of "go make a sandwich" speeds.
 - *Optional:* **`dovi_tool` + `mkvmerge`** only when you opt into
   `--dv-p7-convert` for stubborn Profile 7 sources.
 
