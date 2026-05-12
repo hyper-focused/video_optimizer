@@ -12,6 +12,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .presets import EST_OUTPUT_MB_PER_HOUR
+
 # --------------------------------------------------------------------------- #
 # Stream models
 # --------------------------------------------------------------------------- #
@@ -126,24 +128,28 @@ class Candidate:
 
     @property
     def total_projected_savings_mb(self) -> float:
-        """Best (largest) per-rule projected savings, capped at source size.
+        """Best per-rule savings, capped at a realistic output size.
 
-        Per-rule projections are NOT orthogonal contributions — they're
-        competing estimates of the same encode. `over_bitrate`,
-        `legacy_codec`, and `hd_non_av1` all fire together on a typical
-        VC-1 or MPEG-2 1080p remux and each independently predicts what
-        the AV1 output will save. Summing them produced obviously wrong
-        totals (Lethal Weapon 1987: 23 GB source, 32.4 GB "projected
-        savings"), so we use max instead.
-
-        Cap at 95% of source size: even an aggressive AV1 encode keeps
-        the audio tracks + a minimum video bitrate, so savings can't
-        plausibly exceed ~95% of source.
+        Per-rule projections are competing estimates of the same encode,
+        not orthogonal contributions — so max(), not sum(). Then ceiling
+        by a tier-aware estimate of what the AV1 output will actually
+        cost: `source - duration × EST_OUTPUT_MB_PER_HOUR[bucket]`. The
+        over_bitrate rule otherwise projects "if video dropped to
+        target_mbps", which ignores audio + the fact that archive-grade
+        CQ encodes run above the rate-flag target. Final fallback: 95%
+        of source size.
         """
         if not self.fired:
             return 0.0
         best = max((v.projected_savings_mb or 0.0) for v in self.fired)
         size_mb = (self.probe.size or 0) / (1024 * 1024)
+        # Tier-aware realistic ceiling. Lookup miss (unknown bucket) or
+        # zero-duration source falls through to the 95% size cap below.
+        rate = EST_OUTPUT_MB_PER_HOUR.get(self.probe.resolution_class)
+        if rate is not None and self.probe.duration_seconds > 0:
+            expected_output_mb = (self.probe.duration_seconds / 3600.0) * rate
+            realistic_savings = max(size_mb - expected_output_mb, 0.0)
+            best = min(best, realistic_savings)
         return min(best, size_mb * 0.95)
 
     @property

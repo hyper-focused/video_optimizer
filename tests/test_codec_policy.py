@@ -663,10 +663,11 @@ class CandidateProjectedSavingsTests(unittest.TestCase):
     GB of "projected savings", impossibly larger than the source.
     """
 
-    def _candidate(self, *, source_mb: float, per_rule_mb: list[float]):
+    def _candidate(self, *, source_mb: float, per_rule_mb: list[float],
+                   duration_s: float = 3600.0, height: int = 1080):
         """Build a Candidate with N fired rules, each projecting given MB."""
         from optimizer.models import Candidate, RuleVerdict
-        pr = make_probe(codec="vc1", height=1080)
+        pr = make_probe(codec="vc1", height=height, duration=duration_s)
         pr.size = int(source_mb * 1024 * 1024)
         fired = [
             RuleVerdict(rule=f"rule_{i}", fired=True,
@@ -678,23 +679,40 @@ class CandidateProjectedSavingsTests(unittest.TestCase):
                          remux_only=False, is_hdr=False)
 
     def test_takes_max_not_sum_of_overlapping_estimates(self):
-        """Three rules predicting 18 / 11 / 5 GB savings should NOT add to
-        34 GB — they describe the same re-encode. Max wins (18 GB)."""
+        """Rules predicting 18/11/5 GB don't add — they're competing
+        estimates of the same encode. 1080p × 1hr → 5 GB expected output
+        → realistic ceiling 18 GB; max-rule 18 GB lands under it."""
         cand = self._candidate(
             source_mb=23_000,
             per_rule_mb=[18_000, 11_000, 5_000],
         )
         self.assertEqual(cand.total_projected_savings_mb, 18_000)
 
-    def test_caps_at_95_percent_of_source_size(self):
-        """over_bitrate can overshoot on grain-heavy older sources where
-        bitrate × duration > size. Cap to keep the displayed number
-        plausible (95% leaves room for the audio track survivors)."""
+    def test_caps_at_realistic_av1_output_for_tier(self):
+        """Die Hard 3 canary: 1080p AVC remux, ~2.18 hr, source ~30 GB,
+        over_bitrate rule projected 23.7 GB savings. Realistic ceiling:
+        source - 2.18hr × 5000 MB/hr = ~19 GB. The rule's overshoot
+        gets pulled back to that ceiling."""
+        # source 30 GB, duration 2.18 hr at 1080p (5000 MB/hr rate)
+        cand = self._candidate(
+            source_mb=30_000,
+            per_rule_mb=[23_700],
+            duration_s=3600 * 2.18,
+        )
+        expected_output_mb = (3600 * 2.18 / 3600.0) * 5000.0   # = 10900
+        expected_savings = 30_000 - expected_output_mb         # = 19_100
+        self.assertAlmostEqual(cand.total_projected_savings_mb,
+                               expected_savings, places=1)
+
+    def test_caps_at_95_percent_when_tier_ceiling_unavailable(self):
+        """Defensive: zero-duration source bypasses the tier-aware cap
+        (can't compute expected output without duration) and falls
+        through to the 95%-of-source guard."""
         cand = self._candidate(
             source_mb=10_000,
-            per_rule_mb=[25_000],  # rule overshoot
+            per_rule_mb=[25_000],
+            duration_s=0,           # bypasses tier ceiling
         )
-        # 95% of 10 000 = 9 500.
         self.assertEqual(cand.total_projected_savings_mb, 9_500)
 
     def test_handles_none_savings_from_advisory_rules(self):

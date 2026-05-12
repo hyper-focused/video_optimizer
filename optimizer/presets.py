@@ -164,3 +164,18 @@ BITRATE_FLAG_TABLE: dict[str, tuple[float, float]] = {
     "1440p": (9.0, 18.0),
     "2160p": (16.0, 32.0),
 }
+
+# Calibrated AV1 output size per hour per resolution bucket (MB/hr).
+# Used by Candidate.total_projected_savings_mb to ceiling the per-rule
+# projections at a realistic output — the over_bitrate rule otherwise
+# computes "if video dropped to target_mbps" which ignores audio + the
+# fact that archive-grade encodes don't actually hit the rate-flag
+# target. Numbers cross-check with the EST_SECONDS_PER_FILE wizard
+# estimates and the per-preset comments above.
+EST_OUTPUT_MB_PER_HOUR: dict[str, float] = {
+    "480p":    600.0,   # SD CQ 24
+    "720p":   2500.0,   # HD low end
+    "1080p":  5000.0,   # HD CQ 21 archive-grade
+    "1440p":  8000.0,   # between HD and UHD
+    "2160p": 12000.0,   # UHD CQ 15 HDR
+}
