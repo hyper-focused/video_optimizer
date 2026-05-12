@@ -103,5 +103,150 @@ class DryRunSkipsDvPrepTests(unittest.TestCase):
             self.assertEqual(final["run_id"], run_id)
 
 
+class HdDvSourceSkipsDvPrepTests(unittest.TestCase):
+    """HD-resolution DV sources (Apple TV+ 1080p WEB-DL, Profile 8.x) must
+    NOT invoke the DV strip pre-pass. The pre-pass exists to feed the
+    av1_qsv UHD pipeline a clean HDR10 stream — at HD we don't engage QSV
+    decode by default, av1_qsv ignores RPU side data on encode, and the
+    static HDR10 base layer flows through implicitly. Running the pre-pass
+    would just write a multi-GB temp file for no functional reason.
+    """
+
+    def test_hd_dv_source_does_not_call_prepare(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "src.mkv"
+            source.write_bytes(b"x" * 1024)
+            output = tmp_path / "src.AV1.REENCODE.mkv"
+
+            # HD-DV: 1080p source with DV Profile 8 (would otherwise hit
+            # the p8_strip strategy and invoke `_prepare_dv_source`).
+            pr = make_probe(height=1080, dv_profile=8)
+            pr.path = str(source)
+            pr.size = source.stat().st_size
+
+            db_path = tmp_path / "state.db"
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("apply", None, {})
+                dec_id = db.insert_pending_decision(
+                    str(source), ["hd_non_av1"], "av1+mkv", 0.0,
+                    run_id=run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?", (dec_id,),
+                ).fetchone())
+
+                args = argparse.Namespace(
+                    dry_run=True,
+                    quality=21,
+                    auto_relax_cq=True,
+                    verbose=False,
+                    timeout=0,
+                    mode="keep",
+                    output_root=None,
+                    source_root=None,
+                    rewrite_codec=True,
+                    reencode_tag=True,
+                    reencode_tag_value="REENCODE",
+                    no_dotted=False,
+                    name_suffix="",
+                    backup=None,
+                    recycle_to=None,
+                    keep_langs="en,und",
+                    hwaccel="auto",
+                    hw_decode=False,
+                    compat_audio=True,
+                    original_audio=False,
+                    original_subs=False,
+                    dv_p7_convert=False,
+                )
+
+                with patch.object(cli_mod, "_prepare_dv_source") as m_prep, \
+                     patch.object(cli_mod, "_build_apply_command",
+                                  return_value=(["ffmpeg", "stub"],
+                                                "encode (stub)")):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        cli_mod._apply_one_after_validation(
+                            db, row, pr, args, run_id, output,
+                            "av1+mkv", "av1_qsv", ["en", "und"], 1, 1,
+                        )
+
+                m_prep.assert_not_called()
+
+    def test_uhd_dv_source_still_calls_prepare(self):
+        """Regression guard for the inverse: UHD DV sources must STILL
+        invoke the strip pre-pass. The height gate must not over-trigger.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "src.mkv"
+            source.write_bytes(b"x" * 1024)
+            output = tmp_path / "src.AV1.REENCODE.mkv"
+
+            pr = make_probe(height=2160, dv_profile=8)
+            pr.path = str(source)
+            pr.size = source.stat().st_size
+
+            db_path = tmp_path / "state.db"
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("apply", None, {})
+                dec_id = db.insert_pending_decision(
+                    str(source), ["uhd_non_av1"], "av1+mkv", 0.0,
+                    run_id=run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?", (dec_id,),
+                ).fetchone())
+
+                # dry_run=False here — we want to verify the prep CALL
+                # happens. Stub the prep function so it doesn't actually
+                # try to spawn ffmpeg.
+                args = argparse.Namespace(
+                    dry_run=False,
+                    quality=15,
+                    auto_relax_cq=True,
+                    verbose=False,
+                    timeout=0,
+                    mode="keep",
+                    output_root=None,
+                    source_root=None,
+                    rewrite_codec=True,
+                    reencode_tag=True,
+                    reencode_tag_value="REENCODE",
+                    no_dotted=False,
+                    name_suffix="",
+                    backup=None,
+                    recycle_to=None,
+                    keep_langs="en,und",
+                    hwaccel="auto",
+                    hw_decode=True,
+                    compat_audio=True,
+                    original_audio=False,
+                    original_subs=False,
+                    dv_p7_convert=False,
+                )
+
+                # Simulate strip failure to avoid the encode path; we
+                # only care that _prepare_dv_source was invoked.
+                with patch.object(cli_mod, "_prepare_dv_source",
+                                  return_value=(None, None,
+                                                "dv_strip_failed: stub")) \
+                                                  as m_prep, \
+                     patch.object(cli_mod, "_build_apply_command",
+                                  return_value=(["ffmpeg", "stub"],
+                                                "encode (stub)")):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        cli_mod._apply_one_after_validation(
+                            db, row, pr, args, run_id, output,
+                            "av1+mkv", "av1_qsv", ["en", "und"], 1, 1,
+                        )
+
+                m_prep.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

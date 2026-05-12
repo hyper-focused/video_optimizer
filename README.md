@@ -364,6 +364,15 @@ colour gamut and high luma range.
 Requires both tools on `PATH`; the apply gate fails closed if either
 is missing rather than silently falling back.
 
+**HD-resolution DV sources skip the strip pre-pass.** The rare 1080p DV
+title (Apple TV+ Profile 8.x WEB-DLs, mostly) doesn't engage the QSV
+decoder path on HD by default, and `av1_qsv` ignores DV RPU side data
+on encode anyway — the HDR10 base layer flows through implicitly. So
+running a multi-GB stream-copy strip for HD-DV produces no functional
+improvement. The gate is `height >= 1440`. The filename rewriter still
+scrubs DV tokens at HD, so the output is labelled HDR10 to match what's
+actually in the container.
+
 **Profile 10** (DV preserved through AV1 as OBU side-data) is on the
 radar but not implemented. Waiting on `dovi_tool inject-rpu`'s AV1
 support and on player ecosystems (Plex, Shield, etc.) recognising the

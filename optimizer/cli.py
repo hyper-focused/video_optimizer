@@ -1231,7 +1231,22 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
     # re-probe the stripped file and use the new probe.
     encode_probe: ProbeResult = pr
     try:
-        if pr.dv_profile is not None:
+        # DV strip pre-pass is UHD-only. The whole purpose of the pre-pass
+        # is to feed the av1_qsv UHD pipeline a clean HDR10 stream (RPU
+        # stripped, multi-track sources pre-trimmed to dodge QSV decoder
+        # starvation). At HD we don't engage the QSV decoder path on the
+        # default `hw_decode=False`, av1_qsv ignores DV RPU side data on
+        # the encode side, and the static HDR10 mastering display + MaxCLL
+        # flow through implicitly — so the only effect of running the pre-
+        # pass at HD would be a multi-GB stream-copy on the source's
+        # filesystem before encoding starts. Skip it.
+        #
+        # Realistic HD-DV vectors (Apple TV+ 1080p WEB-DL, Profile 8.x with
+        # an HDR10 base layer) encode correctly without the strip; the
+        # filename rewriter already scrubs DV/HDR10+ tokens on the av1
+        # target so the output is labelled HDR10 to match what's actually
+        # in the container.
+        if pr.dv_profile is not None and pr.height >= 1440:
             dv_prep_dir, source_for_encode, dv_err = _prepare_dv_source(
                 pr, args,
                 keep_langs=keep_langs,
