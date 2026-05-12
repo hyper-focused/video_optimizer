@@ -12,10 +12,29 @@ import re
 
 # Tokens to strip per target codec. Each entry is a regex *fragment* (without
 # the surrounding word-boundary lookarounds, which are added at compile time).
+#
+# Each list pairs the target's own near-neighbour codec tokens (e.g. AV1 strips
+# H.264/HEVC) with the broader set of legacy video-codec tokens that show up in
+# filenames from the MPEG-2/VC-1/DivX era. Without the legacy entries an
+# `MPEG2`-tagged Blu-ray remux re-encoded to AV1 would still claim MPEG2 in
+# its output filename — see Kingdom.of.Heaven / Pearl.Harbor for canonical
+# examples.
+_LEGACY_VIDEO_CODEC_TOKENS: list[str] = [
+    r"MPEG[. _-]?2(?:video)?", r"XviD", r"DivX", r"VC-?1", r"VP9", r"WMV[0-9]?",
+]
 _FOREIGN_CODEC_TOKENS: dict[str, list[str]] = {
-    "av1": [r"H\.?264", r"H\.?265", r"HEVC", r"x264", r"x265", r"AVC"],
-    "hevc": [r"H\.?264", r"x264", r"AVC", r"AV1", r"SVT-?AV1"],
-    "h264": [r"H\.?265", r"HEVC", r"x265", r"AV1", r"SVT-?AV1"],
+    "av1": [
+        r"H\.?264", r"H\.?265", r"HEVC", r"x264", r"x265", r"AVC",
+        *_LEGACY_VIDEO_CODEC_TOKENS,
+    ],
+    "hevc": [
+        r"H\.?264", r"x264", r"AVC", r"AV1", r"SVT-?AV1",
+        *_LEGACY_VIDEO_CODEC_TOKENS,
+    ],
+    "h264": [
+        r"H\.?265", r"HEVC", r"x265", r"AV1", r"SVT-?AV1",
+        *_LEGACY_VIDEO_CODEC_TOKENS,
+    ],
 }
 
 

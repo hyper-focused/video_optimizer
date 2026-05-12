@@ -146,6 +146,73 @@ class CodecRewriteTests(unittest.TestCase):
             "Movie.2010.Bluray-1080p.AV1",
         )
 
+    def test_av1_target_strips_mpeg2_token(self):
+        """MPEG2 Blu-ray remux: the legacy codec token must be scrubbed when
+        re-encoding to AV1 (Kingdom of Heaven / Pearl Harbor pattern).
+        """
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Kingdom.of.Heaven.2005.Bluray-1080p.MPEG2.DTS-HD.MA5.1",
+                "av1",
+            ),
+            "Kingdom.of.Heaven.2005.Bluray-1080p.DTS-HD.MA5.1.AV1",
+        )
+
+    def test_av1_target_strips_mpeg_dash_2_token(self):
+        """`MPEG-2` (hyphen variant) also stripped."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.1998.Bluray-1080p.MPEG-2.AC3", "av1",
+            ),
+            "Movie.1998.Bluray-1080p.AC3.AV1",
+        )
+
+    def test_av1_target_strips_vc1_token(self):
+        """VC-1 era Blu-ray remux (Universal/Sony catalog) — token scrubbed."""
+        self.assertEqual(
+            rewrite_codec_tokens(
+                "Movie.2007.Bluray-1080p.VC-1.TrueHD5.1", "av1",
+            ),
+            "Movie.2007.Bluray-1080p.TrueHD5.1.AV1",
+        )
+
+    def test_av1_target_strips_xvid_and_divx_tokens(self):
+        """Legacy DivX/XviD release tokens are scrubbed on the AV1 rewrite."""
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.1999.DVDRip.XviD-GRP", "av1"),
+            "Movie.1999.DVDRip-GRP.AV1",
+        )
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2003.DVDRip.DivX-GRP", "av1"),
+            "Movie.2003.DVDRip-GRP.AV1",
+        )
+
+    def test_av1_target_strips_vp9_token(self):
+        """VP9 (YouTube/WebM-style) is foreign to AV1 output."""
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2020.WEBDL-2160p.VP9.Opus", "av1"),
+            "Movie.2020.WEBDL-2160p.Opus.AV1",
+        )
+
+    def test_mpeg2_does_not_eat_mpeg2video_suffix(self):
+        """`MPEG2video` (ffprobe-style codec name in a filename) collapses to
+        the legacy MPEG-2 token, not a leftover `video` fragment.
+        """
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2001.Bluray-1080p.MPEG2video", "av1"),
+            "Movie.2001.Bluray-1080p.AV1",
+        )
+
+    def test_mpeg2_token_does_not_eat_mpeg4(self):
+        """Bare `MPEG-4` must not match the MPEG-2 stripper (it's a different
+        codec family and we deliberately don't scrub it).
+        """
+        # MPEG-4 stays put; HEVC is the actual codec token being replaced.
+        self.assertEqual(
+            rewrite_codec_tokens("Movie.2010.MPEG-4.HEVC", "av1"),
+            "Movie.2010.MPEG-4.AV1",
+        )
+
     def test_dv_inside_other_words_not_stripped(self):
         """`DV` is short — make sure it doesn't eat `DVD` or similar."""
         self.assertEqual(

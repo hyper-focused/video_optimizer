@@ -380,6 +380,8 @@ aren't there:
 | `DV`, `DoVi`, `Dolby.Vision` | Removed (or substituted with `HDR10` — see below) | RPU is stripped before the encoder sees the frames |
 | `HDR10Plus`, `HDR10+` | Removed (or substituted with `HDR10`) | `av1_qsv` doesn't carry the SMPTE 2094-40 dynamic metadata |
 | `HDR10`, `HDR` | Preserved | Static mastering display + MaxCLL flow through implicitly |
+| `H.264`, `H.265`, `HEVC`, `x264`, `x265`, `AVC` | Removed | Foreign codec token from the source — the output is AV1 |
+| `MPEG2` / `MPEG-2` / `MPEG2video`, `VC-1`, `XviD`, `DivX`, `VP9`, `WMV` | Removed | Legacy codec tokens (Blu-ray MPEG-2 / VC-1 era, DivX/XviD DVD rips, WebM VP9) — none survive the AV1 encode |
 
 When the source advertised DV or HDR10+ but no plain `HDR10` token,
 the first stripped token is replaced with `HDR10` to keep the file
