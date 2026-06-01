@@ -8,7 +8,8 @@ Layout:
   - SLOW_CPU_DECODE_CODECS      — codec-aware hw_decode override (empty today).
   - EST_SECONDS_PER_FILE        — wizard's wall-clock estimates per tier.
   - AV1_QSV_TIER / AV1_QSV_BASE — av1_qsv tuning (per-tier and shared).
-  - BLOAT_*                     — UHD over-budget retry trigger + checkpoints.
+  - BLOAT_*                     — HD+UHD over-budget retry trigger, checkpoints,
+                                  per-tier relaxed tuning.
   - MIN_PROBE_SIZE_BYTES        — scan-time size gate.
   - BITRATE_FLAG_TABLE          — OverBitratedRule thresholds.
 
@@ -133,18 +134,45 @@ AV1_QSV_DEFAULT_ENCODER_PRESET: str = "veryslow"
 
 
 # --------------------------------------------------------------------------- #
-# Post/mid-encode bloat fallback (UHD only)
+# Post/mid-encode bloat fallback (HD + UHD)
 # --------------------------------------------------------------------------- #
 #
-# Healthy UHD encodes land at 0.4–0.7 of source size. If a UHD output
-# projects above the threshold, kill + retry at RELAXED_UHD_CQ /
-# RELAXED_UHD_ENCODER_PRESET. Threshold + checkpoint calibration history
-# (TGF 1972, Princess Bride): NOTES.md#preset-rationale.
+# Healthy encodes land well under source size. If an output projects above
+# BLOAT_RATIO_THRESHOLD × source mid-encode (or finishes above it), the
+# encode is killed and retried once at the tier's relaxed tuning below —
+# the failure mode is grain-dominated content the default CQ over-allocates
+# bits to. Threshold + checkpoint calibration history (TGF 1972, Princess
+# Bride): NOTES.md#preset-rationale.
 
 BLOAT_RATIO_THRESHOLD: float = 0.90
-RELAXED_UHD_CQ: int = 21
-RELAXED_UHD_ENCODER_PRESET: str = "slow"
 BLOAT_CHECKPOINTS: tuple[float, ...] = (0.10, 0.20, 0.30, 0.50)
+
+# Per-tier relaxed (cq, encoder_preset) keyed by the hd/uhd split
+# (probe.height >= 1440). The `uhd` row intentionally mirrors the UHD-FILM
+# preset — "when UHD bloats, fall back to the film tuning". HD has no film
+# preset, so its relaxed values are defined directly: CQ 26 (~half the bit
+# allocation of the CQ 21 HD default) + `slow` (grain is bit-budget-bound
+# regardless of RD-search depth). SD opts out (resolver below returns None)
+# — its outputs are too small for a doubled encode budget to be worth it.
+BLOAT_RELAX_TIER: dict[str, dict[str, object]] = {
+    "hd":  {"cq": 26, "encoder_preset": "slow"},
+    "uhd": {"cq": 21, "encoder_preset": "slow"},
+}
+
+# Back-compat aliases — UHD was the original (and for a while only) tier
+# with a bloat fallback. Existing imports/tests reference these directly.
+RELAXED_UHD_CQ = BLOAT_RELAX_TIER["uhd"]["cq"]
+RELAXED_UHD_ENCODER_PRESET = BLOAT_RELAX_TIER["uhd"]["encoder_preset"]
+
+
+def bloat_relax_for_height(height: int) -> dict[str, object] | None:
+    """Relaxed bloat-retry tuning for a frame height, or None if the tier
+    opts out. UHD (>=1440) and HD (>=720) retry; SD (<720) does not."""
+    if height >= 1440:
+        return BLOAT_RELAX_TIER["uhd"]
+    if height >= 720:
+        return BLOAT_RELAX_TIER["hd"]
+    return None
 
 
 # --------------------------------------------------------------------------- #

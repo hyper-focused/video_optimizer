@@ -211,6 +211,32 @@ ladder, best efficiency per bit. UHD-FILM uses `slow` because grain
 content is bit-budget-bound on the encoder regardless of search depth;
 `veryslow` spends time the encoder can't compress better anyway.
 
+### Bloat fallback (HD + UHD)
+
+The default CQ occasionally backfires on grain-dominated content: the
+encoder spends its whole budget preserving grain particles and the AV1
+output matches or exceeds the source. The fallback detects this — at
+duration checkpoints `(0.10, 0.20, 0.30, 0.50)` it projects the final
+size from bytes-so-far, and if the projection (or the finished file)
+crosses `BLOAT_RATIO_THRESHOLD` (0.90) of the encoder input, it kills the
+encode and retries **once** at the tier's relaxed tuning, encoder preset
+`slow`.
+
+Per-tier relaxed CQ lives in `presets.BLOAT_RELAX_TIER`:
+
+| Tier | Default CQ | Relaxed CQ | Notes |
+|---|---|---|---|
+| UHD | 15 | 21 | Mirrors the UHD-FILM preset — "when UHD bloats, fall back to the film tuning". Princess Bride 2160p remux (47 GB → 49 GB CQ-15) is the canonical case. |
+| HD | 21 | 26 | ~half the bit allocation of CQ 21. Burn Notice S02/S03 (grainy 1080p, HD run 353) bloated to ~1.4–1.5× source at CQ 21. |
+| SD | 24 | — | Opts out (`bloat_relax_for_height` returns `None`); SD outputs are too small for a doubled encode budget to be worth chasing. |
+
+The mechanism is identical across tiers — only the relaxed `(cq,
+encoder_preset)` differs — so it's one code path (`_bloat_check_applies`
++ `_maybe_make_bloat_checker` + the retry in `_apply_one`) parameterised
+by `bloat_relax_for_height(pr.height)`, not a per-tier fork. The HD CQ 26
+target is a calibration estimate (each +6 CQ roughly halves AV1 rate);
+recalibrate in `BLOAT_RELAX_TIER` if real runs disagree.
+
 ### Why this is a Python module not TOML/YAML
 
 Deliberately a `.py` file: zero parser, zero precedence rules, comments

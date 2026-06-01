@@ -1,19 +1,20 @@
 """Post-encode bloat fallback (`--auto-relax-cq`).
 
-When a UHD encode at the default tight CQ (15) produces an output that
-is nearly the same size as the source, the encoder is over-allocating
-bits to grain — re-encoding once at CQ 21 (`RELAXED_UHD_CQ`) typically
-collapses the output to a sane size. The Princess Bride 2160p remux is
-the canonical case (47 GB source → 49 GB CQ-15 output).
+When an encode at the tier's default tight CQ produces an output that is
+nearly the same size as the source, the encoder is over-allocating bits
+to grain — re-encoding once at the tier's relaxed CQ typically collapses
+the output to a sane size. The fallback covers UHD (CQ 15 → 21; Princess
+Bride 2160p remux, 47 GB source → 49 GB CQ-15 output) and HD (CQ 21 → 26;
+Burn Notice S02/S03 cluster, HD run 353). SD opts out.
 
 These tests verify:
-  - The bloat predicate triggers only on UHD + bloat ratio + CQ < relaxed
-    + auto-relax enabled + not-yet-retried.
+  - The bloat predicate triggers on HD/UHD + bloat ratio + CQ < the tier's
+    relaxed CQ + auto-relax enabled + not-yet-retried; SD opts out.
   - `_execute_encode` returns the `bloat_retry` sentinel when bloat is
     detected and deletes the bloated output.
-  - `_apply_one_after_validation` rebuilds the command at CQ 21 and
-    re-runs `_execute_encode` exactly once, then restores the original
-    CQ on the namespace.
+  - `_apply_one_after_validation` rebuilds the command at the tier's
+    relaxed CQ and re-runs `_execute_encode` exactly once, then restores
+    the original CQ on the namespace.
 """
 
 from __future__ import annotations
@@ -33,7 +34,11 @@ from optimizer.cli import (
     _should_retry_for_bloat,
 )
 from optimizer.db import Database
-from optimizer.presets import BLOAT_RATIO_THRESHOLD, RELAXED_UHD_CQ
+from optimizer.presets import (
+    BLOAT_RATIO_THRESHOLD,
+    BLOAT_RELAX_TIER,
+    RELAXED_UHD_CQ,
+)
 from tests._fixtures import make_probe
 
 
@@ -83,15 +88,26 @@ class ShouldRetryForBloatTests(unittest.TestCase):
         pr, out = self._setup_pair(src_size=10_000, out_size=4_000)  # ratio 0.4
         self.assertFalse(_should_retry_for_bloat(pr, out, _args()))
 
-    def test_hd_bloat_does_not_trigger(self):
-        # 1080p source: bloat policy doesn't apply. The storage delta at
-        # HD doesn't justify a doubled encode budget.
+    def test_hd_bloat_triggers(self):
+        # 1080p source: HD is now covered. A grainy HD encode at the
+        # default CQ 21 that bloats retries at the HD relaxed CQ (26).
+        # Regression: Burn Notice S02/S03 cluster, HD run 353.
+        self.tmp = tempfile.TemporaryDirectory()
+        out = Path(self.tmp.name) / "out.mkv"
+        out.write_bytes(b"x" * 9_700)  # ratio 0.97
+        pr = make_probe(height=1080)
+        pr.size = 10_000
+        self.assertTrue(_should_retry_for_bloat(pr, out, _args(quality=21)))
+
+    def test_sd_bloat_does_not_trigger(self):
+        # SD (<720p) opts out: outputs are too small for a doubled encode
+        # budget to be worth chasing.
         self.tmp = tempfile.TemporaryDirectory()
         out = Path(self.tmp.name) / "out.mkv"
         out.write_bytes(b"x" * 9_700)
-        pr = make_probe(height=1080)
+        pr = make_probe(height=480)
         pr.size = 10_000
-        self.assertFalse(_should_retry_for_bloat(pr, out, _args()))
+        self.assertFalse(_should_retry_for_bloat(pr, out, _args(quality=24)))
 
     def test_already_retried_does_not_trigger(self):
         pr, out = self._setup_pair(src_size=10_000, out_size=9_900)
@@ -292,6 +308,67 @@ class ApplyOneRetryTests(unittest.TestCase):
             self.assertEqual(args.encoder_preset, "veryslow")
             self.assertFalse(getattr(args, "_cq_retried", False))
 
+    def test_hd_bloat_retry_uses_hd_relaxed_cq(self):
+        # HD tier: a 1080p encode at the CQ 21 default that bloats must
+        # retry at the HD relaxed tuning (CQ 26 / slow), not the UHD one.
+        from optimizer.cli import _apply_one_after_validation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "src.mkv"
+            source.write_bytes(b"x" * 10_000)
+            output = tmp_path / "src.AV1.REENCODE.mkv"
+
+            pr = make_probe(height=1080)
+            pr.path = str(source)
+            pr.size = 10_000
+
+            db_path = tmp_path / "state.db"
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("apply", None, {})
+                dec_id = db.insert_pending_decision(
+                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
+                    run_id=run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?", (dec_id,),
+                ).fetchone())
+
+                args = _args(quality=21)  # HD archive-grade default
+                args._apply_run_id = run_id  # noqa: SLF001
+                args.encoder_preset = "veryslow"
+
+                seen: list[tuple[int, str | None]] = []
+
+                def fake_execute(_db, _dec, _pr, _cmd, _desc,
+                                 _out, args_, _label, **_kw):
+                    seen.append((args_.quality,
+                                 getattr(args_, "encoder_preset", None)))
+                    if len(seen) == 1:
+                        return "bloat_retry", 0
+                    return "applied", 1024
+
+                with patch.object(cli_mod, "_execute_encode",
+                                  side_effect=fake_execute), \
+                     patch.object(cli_mod, "_build_apply_command",
+                                  return_value=(["ffmpeg"], "encode (stub)")):
+                    with redirect_stdout(io.StringIO()):
+                        status, _saved = _apply_one_after_validation(
+                            db, row, pr, args, run_id, output,
+                            "av1+mkv", "av1_qsv",
+                            ["en", "und"], 1, 1,
+                        )
+
+            self.assertEqual(status, "applied")
+            self.assertEqual(seen, [
+                (21, "veryslow"),
+                (BLOAT_RELAX_TIER["hd"]["cq"], "slow"),
+            ])
+            # Restored to the HD defaults after the retry.
+            self.assertEqual(args.quality, 21)
+            self.assertEqual(args.encoder_preset, "veryslow")
+
 
 class MidEncodeBloatCheckerTests(unittest.TestCase):
     """`encoder._BloatChecker` projects final size at progress checkpoints."""
@@ -393,13 +470,26 @@ class MaybeMakeBloatCheckerTests(unittest.TestCase):
             )
         self.assertIsNotNone(ck)
 
-    def test_hd_returns_none(self):
+    def test_hd_returns_checker(self):
+        # HD is covered now; the mid-encode checker is built at HD too,
+        # provided the current CQ is tighter than the HD relaxed CQ (26).
         from optimizer.cli import _maybe_make_bloat_checker
         with tempfile.TemporaryDirectory() as tmp:
             ck = _maybe_make_bloat_checker(
                 self._pr(height=1080, size=10_000),
                 Path(tmp) / "out.mkv",
-                _args(),
+                _args(quality=21),
+            )
+        self.assertIsNotNone(ck)
+
+    def test_sd_returns_none(self):
+        # SD opts out of the bloat fallback entirely.
+        from optimizer.cli import _maybe_make_bloat_checker
+        with tempfile.TemporaryDirectory() as tmp:
+            ck = _maybe_make_bloat_checker(
+                self._pr(height=480, size=10_000),
+                Path(tmp) / "out.mkv",
+                _args(quality=24),
             )
         self.assertIsNone(ck)
 

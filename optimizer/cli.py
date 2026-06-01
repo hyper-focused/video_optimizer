@@ -27,9 +27,8 @@ from .presets import (
     EST_SECONDS_PER_FILE,
     MIN_PROBE_SIZE_BYTES,
     PRESETS,
-    RELAXED_UHD_CQ,
-    RELAXED_UHD_ENCODER_PRESET,
     SLOW_CPU_DECODE_CODECS,
+    bloat_relax_for_height,
 )
 
 _SIZE_SUFFIXES = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
@@ -266,10 +265,11 @@ def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
     # post-encode (same retry from the finished output's size).
     ap.add_argument("--no-auto-relax-cq", action="store_false",
                     dest="auto_relax_cq", default=True,
-                    help="Disable the UHD bloat fallback. Default: a "
-                         "UHD encode whose mid-encode projection or "
-                         "final output is nearly as big as the source "
-                         "is retried once at CQ 21.")
+                    help="Disable the HD/UHD bloat fallback. Default: an "
+                         "HD or UHD encode whose mid-encode projection or "
+                         "final output is nearly as big as the source is "
+                         "retried once at the tier's relaxed CQ (UHD 21, "
+                         "HD 26).")
     # Compat audio: when a kept track is hi-res lossless (TrueHD, DTS-HD MA,
     # FLAC, multichannel PCM), also emit AAC 5.1 @ 640k and AAC 2.0 @ 320k
     # so devices that can't decode lossless still play sound. On by default.
@@ -1240,15 +1240,16 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         if status != "bloat_retry":
             return status, saved
 
-        # Bloat fallback: rebuild argv at relaxed CQ + slower encoder
-        # preset, retry once. _execute_encode already deleted the bloated
-        # output. Originals are restored after so the next file starts
-        # from the preset defaults. See NOTES.md#preset-rationale.
+        # Bloat fallback: rebuild argv at the tier's relaxed CQ + slower
+        # encoder preset, retry once. _execute_encode already deleted the
+        # bloated output. Originals are restored after so the next file
+        # starts from the preset defaults. See NOTES.md#preset-rationale.
+        relax = bloat_relax_for_height(encode_probe.height)
         original_cq = getattr(args, "quality", None)
         original_encoder_preset = getattr(args, "encoder_preset", None)
         args._cq_retried = True  # noqa: SLF001
-        args.quality = RELAXED_UHD_CQ
-        args.encoder_preset = RELAXED_UHD_ENCODER_PRESET
+        args.quality = relax["cq"]
+        args.encoder_preset = relax["encoder_preset"]
         try:
             retry_cmd, retry_desc = _build_apply_command(
                 dec, encode_probe, output_path, target_container,
@@ -1559,9 +1560,10 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
             # fires immediately after — without flushing, the "bloat
             # detected" diagnostic sits in the buffer past the next
             # ffmpeg invocation.
+            relax = bloat_relax_for_height(bloat_pr.height)
             print(f"    bloat detected mid-encode: {err}", flush=True)
-            print(f"    will retry at CQ {RELAXED_UHD_CQ} "
-                  f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
+            print(f"    will retry at CQ {relax['cq']} "
+                  f"(encoder preset → {relax['encoder_preset']})",
                   flush=True)
             _unlink_partial_output(output_path)
             return "bloat_retry", 0
@@ -1573,16 +1575,17 @@ def _execute_encode(db: Database, dec: dict, pr: ProbeResult,
                          expected_path=pr.path)
         return "failed", 0
 
-    # Post-encode bloat check (UHD only, before _finalize_output so
+    # Post-encode bloat check (HD/UHD, before _finalize_output so
     # replace mode hasn't recycled the source). Compare against
     # `bloat_pr` (stripped intermediate) when DV prep ran.
     if _should_retry_for_bloat(bloat_pr, output_path, args):
+        relax = bloat_relax_for_height(bloat_pr.height)
         out_size = _safe_stat_size(output_path)
         ratio = out_size / bloat_pr.size if bloat_pr.size else 0
         print(f"    bloat detected: output {out_size / 1024 ** 3:.2f} GB "
               f"vs encoder input {bloat_pr.size / 1024 ** 3:.2f} GB "
-              f"(ratio {ratio:.2f}); retrying at CQ {RELAXED_UHD_CQ} "
-              f"(encoder preset → {RELAXED_UHD_ENCODER_PRESET})",
+              f"(ratio {ratio:.2f}); retrying at CQ {relax['cq']} "
+              f"(encoder preset → {relax['encoder_preset']})",
               flush=True)
         _unlink_partial_output(output_path)
         return "bloat_retry", 0
@@ -1600,21 +1603,21 @@ def _bloat_check_applies(pr: ProbeResult, args: argparse.Namespace) -> bool:
     Triggers when *all* of these are true:
       - Auto-relax is enabled (default; --no-auto-relax-cq disables).
       - We have not already retried this file (one retry cap).
-      - Source is UHD (height >= 1440). 1080p AV1 occasionally bloats
-        relative to over-bitrated h264, but the storage delta isn't
-        worth a doubled encode budget there.
-      - The current CQ is tighter than the relaxed CQ — otherwise the
-        retry would re-run with the same (or looser) settings.
+      - The tier has a relaxed tuning (HD and UHD do; SD opts out — its
+        outputs are too small for a doubled encode budget to be worth it).
+      - The current CQ is tighter than the tier's relaxed CQ — otherwise
+        the retry would re-run with the same (or looser) settings.
       - We know the source size (sanity for the projection math).
     """
     if not getattr(args, "auto_relax_cq", True):
         return False
     if getattr(args, "_cq_retried", False):
         return False
-    if pr.height < 1440:
+    relax = bloat_relax_for_height(pr.height)
+    if relax is None:
         return False
     cur_cq = getattr(args, "quality", None)
-    if cur_cq is None or cur_cq >= RELAXED_UHD_CQ:
+    if cur_cq is None or cur_cq >= relax["cq"]:
         return False
     if not pr.size:
         return False

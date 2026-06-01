@@ -771,7 +771,8 @@ def _subtitle_map_args(probe: ProbeResult, langs: set[str],
     original_subs=True bypasses the language filter and keeps every input
     subtitle track. mp4-incompatible image subtitles are still dropped
     (the container fundamentally cannot hold them); for mkv targets every
-    subtitle stream is preserved bit-perfectly.
+    subtitle stream is preserved bit-perfectly — except mov_text, which the
+    matroska muxer can't write, so it's transcoded to subrip.
     """
     kept: list[int] = []
     for i, s in enumerate(probe.subtitle_tracks):
@@ -788,11 +789,20 @@ def _subtitle_map_args(probe: ProbeResult, langs: set[str],
 
     args: list[str] = []
     for out_idx, i in enumerate(kept):
+        track = probe.subtitle_tracks[i]
         args += ["-map", f"0:s:{i}?"]
-        args += _kept_subtitle_metadata(out_idx, probe.subtitle_tracks[i])
-    if kept:
-        # mkv preserves any sub format; mp4 needs text subs converted.
-        args += ["-c:s", "copy"] if target_container == "mkv" else ["-c:s", "mov_text"]
+        if target_container == "mkv":
+            # mkv copies any matroska-native format bit-perfectly, with one
+            # exception: mov_text (MP4/MOV timed text) — the matroska muxer
+            # can't write it ("Subtitle codec 94213 is not supported",
+            # ffmpeg exit 218; The Internship 2026, an mp4 source, run 353).
+            # Transcode those to subrip; copy everything else.
+            sub_codec = "srt" if track.codec == "mov_text" else "copy"
+            args += [f"-c:s:{out_idx}", sub_codec]
+        args += _kept_subtitle_metadata(out_idx, track)
+    if kept and target_container != "mkv":
+        # mp4 carries only mov_text; image subs were already dropped above.
+        args += ["-c:s", "mov_text"]
     return args
 
 

@@ -741,5 +741,58 @@ class CandidateProjectedSavingsTests(unittest.TestCase):
         self.assertEqual(cand.total_projected_savings_mb, 0.0)
 
 
+# --------------------------------------------------------------------------- #
+# Subtitle codec policy (mov_text can't be copied into matroska)
+# --------------------------------------------------------------------------- #
+
+
+class SubtitleCodecPolicyTests(unittest.TestCase):
+    """The matroska muxer can't write mov_text (MP4/MOV timed text); copying
+    it in aborts the whole encode with "Subtitle codec 94213 is not
+    supported" (ffmpeg exit 218). Pins the v0.6.x fix: mov_text → subrip on
+    mkv targets, native text/image subs still bit-copied, mp4 unchanged.
+    Regression: The Internship 2026 (an .mp4 source), HD run 353.
+    """
+
+    def _build(self, subs, *, target="mkv"):
+        from tests._fixtures import sub
+        pr = make_probe(codec="h264", height=1080,
+                        subs=[sub(*s) for s in subs])
+        return encoder.build_encode_command(
+            pr, Path(f"/tmp/out.{target}"),
+            "libsvtav1", quality=28,
+            keep_langs=["en", "und"], target_container=target,
+        )
+
+    def test_mov_text_transcoded_to_srt_on_mkv(self):
+        # mov_text must NOT be copied; it's transcoded to srt for matroska.
+        cmd = self._build([(0, "mov_text", "eng")])
+        self.assertIn("-c:s:0", cmd)
+        self.assertEqual(cmd[cmd.index("-c:s:0") + 1], "srt")
+
+    def test_native_text_sub_still_copied_on_mkv(self):
+        cmd = self._build([(0, "subrip", "eng")])
+        self.assertIn("-c:s:0", cmd)
+        self.assertEqual(cmd[cmd.index("-c:s:0") + 1], "copy")
+
+    def test_image_sub_still_copied_on_mkv(self):
+        # PGS is matroska-native and must pass through untouched.
+        cmd = self._build([(0, "hdmv_pgs_subtitle", "eng")])
+        self.assertIn("-c:s:0", cmd)
+        self.assertEqual(cmd[cmd.index("-c:s:0") + 1], "copy")
+
+    def test_mixed_subs_get_per_stream_codecs_on_mkv(self):
+        # mov_text → srt, subrip → copy, decided independently per stream.
+        cmd = self._build([(0, "mov_text", "eng"), (1, "subrip", "eng")])
+        self.assertEqual(cmd[cmd.index("-c:s:0") + 1], "srt")
+        self.assertEqual(cmd[cmd.index("-c:s:1") + 1], "copy")
+
+    def test_mp4_target_still_uses_mov_text(self):
+        # The reverse direction is unchanged: text subs → mov_text for mp4.
+        cmd = self._build([(0, "subrip", "eng")], target="mp4")
+        self.assertIn("-c:s", cmd)
+        self.assertEqual(cmd[cmd.index("-c:s") + 1], "mov_text")
+
+
 if __name__ == "__main__":
     unittest.main()

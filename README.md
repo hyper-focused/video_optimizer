@@ -244,7 +244,10 @@ Every encode produces a deterministic three-stream audio output:
 
 Subtitles filter to `--keep-langs` (default `en,und`). Image-based subs
 (PGS / VobSub) drop when targeting MP4 (which can't carry them);
-otherwise they pass through.
+otherwise they pass through. The one exception on MKV targets is
+`mov_text` (the timed-text format inside MP4/MOV sources), which the
+matroska muxer can't write — it's transcoded to SubRip rather than
+copied.
 
 Replaces an older "keep every audio track in your language" rule that
 produced 5+ streams on Blu-ray remuxes (parallel TrueHD + DTS-HD MA +
@@ -318,21 +321,29 @@ Dry-run by default. Only files whose stem carries the `REENCODE` marker
 are touched, so it's safe on a mixed library. Existing targets are
 never overwritten.
 
-### The UHD bloat fallback
+### The bloat fallback (HD + UHD)
 
-UHD is ambitious: CQ 15 with `veryslow`. Usually that produces a
-dramatically smaller file at the same perceptual quality. Occasionally
-— grain-dominated older film, mostly — `av1_qsv` spends its bit budget
-preserving every grain particle and the output matches or exceeds the
-source.
+The default CQs are ambitious — UHD CQ 15, HD CQ 21, both `veryslow`.
+Usually that produces a dramatically smaller file at the same perceptual
+quality. Occasionally — grain-dominated older film and TV, mostly —
+`av1_qsv` spends its bit budget preserving every grain particle and the
+output matches or exceeds the source.
 
 The bloat fallback catches this. At checkpoints (10% / 20% / 30% / 50%
 of duration) the tool projects final output size from bytes-so-far. If
 the projection ≥ 90% of the encoder's input, ffmpeg is killed and the
-file retries once with the **UHD-FILM** tuning (CQ 21, encoder preset
-`slow`). The retry finishes ~1.5–2× faster and produces a smaller
-output — counter-intuitive, but the encoder stops fighting grain it
-was never going to compress efficiently.
+file retries once at the tier's **relaxed** tuning, encoder preset
+`slow`:
+
+| Tier | Default CQ | Relaxed CQ on bloat |
+|---|---|---|
+| UHD (≥ 1440p) | 15 | 21 (the **UHD-FILM** tuning) |
+| HD (720–1439p) | 21 | 26 |
+| SD (< 720p) | 24 | — (opts out; outputs too small to be worth a doubled encode budget) |
+
+The retry finishes faster and produces a smaller output — counter-
+intuitive, but the encoder stops fighting grain it was never going to
+compress efficiently.
 
 Runs silently on healthy encodes. Disable with `--no-auto-relax-cq`.
 See [`NOTES.md#preset-rationale`](NOTES.md#preset-rationale) for the
