@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     actual_savings_mb     REAL,
     error                 TEXT,
     run_id                INTEGER,
+    owner_pid             INTEGER,
     FOREIGN KEY (path) REFERENCES files(path)
 );
 
@@ -63,6 +65,28 @@ CREATE INDEX IF NOT EXISTS idx_skipped_reason   ON skipped_files(reason);
 """
 
 
+def _owner_pid_is_alive(pid: int) -> bool:
+    """Return True if `pid` refers to a live process.
+
+    Signal 0 does not kill. ProcessLookupError means the pid is gone.
+    PermissionError means it is alive under another user. Non-positive
+    pids are not probed: os.kill(0, 0) checks the process group.
+    Any other OSError leaves the row alone so a live encode is not reaped.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    else:
+        return True
+
+
 class Database:
     """SQLite-backed state store for probe cache, decisions, and run history."""
 
@@ -75,7 +99,10 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(_SCHEMA)
         self._migrate_decisions_run_id()
+        self._migrate_decisions_owner_pid()
         self._migrate_decisions_autoincrement()
+        self._fail_leftover_running_decisions()
+        self._delete_leftover_pending_decisions()
         self.conn.commit()
 
     def _migrate_decisions_run_id(self) -> None:
@@ -90,6 +117,21 @@ class Database:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN run_id INTEGER")
         except sqlite3.OperationalError as e:
             # "duplicate column name: run_id" — already migrated.
+            if "duplicate column" not in str(e).lower():
+                raise
+
+    def _migrate_decisions_owner_pid(self) -> None:
+        """Add `owner_pid` to `decisions` if the column is not there yet.
+
+        CREATE TABLE IF NOT EXISTS does not alter a pre-existing table.
+        A duplicate-column error means this db already has the column.
+        Runs before the AUTOINCREMENT table swap so that swap copies it.
+        """
+        try:
+            self.conn.execute(
+                "ALTER TABLE decisions ADD COLUMN owner_pid INTEGER",
+            )
+        except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
 
@@ -130,12 +172,13 @@ class Database:
                 actual_savings_mb     REAL,
                 error                 TEXT,
                 run_id                INTEGER,
+                owner_pid             INTEGER,
                 FOREIGN KEY (path) REFERENCES files(path)
             );
             INSERT INTO decisions_new
                 SELECT id, path, decided_at, rules_fired_json, target,
                        projected_savings_mb, status, output_path,
-                       actual_savings_mb, error, run_id
+                       actual_savings_mb, error, run_id, owner_pid
                 FROM decisions;
             DROP TABLE decisions;
             ALTER TABLE decisions_new RENAME TO decisions;
@@ -143,6 +186,39 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_decisions_path   ON decisions(path);
             COMMIT;
         """)
+
+    def _fail_leftover_running_decisions(self) -> None:
+        """Fail running rows whose owner process is gone.
+
+        A live `owner_pid` stays running, so a second connect (status
+        or scan) does not interrupt an encode that is still going.
+        NULL `owner_pid` is a row from before the column existed and is
+        reaped. `error` is exactly 'interrupted' so the two-strike query
+        (`error LIKE '%encoder stalled%'`) does not count it. Pending,
+        completed, failed, and skipped rows are not updated.
+        """
+        rows = self.conn.execute(
+            "SELECT id, owner_pid FROM decisions WHERE status = 'running'",
+        ).fetchall()
+        for row in rows:
+            pid = row["owner_pid"]
+            if pid is not None and _owner_pid_is_alive(int(pid)):
+                continue
+            self.conn.execute(
+                "UPDATE decisions SET status = 'failed', error = 'interrupted' "
+                "WHERE id = ? AND status = 'running'",
+                (row["id"],),
+            )
+
+    def _delete_leftover_pending_decisions(self) -> None:
+        """Delete leftover status='pending' rows.
+
+        Pending was the queue protocol. A row still in that state is an
+        abandoned queue, not history. Completed, failed, skipped, and
+        running rows are not touched. The running-row heal runs first,
+        so a dead owner is already failed / interrupted.
+        """
+        self.conn.execute("DELETE FROM decisions WHERE status = 'pending'")
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -237,63 +313,46 @@ class Database:
 
     # ---- decisions ----------------------------------------------------------
 
-    def clear_pending_decisions(self) -> int:
-        """Delete all rows where status='pending' and return the count."""
-        cur = self.conn.execute("DELETE FROM decisions WHERE status = 'pending'")
-        self.conn.commit()
-        return cur.rowcount
-
-    def insert_pending_decision(
+    def insert_running_decision(
         self,
         path: str,
-        rules_fired: list[str],
-        target: str,
+        rules_json: str,
+        target_codec: str,
         projected_savings_mb: float | None,
-        run_id: int | None = None,
+        run_id: int,
     ) -> int:
-        """Insert a row with status='pending' and return its row id.
+        """Insert a row with status='running' and return its row id.
 
-        `run_id` records which `runs` row created the pending row (typically
-        the current `cmd_plan` run). The apply step overwrites this with its
-        own run id when it terminalises the row, so `decisions_for_run` keys
-        on the *apply* run — that's the run the post-run report describes.
+        `rules_json` is stored as given in `rules_fired_json` (already
+        serialized). `owner_pid` is `os.getpid()`. `decided_at` is
+        `time.time()`. A later connect marks the row failed with error
+        'interrupted' only if this pid is dead or `owner_pid` is NULL.
         """
         cur = self.conn.execute(
             "INSERT INTO decisions "
             "(path, decided_at, rules_fired_json, target, "
-            "projected_savings_mb, status, run_id) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (path, time.time(), json.dumps(rules_fired),
-             target, projected_savings_mb, run_id),
+            "projected_savings_mb, status, run_id, owner_pid) "
+            "VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+            (path, time.time(), rules_json,
+             target_codec, projected_savings_mb, run_id, os.getpid()),
         )
         self.conn.commit()
         return int(cur.lastrowid or 0)
-
-    def list_pending_decisions(self) -> list[dict]:
-        """Return pending rows as dicts ordered by projected savings (desc)."""
-        cur = self.conn.execute(
-            "SELECT * FROM decisions WHERE status = 'pending' "
-            "ORDER BY COALESCE(projected_savings_mb, 0) DESC"
-        )
-        return [dict(row) for row in cur]
 
     def _verify_decision_path(self, decision_id: int,
                               expected_path: str) -> bool:
         """Confirm `decisions[id=decision_id].path == expected_path`.
 
-        Used by mark_decision and stamp_decision_run to refuse writes
-        when a concurrent plan re-purposed the row's id (the corruption
-        path that produced run-127.txt's MaXXXine-output-on-Princess-
-        Bride-row mismatch). Logs a warning to stderr on mismatch so
-        the operator can spot a concurrent-process collision.
+        Used by mark_decision to refuse a write when the row is gone or
+        its path does not match. Logs a warning to stderr on mismatch.
         """
         row = self.conn.execute(
             "SELECT path FROM decisions WHERE id = ?", (decision_id,)
         ).fetchone()
         if row is None:
             sys.stderr.write(
-                f"warning: decision id={decision_id}: row no longer exists "
-                f"(concurrent plan?); skipping update\n"
+                f"warning: decision id={decision_id}: row no longer exists; "
+                f"skipping update\n"
             )
             return False
         if row["path"] != expected_path:
@@ -353,31 +412,6 @@ class Database:
                 "actual_savings_mb = ?, error = ? WHERE id = ?",
                 (status, output_path, actual_savings_mb, error, decision_id),
             )
-        self.conn.commit()
-        return True
-
-    def stamp_decision_run(self, decision_id: int,
-                           run_id: int | None,
-                           expected_path: str | None = None) -> bool:
-        """Update a decision row's run_id without touching status / outcome.
-
-        Used by dry-run, which observes a pending row but doesn't terminalise
-        it — yet still needs the row to surface in the post-run report.
-        Caller passing `run_id=None` is a no-op (e.g. an apply context
-        without a stashed run id, which shouldn't normally happen).
-
-        `expected_path` is the same concurrent-process race guard as on
-        `mark_decision`; mismatch returns False without writing.
-        """
-        if run_id is None:
-            return False
-        if expected_path is not None and not self._verify_decision_path(
-                decision_id, expected_path):
-            return False
-        self.conn.execute(
-            "UPDATE decisions SET run_id = ? WHERE id = ?",
-            (run_id, decision_id),
-        )
         self.conn.commit()
         return True
 

@@ -100,7 +100,7 @@ outputs are good."
 # Whole library — UHD → HD → SD pipeline
 ./video_optimizer.py /mnt/nas/media/Movies
 
-# Dry-run first to see the plan
+# --dry-run on a path is the preview
 ./video_optimizer.py /mnt/nas/media/Movies --dry-run
 
 # Just one tier
@@ -133,18 +133,30 @@ tier scope, codec exemptions, count limit. Friendlier than `--help`.
 ./video_optimizer.py cleanup --apply    # actually unlink them
 ```
 
-Reads the most recent run's completed encodes from the state db, runs a
-3-check safety guard (output exists, output is non-empty, output ≠
-source), and unlinks only when all three pass. The nuclear option
-requires the safety word.
+Reads completed encodes from the state db. With no `--run`, that is
+the most recent run that has one. Without `--apply` it only lists
+what would be removed. `--apply` unlinks those sources. It does not
+ask for a confirmation.
+
+A completed row is removed only when an output path was recorded,
+that output exists, the output is non-empty, the output path is not
+the source path, and the source still exists. Anything else is
+printed as `SKIP` and left on disk.
 
 ### Inspect
 
 ```bash
-./video_optimizer.py status              # recent runs + pending decisions
+./video_optimizer.py status              # recent runs
 ./video_optimizer.py doctor              # preflight: ffmpeg / encoders / GPU / db
 ./video_optimizer.py list-encoders       # what encoders are available
 ```
+
+`status` prints recent runs: encode jobs, `scan` (including `reprobe`,
+which is recorded as a scan), and `cleanup`. With no runs it prints
+`no history yet.` `doctor` checks ffmpeg, encoders, the GPU device
+node, and that the database opens. It reports how many files are in
+the probe cache. It does not count decisions. There is no pending
+queue to count.
 
 ### Audit for stragglers (orphan source files)
 
@@ -167,26 +179,50 @@ under the recycle directory so nothing collides.
 
 ## How it actually works
 
-Four-stage pipeline communicating through a SQLite database at
-`~/.video_optimizer/state.db`:
+A path command probes, decides, and encodes in one job, and that job is
+one run. The probe cache and the outcome log live in SQLite at
+`~/.video_optimizer/state.db` (override with `--db`):
 
 ```
-  scan  ──►  probe cache (per-file: codec, bitrate, HDR, DV profile, …)
-   │
-   ▼
-  plan  ──►  pending decisions (which files, which target codec)
-   │
-   ▼
-  apply ──►  encoded outputs + run report
-   │
-   ▼
-  cleanup    (later, when you're satisfied: removes originals)
+  scan / reprobe   ──►  probe cache only
+  path --dry-run   ──►  preview: ffmpeg commands, no encode, no decision rows
+  path             ──►  one run: encode, then the run report
+  cleanup          ──►  later, when you're satisfied: removes originals
 ```
 
-Path-taking subcommands (`optimize`, `SD`, `HD`, `UHD`, `UHD-FILM`, bare
-invocation, `wizard`) compose all four stages. The standalone
-subcommands exist as power-user escape hatches and are hidden from
-`--help`.
+Path-taking commands are `optimize`, `SD`, `HD`, `UHD`, `UHD-FILM`, and
+a bare path (that one is `optimize`). `optimize` encodes UHD, then HD,
+then SD. A named preset encodes only its own band. `UHD-FILM` runs only
+when you name it, and only on UHD-tier files (height ≥ 1440). It is not
+part of the `optimize` chain, and a grainy 4K file is not sent there on
+its own.
+
+Inside a tier, the biggest projected savings go first. `--limit N` is
+N files **per preset** after that sort (`0` means no limit).
+`optimize /lib --limit 3` can encode up to three UHD, three HD, and
+three SD. `UHD /lib --limit 3` is three UHD files.
+
+`--dry-run` on a path is the preview. `scan` and `reprobe` only warm or
+refresh the probe cache (`reprobe` ignores a size+mtime hit). `plan`
+and `apply` are not commands. `cleanup --apply` and `rename-fix --apply`
+are flags on those commands: they remove originals, or rename existing
+outputs. They do not encode.
+
+The wizard (no args, on a TTY) previews candidates in memory, asks how
+many files to encode, then encodes through the same job. That preview
+is not a queue, and it does not write decision rows.
+
+A file is stored when its encode starts, as a `running` decision on
+that one run. `decide()` skips are printed and not stored. A file
+under the size gate is not one of them: scan drops it with
+`record_size_skip` before `decide()` runs. `--dry-run` stores
+nothing either.
+
+Opening the database drops leftover `pending` rows.
+A `running` row whose process is still alive is left alone. If that
+process is gone, the row becomes `failed` with error `interrupted`.
+That is not an encoder stall, so it does not count toward
+`replace-list`. Completed, failed, and skipped rows stay.
 
 ### Output modes
 
@@ -206,8 +242,9 @@ Any source that fires at least one non-advisory rule:
 - **Non-AV1 video at any tier.** AV1 is wildly more efficient than
   h.264 / HEVC / MPEG-2 / VC-1 / etc., and CQ encoding preserves quality.
 - **Over-bitrate sources** above the per-resolution flag threshold
-  (1080p > 10 Mbps, 2160p > 32 Mbps, etc.) — including AV1 sources, if
-  they're abnormally fat.
+  (1080p > 10 Mbps, 2160p > 32 Mbps, etc.). Not AV1. `decide()`
+  returns `av1_source` before the rules engine unless `--allow-av1`,
+  so a fat AV1 file is skipped with every other AV1 source.
 - **Container migration.** AVI / WMV / etc. get re-muxed to MKV even
   when the codec is fine.
 
@@ -216,21 +253,30 @@ Any source that fires at least one non-advisory rule:
 The tool errs heavily on the side of "don't waste GPU time, don't
 clobber existing work":
 
-- Files < **100 MB** (likely trailers, samples, extras)
-- Files in `Trailers/` / `Behind The Scenes/` / `Featurettes/`, or with
-  `-trailer` / `-bts` / `-deleted` filename suffixes
-- Files whose source codec is **already AV1**
-- Files whose `.AV1.REENCODE.mkv` sibling **already exists**
-- Files with `REENCODE` in their **own filename**
-- Files that hit the encoder watchdog **twice** (chronic stalls; see
-  `replace-list`)
-- **Dolby Vision Profile 5** (no clean HDR10 fallback)
-- **Low-bitrate sources** below the AV1 target for their resolution
-  (1080p < 5 Mbps, 2160p < 16 Mbps, etc.) — re-encoding wouldn't yield
-  meaningful savings and risks perceptual regression
+- **Scan, size gate.** Files under **100 MB** (default `--min-size`)
+  are dropped in the walk via `record_size_skip`. They are not probed
+  and they are not a `decide()` reason. `--min-size 0` disables the gate.
+- **Crawler, extras directories.** `Trailers/`, `Behind The Scenes/`,
+  and `Featurettes/` are not walked. `decide()` does not see a directory.
+- **Crawler and `decide()`, extras filenames.** A stem ending in
+  `-trailer`, `-bts`, or `-deleted` is dropped on the walk. If a
+  cached probe is classified anyway, `decide()` returns `extras`.
+  `--allow-extras` lets both through.
+- **`decide()`, already AV1.** Returned as `av1_source` before the
+  rules engine, unless `--allow-av1`.
+- **`decide()`, existing output.** A sibling `.AV1.REENCODE.mkv`
+  returns `existing_output`, unless `--allow-reencoded`.
+- **`decide()`, own filename.** `REENCODE` in the file's own name
+  returns `reencoded`, unless `--allow-reencoded`.
+- **`decide()`, two stalls.** `stall_count >= 2` returns `stalled`.
+  See `replace-list`.
+- **`decide()`, Dolby Vision.** A profile is skipped only when
+  `encoder.dv_strategy` returns None. Profile 5 always does. Profiles
+  7 and 8 return `p8_strip` and are encoded.
+- **`decide()`, low bitrate.** Below the AV1 target for the resolution
+  (1080p < 5 Mbps, 2160p < 16 Mbps, etc.), unless `--allow-low-bitrate`.
 
-Each skip class has a corresponding `--allow-*` flag — see "Advanced
-options".
+Some of these have an `--allow-*` override — see "Advanced options".
 
 ### Audio and subtitles: the 3-stream ladder
 
@@ -357,11 +403,14 @@ After every run, a plain-text report at
 ```
 OK   3215 MB  /movies/foo.AV1.REENCODE.mkv  (from /movies/foo.mkv)
 FAIL encoder_stalled  /movies/baz.mkv
-SKIP dolby_vision     /movies/qux.mkv
+SKIP user_declined    /movies/qux.mkv
 ```
 
 Same data lives in the SQLite db. `cleanup` reads it to know which
-originals are safe to remove.
+originals are safe to remove. Decide-time skips are printed while the
+job is choosing files; they are not lines in this report. A `SKIP`
+line is a file the job had already stored and then did not encode
+(for example you declined it with `--confirm`).
 
 ---
 
@@ -369,16 +418,16 @@ originals are safe to remove.
 
 | Flag | Effect |
 |---|---|
-| `--dry-run` | Print planned ffmpeg commands and exit. No encoding. |
-| `--limit N` | Process at most N candidates (0 = no limit) |
+| `--dry-run` | Print the ffmpeg commands and exit. No encoding, and no decision rows. |
+| `--limit N` | At most N files per preset, biggest projected savings first (`0` = no limit). `optimize` applies that cap once per tier. |
 | `--confirm` | Prompt per-file before encoding (default is auto-yes) |
-| `--cleanup-after` | Prompt to remove originals after a successful run |
+| `--cleanup-after` | After the path command, unlink originals of completed encodes. No question. `--confirm` asks first (`[y/N]`) and leaves them unless you answer y. |
 | `--verbose` / `-v` | More chatter (timeout labels, preset tunings) |
 | `--output DIR` | Mirror outputs into a separate tree under `DIR` |
 | `--replace` | Replace mode: move originals to a recycle dir as encodes complete |
 | `--recycle-to DIR` | With `--replace`: explicit recycle directory |
 | `--mode {keep,side,replace}` | Explicit mode override |
-| `--no-auto-relax-cq` | Disable the UHD bloat fallback |
+| `--no-auto-relax-cq` | Disable the bloat retry for HD and UHD. SD has no relaxed tuning, so this flag does not change an SD encode. |
 | `--dv-p7-convert` | Use the dovi_tool convert pipeline for stubborn P7 |
 | `--original-audio` | Keep every input audio track via stream-copy |
 | `--original-subs` | Keep every input subtitle track via stream-copy |
@@ -425,22 +474,19 @@ Names match `ffprobe -show_streams`; case-insensitive. Common values:
 | `--hw-decode` / `--no-hw-decode` | Override the preset's hw-decode default |
 | `--min-size BYTES` | Skip files below this size at scan (default 100 MB; accepts `100M`, `1G`) |
 | `--db PATH` | SQLite state file (default `~/.video_optimizer/state.db`) |
-| `--timeout SEC` | Per-file ffmpeg wall-clock cap (default `max(3600, 6 × duration)`; `0` disables) |
+| `--timeout SEC` | Per-file ffmpeg wall-clock cap. Omitted: `max(3600, 6 × duration)`. `0` disables. A positive number replaces the adaptive cap. |
 
-### Pipeline-primitive subcommands
+### Cache and maintenance subcommands
 
 | Subcommand | What it does |
 |---|---|
-| `scan PATH` | Probe-cache only — populate the db without queueing anything |
-| `plan` | Run rules against the cache, write pending decisions |
-| `apply` | Encode pending decisions |
+| `scan PATH` | Warm or refresh the probe cache |
 | `reprobe PATH` | Force-refresh the probe cache (alias for `scan --no-probe-cache`) |
 | `replace-list` | Files that have hit the encoder watchdog twice (chronic stalls) |
 | `rename-fix PATH` | Re-run existing `.REENCODE` outputs through the current naming rules. Dry-run by default. |
 
-These are the building blocks the path-taking subcommands compose.
-You only need them if you're iterating on rule tunings or
-investigating a problem.
+`scan` and `reprobe` only refresh the probe cache. They do not encode.
+Encoding is a path command; `--dry-run` on that path is the preview.
 
 ---
 

@@ -113,7 +113,7 @@ class KnownSubcommandsRegistryTest(unittest.TestCase):
 
     def test_contains_all_documented_subcommands(self) -> None:
         expected_core = {
-            "scan", "reprobe", "plan", "apply", "status",
+            "scan", "reprobe", "status",
             "list-encoders", "replace-list", "doctor",
             "optimize", "cleanup", "wizard",
         }
@@ -121,6 +121,8 @@ class KnownSubcommandsRegistryTest(unittest.TestCase):
             expected_core.issubset(KNOWN_SUBCOMMANDS),
             f"missing core subcommands: {expected_core - set(KNOWN_SUBCOMMANDS)}",
         )
+        self.assertNotIn("plan", KNOWN_SUBCOMMANDS)
+        self.assertNotIn("apply", KNOWN_SUBCOMMANDS)
 
     def test_contains_all_presets(self) -> None:
         # PRESETS keys must be reachable as subcommands so the dispatcher

@@ -20,20 +20,23 @@ why.
       Test coverage: `tests/test_scan.py` (parallel == sequential, cap,
       cache-skip, error-isolation).
 
-- [ ] **Parallelise apply on multi-engine GPUs**
-      (`optimizer/cli.py:cmd_apply`). Apply iterates pending decisions
-      sequentially. For single-stream encodes on a single-engine GPU
-      that's fine — encoder is the bottleneck. But Battlemage / Arc
+- [ ] **Parallelise encodes on multi-engine GPUs** (apply parallelism)
+      (`optimizer/cli.py:run_job`, `_encode_preset`). A path command
+      encodes its band one file at a time, biggest projected savings
+      first. For single-stream encodes on a single-engine GPU that's
+      fine — the encoder is the bottleneck. But Battlemage / Arc
       Pro and similar dual-media-engine GPUs can encode two streams
       concurrently across the engines, and the current loop leaves
-      Engine 2 idle.
+      Engine 2 idle. There is no pending queue and no `cmd_apply`;
+      the candidates for the job are already in memory.
 
       Approach: a small worker pool sized to the GPU's media-engine
       count (probe Intel's `vainfo` or QuickSync stats to count;
-      default to 1 if unknown). Each worker pulls the next pending
-      decision from the db and calls the same `_apply_one` path.
-      SQLite writes need to be serialised through the main thread or
-      use `PRAGMA journal_mode=WAL` plus per-worker connections.
+      default to 1 if unknown). Each worker takes the next in-memory
+      candidate and calls the same `_encode_job_file` path. SQLite
+      writes need to be serialised through the main thread or use
+      `PRAGMA journal_mode=WAL` plus per-worker connections. Each
+      encode is still born `running` on the one job run.
 
       Caveat: I/O contention on the source (NFS share read) can
       throttle wins. Measure on a representative library before
@@ -55,7 +58,9 @@ why.
       the place where it runs is wrong.
 
       Until this lands, frame-0 wedges have to be killed manually
-      (`kill -9 <ffmpeg-pid>`) so the queue can advance.
+      (`kill -9 <ffmpeg-pid>`). Encode order is the in-memory loop
+      in `_encode_preset`. Killing ffmpeg lets that loop move on
+      to the next file. There is no queue to advance.
 
 - [ ] **Empirical validation gate for `SLOW_CPU_DECODE_CODECS` candidates**
       The set is empty after `vc1_qsv` wedged on Lethal Weapon 1987
@@ -104,7 +109,7 @@ why.
       Test coverage: `tests/test_crawler.py`.
 
 - [ ] **Post-stall source-corruption probe + actionable error message**
-      (`optimizer/cli.py:_apply_one`, `optimizer/cli.py:cmd_replace_list`).
+      (`optimizer/cli.py:_encode_one`, `optimizer/cli.py:cmd_replace_list`).
       The current stall path records `error='encoder stalled — no
       progress for 300s (out_time=Xs, frame=N)'` and the operator-facing
       `replace-list` says "consider replacing with a different release"
@@ -148,8 +153,8 @@ why.
       practice.
 
 - [ ] **`--rescue-mode` opt-in for irreplaceable corrupt sources**
-      (probably `optimizer/cli.py` apply path + a small `encoder.py`
-      branch). Companion to the post-stall corruption-probe TODO above:
+      (a `rescue` handler in `optimizer/cli.py` plus a small
+      `encoder.py` branch). Companion to the post-stall corruption-probe TODO above:
       that one *identifies* damaged sources; this one gives the user
       an explicit escape hatch for the case where they can't replace
       the source.
@@ -174,15 +179,15 @@ why.
       1. **New `rescue PATH` subcommand, single-file only.** Takes
          exactly one file path (positional, no recursion, errors out if
          given a directory). Does its own probe → encode → finalize for
-         the one file without ever touching the pending-decisions queue
-         that drives `apply` / `optimize`. Keeping it as a separate
-         subcommand — rather than a `--rescue-mode` flag on `apply` /
-         `optimize` — is deliberate: the workaround silently produces
-         output with concealed source corruption, and that's exactly
-         the kind of behavior you don't want to risk leaking into a
-         batch run. By construction, `rescue` can only apply to one
-         file at a time and the user has to invoke it deliberately per
-         file.
+         the one file. It does not go through `run_job`, so an
+         `optimize` or preset batch cannot pick it up. Keeping it as a
+         separate subcommand — rather than a `--rescue-mode` flag on
+         `optimize` or the presets — is deliberate: the workaround
+         silently produces output with concealed source corruption,
+         and that's exactly the kind of behavior you don't want to
+         risk leaking into a batch run. By construction, `rescue` runs
+         on one file at a time and the user has to invoke it
+         deliberately per file.
       2. **Forces lenient-decode pipeline**: `--hwaccel software`
          (libavcodec, the most permissive — interpolates over corrupt
          macroblocks and corrects timestamps) decoding into either
@@ -209,8 +214,8 @@ why.
          so the user knows where to look when reviewing the result.
 
       Caveat / non-goals:
-      - **Never expose this as a flag on `apply` / `optimize` /
-        presets.** Single-file `rescue` subcommand only. The single-file
+      - **Never expose this as a flag on `optimize` or the presets.**
+        Single-file `rescue` subcommand only. The single-file
         constraint is a load-bearing safety property, not a UX choice.
       - Don't make rescue the default for any preset.
       - Don't try to estimate "how corrupt is too corrupt" — let the
@@ -407,10 +412,10 @@ why.
       different encoder path).
 
 - [ ] **DV strip-and-encode (P7/P8 → HDR10) as the default DV path**
-      (replaces the current plan-time `dv` skip). The probe layer
-      already detects `dv_profile`; today the plan-gate drops every
-      DV source from the queue because av1_qsv wedges on them
-      (Profile 7 stalls at frame 0, Profile 8 stalls partway in).
+      The probe layer already detects `dv_profile`. `decide()` skips
+      a profile only when `encoder.dv_strategy` returns None. Profile
+      5 skips. Profiles 7 and 8 return `p8_strip` and are encoded.
+      There is no pending queue.
       Strategy decided 2026-05-06: strip the DV RPU, encode the
       HDR10-compatible base layer to AV1. Most modern UHD content
       has a clean HDR10 base layer; players that don't speak DV
@@ -567,24 +572,28 @@ why.
       Approach (sketched, not committed):
       1. New `tools/arr-import-hook.sh` reads the relevant Arr env
          vars, normalises the import path, exits 0 immediately.
-      2. Either fire-and-forget a background job
-         (`nohup video_optimizer.py scan "$file" && plan && apply
-         --auto --mode replace --recycle-to ... &`) or push a row
+      2. Either fire-and-forget a background path command
+         (`nohup ./video_optimizer.py "$file" --replace
+         --recycle-to ... >/dev/null 2>&1 &`) or push a row
          into a new `import_queue` table that a periodic worker
          drains. Worker is preferable — avoids overlapping encodes
          when the Arr app imports a season pack of 20 episodes.
-      3. New CLI surface either way: a single-file shortcut like
-         `video_optimizer.py one-shot PATH` that runs scan + plan +
-         apply for one path, respecting the existing decision /
-         status / recycle plumbing. The Arr hook calls this; cron
-         or systemd-timer drains the queue at off-hours.
+         A bare path already probes, decides, and encodes in one
+         job. Do not shell out to `scan && plan && apply`; those
+         last two commands are not registered.
+      3. No separate one-shot subcommand is required for a single
+         file: `./video_optimizer.py PATH --replace` is the job.
+         The Arr hook calls that. If the queue-table approach wins,
+         cron or a systemd timer drains it by invoking the same
+         path command per file. Recycle and the outcome log are the
+         existing path-command plumbing; `status` shows the run.
 
-      Quality gate: only re-encode when the rules engine would have
-      flagged the file in a normal `plan` pass — over_bitrate or
-      legacy_codec firing. Pass-through everything that's already
-      archive-grade (modern codec at sane bitrate). The hook should
-      *not* fire a re-encode on imports that don't meet the gate; it
-      should exit 0 silently and leave the file alone.
+      Quality gate: the path command already encodes only when
+      `decide()` says encode (over-bitrate, or a non-AV1 rule).
+      Pass-through everything that's already archive-grade (modern
+      codec at a sane bitrate). The hook should *not* force a
+      re-encode on imports that don't meet the gate; it should exit
+      0 silently and leave the file alone.
 
       Failure handling: the Arr app has already imported the file
       to its library path by the time our hook runs. If our re-encode

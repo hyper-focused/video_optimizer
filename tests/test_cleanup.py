@@ -58,19 +58,15 @@ def _seed_completed_decision(
     source_path: str,
     output_path: str | None,
 ) -> int:
-    """Insert a pending decision and flip it to completed under `run_id`.
+    """Insert a running decision and flip it to completed under `run_id`.
 
-    Mirrors the cmd_apply path: insert pending, then mark_decision flips
-    status to 'completed' and stamps the apply run id onto the row so
+    A completed row is what authorizes removal. Born with
+    insert_running_decision, then mark_decision stamps the run id so
     decisions_for_run(run_id) picks it up.
     """
     _seed_files_row(db, source_path)
-    decision_id = db.insert_pending_decision(
-        path=source_path,
-        rules_fired=["test_rule"],
-        target="hevc",
-        projected_savings_mb=100.0,
-        run_id=run_id,
+    decision_id = db.insert_running_decision(
+        source_path, '["test_rule"]', "hevc", 100.0, run_id,
     )
     db.mark_decision(
         decision_id,
@@ -389,12 +385,8 @@ class CleanupNoEligibleRunTests(unittest.TestCase):
             run_id = db.start_run("apply", str(self.root), {})
             source_path = str(self.root / "movie.mkv")
             _seed_files_row(db, source_path)
-            decision_id = db.insert_pending_decision(
-                path=source_path,
-                rules_fired=["test_rule"],
-                target="hevc",
-                projected_savings_mb=100.0,
-                run_id=run_id,
+            decision_id = db.insert_running_decision(
+                source_path, '["test_rule"]', "hevc", 100.0, run_id,
             )
             db.mark_decision(
                 decision_id, status="failed",

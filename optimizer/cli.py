@@ -14,12 +14,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import crawler, encoder, naming, probe, report, rules
 from .db import DEFAULT_DB_PATH, Database
-from .models import ProbeResult, probe_from_dict
+from .decide import Decision, _is_reencoded_filename, decide
+from .models import Candidate, ProbeResult, probe_from_dict
 from .presets import (
     BITRATE_FLAG_TABLE,
     BLOAT_CHECKPOINTS,
@@ -132,194 +134,9 @@ def _add_reprobe_parser(sub: "argparse._SubParsersAction") -> None:
     _add_common_db_arg(r)
 
 
-def _add_plan_parser(sub: "argparse._SubParsersAction") -> None:
-    """Register the `plan` subcommand."""
-    pl = sub.add_parser("plan")
-    pl.add_argument("--rules", default=None,
-                    help=f"Comma-separated rule names (default: all). "
-                         f"Available: {','.join(rules.RULES.keys())}")
-    pl.add_argument("--target", choices=list(encoder.TARGETS.keys()),
-                    default="av1+mkv")
-    pl.add_argument("--keep-langs", default="en,und",
-                    help="Comma-separated languages to retain on apply "
-                         "(advisory only here).")
-    pl.add_argument("--json", action="store_true",
-                    help="Emit JSON candidate list instead of text report.")
-    pl.add_argument("--allow-reencoded", action="store_true",
-                    help="Re-queue files whose names carry the REENCODE marker "
-                         "(prior outputs of this tool). Default behavior is to "
-                         "skip them permanently. Use this when intentionally "
-                         "re-running an already-encoded file (e.g. trying a "
-                         "different CQ).")
-    pl.add_argument("--allow-av1", action="store_true",
-                    help="Re-queue AV1 sources. Default behavior is to skip "
-                         "AV1 entirely (it's already at the target codec; "
-                         "re-encoding is wasteful and quality-lossy).")
-    pl.add_argument("--allow-extras", action="store_true",
-                    help="Re-queue files matching Plex extras suffixes "
-                         "(`-trailer`, `-bts`, `-deleted`, …). Default "
-                         "skips them; the crawler also filters extras "
-                         "directories at walk time.")
-    pl.add_argument("--allow-low-bitrate", action="store_true",
-                    help="Override the auto-skip for sources whose video "
-                         "bitrate is below the AV1 target for their "
-                         "resolution (1080p < 5 Mbps, 2160p < 16 Mbps, etc.; "
-                         "see BITRATE_FLAG_TABLE in presets.py for the full "
-                         "table). Default skips these — at sub-target source "
-                         "bitrate, AV1 can't yield meaningful savings and may "
-                         "regress perceptual quality.")
-    pl.add_argument("--skip-codecs", default="",
-                    metavar="CODECS",
-                    help="Comma-separated list of source codecs to exclude "
-                         "from the plan (case-insensitive; ffprobe codec "
-                         "names — e.g. `hevc,h264,mpeg2video,vp9`). Sources "
-                         "matching any listed codec are skipped before rule "
-                         "evaluation. Use to opt out of re-encoding codecs "
-                         "you trust (e.g. `--skip-codecs hevc` to leave "
-                         "HEVC libraries alone). Default: empty (no skips).")
-    _add_common_db_arg(pl)
-
-
-def _add_apply_parser(sub: "argparse._SubParsersAction") -> None:
-    """Register the `apply` subcommand and all its encode/output flags."""
-    ap = sub.add_parser("apply")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Print planned ffmpeg commands and exit without "
-                         "encoding. Use this to preview what would happen "
-                         "before committing to a run.")
-    _add_apply_workflow_args(ap)
-    _add_apply_encoding_args(ap)
-    _add_apply_naming_args(ap)
-    ap.add_argument("--verbose", "-v", action="store_true")
-    # Suppress the post-run report. Hidden in --help; this is for users with
-    # piped output / cron contexts who genuinely don't want the summary or
-    # the persisted ~/.video_optimizer/reports/run-N.txt file.
-    ap.add_argument("--no-report", action="store_true",
-                    help=argparse.SUPPRESS)
-    _add_common_db_arg(ap)
-
-
-def _add_apply_workflow_args(ap: argparse.ArgumentParser) -> None:
-    """Attach apply-mode flags governing confirmation, output layout, limits."""
-    ap.add_argument("--auto", action="store_true",
-                    help="Skip per-file confirmation.")
-    ap.add_argument("--mode", choices=["keep", "side", "replace"],
-                    default="side")
-    ap.add_argument("--output-root", type=Path,
-                    help="Required for --mode side. Mirrored output tree.")
-    ap.add_argument("--source-root", type=Path,
-                    help="Strip this prefix from source paths when placing outputs "
-                         "in --output-root (default: filesystem root).")
-    ap.add_argument("--backup", type=Path,
-                    help="For --mode replace: copy original here before replacing. "
-                         "Doubles disk use during the run; prefer --recycle-to "
-                         "for NAS targets that have a recycle-bin directory.")
-    ap.add_argument("--recycle-to", type=Path,
-                    help="For --mode replace: atomically move (rather than copy or "
-                         "delete) originals into this directory. Preserves source "
-                         "hierarchy under it. Atomic and instant when source and "
-                         "target are on the same filesystem (typical NAS share "
-                         "with @Recycle / #recycle). Mutually exclusive with "
-                         "--backup.")
-    ap.add_argument("--allow-hard-delete", action="store_true",
-                    help="Required to combine --mode replace with --auto when "
-                         "neither --backup nor --recycle-to is set. Acknowledges "
-                         "that originals will be permanently deleted after each "
-                         "successful encode (encode-then-unlink, no copy).")
-    ap.add_argument("--limit", type=int, default=0,
-                    help="Process at most N candidates (0 = no limit).")
-    ap.add_argument("--min-height", type=int, default=None,
-                    help="Skip candidates whose video height < N. "
-                         "Leaves them pending in the db for a later run.")
-    ap.add_argument("--max-height", type=int, default=None,
-                    help="Skip candidates whose video height > N. "
-                         "Leaves them pending in the db for a later run.")
-
-
-def _add_apply_encoding_args(ap: argparse.ArgumentParser) -> None:
-    """Attach encoder/quality/timeout/HDR flags for the apply subcommand."""
-    ap.add_argument("--quality", type=int)
-    ap.add_argument("--hwaccel",
-                    choices=["auto", "qsv", "nvenc", "vaapi", "videotoolbox",
-                             "software", "none"],
-                    default="auto")
-    ap.add_argument("--keep-langs", default="en,und")
-    ap.add_argument("--timeout", type=int, default=None,
-                    help="Per-file ffmpeg wall-clock cap in seconds. "
-                         "0 disables. Default adapts to source duration "
-                         "(max(3600, 6 * duration_seconds)).")
-    ap.add_argument("--hw-decode", action="store_true",
-                    help="Enable zero-copy QSV decode->encode pipeline. "
-                         "Off by default; safe to enable when the source "
-                         "codecs are modern (H.264/HEVC/AV1).")
-    # Default DV strategy for P7/P8 is the simple bsf strip. The
-    # dovi_tool P7→P8 conversion is opt-in (requires extra tools, writes
-    # a ~50 GB temp). See NOTES.md#profile-dispatch.
-    ap.add_argument("--dv-p7-convert", action="store_true",
-                    help="For Profile 7 sources: run the dovi_tool "
-                         "convert + mkvmerge pipeline before encoding "
-                         "instead of the default RPU-strip-only path. "
-                         "Requires dovi_tool and mkvmerge on PATH.")
-    # Bloat fallback covers two checkpoints: mid-encode (kill + retry
-    # when the projected final size crosses BLOAT_RATIO_THRESHOLD) and
-    # post-encode (same retry from the finished output's size).
-    ap.add_argument("--no-auto-relax-cq", action="store_false",
-                    dest="auto_relax_cq", default=True,
-                    help="Disable the HD/UHD bloat fallback. Default: an "
-                         "HD or UHD encode whose mid-encode projection or "
-                         "final output is nearly as big as the source is "
-                         "retried once at the tier's relaxed CQ (UHD 21, "
-                         "HD 26).")
-    # Compat audio: when a kept track is hi-res lossless (TrueHD, DTS-HD MA,
-    # FLAC, multichannel PCM), also emit AAC 5.1 @ 640k and AAC 2.0 @ 320k
-    # so devices that can't decode lossless still play sound. On by default.
-    ca = ap.add_mutually_exclusive_group()
-    ca.add_argument("--compat-audio", action="store_true", default=True,
-                    help="(default) Add AAC 5.1 + AAC 2.0 compat tracks "
-                         "alongside any hi-res lossless source.")
-    ca.add_argument("--no-compat-audio", action="store_false",
-                    dest="compat_audio",
-                    help="Disable the AAC compat-track shadowing.")
-    ap.add_argument("--original-audio", action="store_true",
-                    help="Bypass the 3-stream audio ladder; map every "
-                         "input audio track via stream-copy. Ignores "
-                         "--keep-langs and --compat-audio (subtitles "
-                         "still respect --keep-langs). Use when you "
-                         "want every track preserved bit-perfectly.")
-    ap.add_argument("--original-subs", action="store_true",
-                    help="Bypass the --keep-langs filter for subtitles; "
-                         "map every input subtitle track via stream-copy. "
-                         "MKV target preserves all formats; MP4 still "
-                         "drops image subs (PGS/VOBSUB) and converts "
-                         "text to mov_text (the container's own limit, "
-                         "not the flag's).")
-
-
-def _add_apply_naming_args(ap: argparse.ArgumentParser) -> None:
-    """Attach the filename-rewrite flags (Radarr/Sonarr-friendly options)."""
-    ap.add_argument("--name-suffix", default="",
-                    help="Free-form string appended to the output stem before "
-                         "the extension. Applied last; composes with "
-                         "--rewrite-codec / --reencode-tag.")
-    ap.add_argument("--rewrite-codec", action="store_true",
-                    help="Strip foreign codec tokens (e.g. H.264, HEVC, x265) "
-                         "from the output filename and insert the canonical "
-                         "target token. Defaults to dotted (Plex-style) names.")
-    ap.add_argument("--no-dotted", action="store_true",
-                    help="With --rewrite-codec: keep the input's whitespace "
-                         "style instead of forcing dots.")
-    ap.add_argument("--reencode-tag", action="store_true",
-                    help="Append a REENCODE token to the output filename so "
-                         "Radarr/Sonarr Custom Formats can match it (e.g. to "
-                         "auto-unmonitor re-encoded titles).")
-    ap.add_argument("--reencode-tag-value", default="REENCODE",
-                    help="Override the token used by --reencode-tag (default: "
-                         "REENCODE).")
-
-
 def _add_status_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `status` subcommand."""
-    st = sub.add_parser("status", help="Show recent runs and pending decisions.")
+    st = sub.add_parser("status", help="Show recent runs.")
     st.add_argument("--last", type=int, default=10,
                     help="Show this many most-recent runs (default: 10).")
     _add_common_db_arg(st)
@@ -391,8 +208,10 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
     p.add_argument("--confirm", action="store_true",
                    help="Prompt per-file before encoding (default is auto-yes).")
     p.add_argument("--cleanup-after", action="store_true",
-                   help="After a successful run, prompt to remove the "
-                        "originals of completed encodes.")
+                   help="After the path command, unlink originals of "
+                        "completed encodes. No question unless --confirm "
+                        "is also set. --confirm asks Continue? [y/N] and "
+                        "leaves the files unless the answer starts with y.")
     p.add_argument("--original-audio", action="store_true",
                    help="Keep every input audio track via stream-copy "
                         "(default strips to --keep-langs and rebuilds a "
@@ -401,6 +220,17 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
                    help="Keep every input subtitle track via stream-copy "
                         "(default strips to --keep-langs).")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--dv-p7-convert", action="store_true",
+                   help="For Profile 7 sources: run the dovi_tool "
+                        "convert + mkvmerge pipeline before encoding "
+                        "instead of the default RPU-strip-only path. "
+                        "Requires dovi_tool and mkvmerge on PATH.")
+    p.add_argument("--no-auto-relax-cq", action="store_false",
+                   dest="auto_relax_cq", default=True,
+                   help="Disable the HD/UHD bloat fallback. Default: an "
+                        "HD or UHD encode whose mid-encode projection or "
+                        "final output is nearly as big as the source is "
+                        "retried once at the tier's relaxed CQ.")
 
     # Hidden / advanced flags below — still functional, just not in --help.
     p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
@@ -425,6 +255,10 @@ def _add_pipeline_args(p: argparse.ArgumentParser, *, path_help: str) -> None:
                    help=argparse.SUPPRESS)
     p.add_argument("--allow-low-bitrate", action="store_true",
                    help=argparse.SUPPRESS)
+    p.add_argument("--allow-reencoded", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--timeout", type=int, default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--skip-codecs", default="",
                    help=argparse.SUPPRESS)
     p.add_argument("--bare-invocation", action="store_true", default=False,
@@ -435,16 +269,16 @@ def _add_optimize_parser(sub: "argparse._SubParsersAction") -> None:
     """Register the `optimize` one-shot pipeline subcommand (all tiers)."""
     op = sub.add_parser(
         "optimize",
-        help="One-shot scan+plan+apply for a library, all three tiers "
-             "(UHD + HD + SD). The friendliest entry point for new users.",
+        help="Probe, decide, and encode a library, UHD then HD then SD. "
+             "The friendliest entry point for new users.",
         description=(
-            "Run scan, plan, and apply against PATH in a single command, "
-            "chaining the UHD, HD, and SD presets so every supported "
-            "resolution band is covered. The default output mode is "
-            "'keep': new files land alongside the source and originals "
-            "stay untouched (see the `cleanup` subcommand for removing "
-            "them). Pass --output DIR for a mirrored tree, or --replace "
-            "to recycle originals as the run proceeds."
+            "Probe PATH, decide what to encode, and encode it in one job: "
+            "UHD, then HD, then SD. Does not write a pending queue. The "
+            "default output mode is 'keep': new files land alongside the "
+            "source and originals stay untouched (see the `cleanup` "
+            "subcommand for removing them). Pass --output DIR for a "
+            "mirrored tree, or --replace to recycle originals as the run "
+            "proceeds."
         ),
     )
     _add_pipeline_args(op, path_help="Library directory to optimize.")
@@ -455,14 +289,13 @@ def _add_preset_parsers(sub: "argparse._SubParsersAction") -> None:
     for name, cfg in PRESETS.items():
         p = sub.add_parser(
             name,
-            help=f"Tier-only pipeline (scan+plan+apply) with the "
-                 f"{cfg['label']} preset.",
+            help=f"Probe, decide, and encode with the {cfg['label']} preset.",
             description=(
-                f"Run scan, plan, and apply against PATH using only the "
-                f"{name} preset (resolution-band filtered to "
-                f"{cfg.get('label')}). Same flags as `optimize`; the "
-                f"difference is that `optimize` chains all three tiers "
-                f"and this subcommand processes only the {name} band."
+                f"Probe PATH, decide, and encode using only the {name} "
+                f"preset ({cfg.get('label')}). Same flags as `optimize`; "
+                f"`optimize` chains UHD, HD, and SD, and this subcommand "
+                f"processes only the {name} band. UHD-FILM is used only "
+                f"when this preset is named, and only for UHD-tier files."
             ),
         )
         _add_pipeline_args(
@@ -498,7 +331,7 @@ def _add_wizard_parser(sub: "argparse._SubParsersAction") -> None:
     wz = sub.add_parser(
         "wizard",
         help="Interactive guided run: prompts for path, output mode, and "
-             "tier scope, then runs the full pipeline. Triggered "
+             "tier scope, previews candidates, then encodes. Triggered "
              "automatically when invoked with no args in a TTY.",
     )
     _add_common_db_arg(wz)
@@ -543,8 +376,6 @@ def _build_parser() -> argparse.ArgumentParser:
                            metavar="<subcommand>")
     _add_scan_parser(sub)
     _add_reprobe_parser(sub)
-    _add_plan_parser(sub)
-    _add_apply_parser(sub)
     _add_status_parser(sub)
     _add_list_encoders_parser(sub)
     _add_replace_list_parser(sub)
@@ -689,27 +520,9 @@ def cmd_reprobe(args: argparse.Namespace) -> int:
     return cmd_scan(args, force=True)
 
 
-_REENCODED_MARKER_RE = re.compile(r"\bREENCODE\b", re.IGNORECASE)
-
-
-def _is_reencoded_filename(path: str) -> bool:
-    """True if `path` looks like one of our prior re-encode outputs.
-
-    Matches the `REENCODE` token inserted by `--reencode-tag` (case
-    insensitive, word-boundary). Used to keep the plan gate from queueing
-    a file we've already processed — without this, a replace run that
-    chose a non-deletable disposal mode (recycle / backup) would surface
-    its own outputs back into a future plan and re-encode them, doubling
-    the marker (`...AV1.REENCODE.REENCODE.mkv`) and burning hours.
-    """
-    return _REENCODED_MARKER_RE.search(Path(path).stem) is not None
-
-
 def _path_under(candidate: str, root: Path) -> bool:
     """Return True if `candidate` lies under `root` (or equals it).
 
-    Used by the plan-time path-scope filter to keep cmd_plan from
-    surfacing candidates that aren't under the user's requested path.
     Both sides are resolved before comparison so symlinks don't
     cause false negatives.
     """
@@ -758,24 +571,44 @@ def _existing_reencode_sibling(src_path: str) -> Path | None:
     return None
 
 
-def _source_below_target_bitrate(pr) -> bool:
-    """True when the source's video bitrate is below the AV1 target for its
-    resolution bucket — re-encoding can't meaningfully save space and risks
-    quality regression on an already-low-bitrate source.
+def _classify_probe(db: Database, pr: ProbeResult,
+                    *, allow_reencoded: bool = False,
+                    allow_av1: bool = False,
+                    allow_extras: bool = False,
+                    allow_low_bitrate: bool = False,
+                    skip_codecs: frozenset[str] | None = None,
+                    ) -> tuple[str, Decision | None]:
+    """Filesystem gate plus ``decide``.
 
-    Threshold comes from BITRATE_FLAG_TABLE's ``target_mbps`` (the bitrate
-    AV1 aims for at this resolution). Sources at or above target are always
-    admitted; sources below it are skipped unless --allow-low-bitrate
-    overrides at the plan layer.
+    Missing files are dropped from the cache here; ``decide`` does not
+    touch the db or the disk. Returns ``("ok", decision)`` for clean or
+    encode, or ``(reason, None)`` for a skip bucket including ``"missing"``.
     """
-    if pr.video_bitrate <= 0:
-        return False
-    bucket = pr.resolution_class
-    entry = BITRATE_FLAG_TABLE.get(bucket)
-    if entry is None:
-        return False
-    target_mbps, _flag_mbps = entry
-    return (pr.video_bitrate / 1_000_000.0) < target_mbps
+    if not Path(pr.path).exists():
+        # Decisions FK back to files with default RESTRICT; delete
+        # dependent decisions first or the files DELETE fails.
+        db.conn.execute("DELETE FROM decisions WHERE path = ?", (pr.path,))
+        db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
+        return "missing", None
+    stall_count = db.conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE path = ? "
+        "AND status = 'failed' AND error LIKE '%encoder stalled%'",
+        (pr.path,),
+    ).fetchone()[0]
+    has_existing_output = _existing_reencode_sibling(pr.path) is not None
+    decision = decide(
+        pr,
+        stall_count=stall_count,
+        has_existing_output=has_existing_output,
+        allow_reencoded=allow_reencoded,
+        allow_av1=allow_av1,
+        allow_extras=allow_extras,
+        allow_low_bitrate=allow_low_bitrate,
+        skip_codecs=skip_codecs,
+    )
+    if decision.kind == "skip" and decision.reason is not None:
+        return decision.reason, None
+    return "ok", decision
 
 
 def _plan_probe_gate(db: Database, pr,
@@ -784,17 +617,17 @@ def _plan_probe_gate(db: Database, pr,
                      allow_extras: bool = False,
                      allow_low_bitrate: bool = False,
                      skip_codecs: frozenset[str] | None = None) -> str:
-    """Pre-rule filter for one probe.
+    """Pre-rule filter for one probe. Skip order lives in ``decide``.
 
     Returns one of:
       "missing"    — source no longer on disk; cache rows dropped here.
       "stalled"    — two-strikes auto-skip (av1_qsv watchdog twice).
-      "dv"         — Dolby Vision source; av1_qsv wedges on DV (Profile 7
-                     stalls at frame 0; Profile 8 partway in). Awaiting a
-                     DV-aware encode path (RPU strip / BL extraction).
+      "dv"         — Dolby Vision profile ``dv_strategy`` cannot handle
+                     (Profile 5; no HDR10 base). Profiles 7 and 8 are
+                     not skipped: ``dv_strategy`` returns ``"p8_strip"``.
       "reencoded"  — filename carries the REENCODE marker (output of a
                      prior run); skipped permanently unless caller passes
-                     allow_reencoded=True (`plan --allow-reencoded`).
+                     allow_reencoded=True.
       "existing_output" — a sibling `.AV1.REENCODE.mkv` already exists
                      next to the source (keep-mode prior-run output).
                      Skipped to avoid overwriting it with a fresh encode;
@@ -802,7 +635,7 @@ def _plan_probe_gate(db: Database, pr,
                      "I want to re-run already-processed files" gate).
       "av1_source" — source codec is AV1; re-encoding is wasteful by
                      default. Caller can pass allow_av1=True to override
-                     (`plan --allow-av1`).
+                     (`--allow-av1`).
       "skipped_codec" — source codec is in the user-supplied skip set
                      (e.g. ``--no-hevc``). Default is no skip set.
       "low_bitrate" — source bitrate is below the AV1 target for its
@@ -813,41 +646,16 @@ def _plan_probe_gate(db: Database, pr,
                      normally filters these at walk time, but a probe
                      cache populated before extras filtering existed
                      could surface them here. allow_extras=True overrides.
-      "ok"         — admit to rule evaluation. SD content (height < 720)
-                     is admitted; the per-tier presets pick which band
-                     they want.
+      "ok"         — ``decide`` returned clean or encode. SD content
+                     (height < 720) is admitted; the per-tier presets
+                     pick which band they want.
     """
-    if not Path(pr.path).exists():
-        # Decisions FK back to files with default RESTRICT; delete
-        # dependent decisions first or the files DELETE fails.
-        db.conn.execute("DELETE FROM decisions WHERE path = ?", (pr.path,))
-        db.conn.execute("DELETE FROM files WHERE path = ?", (pr.path,))
-        return "missing"
-    stall_count = db.conn.execute(
-        "SELECT COUNT(*) FROM decisions WHERE path = ? "
-        "AND status = 'failed' AND error LIKE '%encoder stalled%'",
-        (pr.path,),
-    ).fetchone()[0]
-    if stall_count >= 2:
-        return "stalled"
-    if pr.dv_profile is not None and encoder.dv_strategy(pr.dv_profile) is None:
-        # P5 falls here (no HDR10 base). P7/P8.x clear because
-        # dv_strategy() returns "p8_strip" with default kwargs.
-        return "dv"
-    if not allow_reencoded and _is_reencoded_filename(pr.path):
-        return "reencoded"
-    if not allow_reencoded and _existing_reencode_sibling(pr.path) is not None:
-        return "existing_output"
-    codec = (pr.video_codec or "").lower()
-    if not allow_av1 and codec == "av1":
-        return "av1_source"
-    if skip_codecs and codec in skip_codecs:
-        return "skipped_codec"
-    if not allow_low_bitrate and _source_below_target_bitrate(pr):
-        return "low_bitrate"
-    if not allow_extras and crawler.is_extras_filename(Path(pr.path)):
-        return "extras"
-    return "ok"
+    bucket, _decision = _classify_probe(
+        db, pr, allow_reencoded=allow_reencoded,
+        allow_av1=allow_av1, allow_extras=allow_extras,
+        allow_low_bitrate=allow_low_bitrate,
+        skip_codecs=skip_codecs)
+    return bucket
 
 
 _PLAN_SKIP_MESSAGES = (
@@ -888,253 +696,15 @@ def _emit_plan_skip_summary(counts: dict) -> None:
             print(template.format(n=n))
 
 
-def _resolve_enabled_rules(args: argparse.Namespace) -> list[str] | None:
-    """Compose the rule-name list for cmd_plan based on flags.
+def _encode_one(db: Database, dec: dict, pr: ProbeResult,
+                args: argparse.Namespace, keep_langs: list[str],
+                idx: int, total: int) -> tuple[str, int]:
+    """Encode one already-loaded decision. No height deferral.
 
-    None → RulesEngine uses its default-enabled set (every non-opt-in
-    rule). Otherwise returns the user's `--rules` override.
+    ``run_job`` calls this directly: the tier filter already ran, and a
+    dry-run ``dec`` may have no id (no decision row is written).
     """
-    if args.rules:
-        return [s.strip() for s in args.rules.split(",")]
-    return None
-
-
-def cmd_plan(args: argparse.Namespace) -> int:
-    """Run the rules engine over the probe cache; record pending decisions."""
-    enabled = _resolve_enabled_rules(args)
-    try:
-        engine = rules.RulesEngine(enabled=enabled, target=args.target)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-
-    allow_reencoded = bool(getattr(args, "allow_reencoded", False))
-    allow_av1 = bool(getattr(args, "allow_av1", False))
-    allow_extras = bool(getattr(args, "allow_extras", False))
-    allow_low_bitrate = bool(getattr(args, "allow_low_bitrate", False))
-    skip_codecs_raw = getattr(args, "skip_codecs", "") or ""
-    skip_codecs = frozenset(
-        s.strip().lower() for s in skip_codecs_raw.split(",") if s.strip()
-    )
-    # Path-pipeline subcommands scope candidate creation to the supplied
-    # path; bare `plan` has no path and operates on the whole cache.
-    scope_path = getattr(args, "path", None)
-    if scope_path is not None:
-        try:
-            scope_resolved = Path(scope_path).resolve(strict=False)
-        except OSError:
-            scope_resolved = Path(scope_path)
-    else:
-        scope_resolved = None
-    with Database(args.db) as db:
-        run_id = db.start_run("plan", None, _args_dict(args))
-        cleared = db.clear_pending_decisions()
-        candidates = []
-        counts = {"missing": 0, "stalled": 0, "dv": 0, "reencoded": 0,
-                  "av1_source": 0, "extras": 0, "existing_output": 0,
-                  "out_of_scope": 0, "low_bitrate": 0, "skipped_codec": 0}
-        # Materialise the probe list so we can mutate the cache (DELETE
-        # stale rows) without invalidating the iterator.
-        for pr in list(db.iter_probes()):
-            if scope_resolved is not None and not _path_under(pr.path,
-                                                              scope_resolved):
-                counts["out_of_scope"] += 1
-                continue
-            verdict = _plan_probe_gate(
-                db, pr, allow_reencoded=allow_reencoded,
-                allow_av1=allow_av1, allow_extras=allow_extras,
-                allow_low_bitrate=allow_low_bitrate,
-                skip_codecs=skip_codecs)
-            if verdict != "ok":
-                counts[verdict] += 1
-                continue
-            cand = engine.evaluate(pr)
-            if cand is None:
-                continue
-            db.insert_pending_decision(
-                path=pr.path,
-                rules_fired=[v.rule for v in cand.fired if not _is_advisory(v.rule)],
-                target=cand.target,
-                projected_savings_mb=cand.total_projected_savings_mb,
-                run_id=run_id,
-            )
-            candidates.append(cand)
-        if counts["missing"]:
-            db.conn.commit()
-        _emit_plan_skip_summary(counts)
-
-        candidates.sort(key=lambda c: c.total_projected_savings_mb, reverse=True)
-
-        if args.json:
-            print(report.format_candidates_json(candidates))
-        else:
-            print(report.format_candidates_text(candidates))
-
-        summary = {"cleared_pending": cleared,
-                   "candidates": len(candidates),
-                   "pruned_stale_rows": counts["missing"],
-                   "stall_blocked": counts["stalled"],
-                   "dv_blocked": counts["dv"],
-                   "reencoded_blocked": counts["reencoded"],
-                   "av1_blocked": counts["av1_source"],
-                   "extras_blocked": counts["extras"],
-                   "existing_output_blocked": counts["existing_output"],
-                   "out_of_scope_blocked": counts["out_of_scope"]}
-        db.end_run(run_id, summary)
-    return 0
-
-
-def _prefilter_resolution_gate(db: Database, pending: list[dict],
-                               args: argparse.Namespace) -> list[dict]:
-    """Drop pending rows outside the preset's height band before --limit slices.
-
-    Without this, `--limit N` can be consumed entirely by DEFER outcomes
-    (a queue whose top-N-by-savings are all UHD candidates burns the
-    limit on 10 defers and does zero encodes). With it, `--limit N`
-    means "N actual encodes within this preset's resolution band."
-
-    The in-loop gate in _apply_one is kept as defense in depth — any
-    caller that bypasses cmd_apply still gets correct DEFER behavior.
-    """
-    min_h = getattr(args, "min_height", None)
-    max_h = getattr(args, "max_height", None)
-    if min_h is None and max_h is None:
-        return pending
-    eligible = []
-    deferred = 0
-    for dec in pending:
-        pr = _load_probe_for_decision(db, dec)
-        if pr is None:
-            # Let _apply_one surface "probe missing" — don't filter here.
-            eligible.append(dec)
-            continue
-        if min_h is not None and pr.height < min_h:
-            deferred += 1
-            continue
-        if max_h is not None and pr.height > max_h:
-            deferred += 1
-            continue
-        eligible.append(dec)
-    if deferred:
-        print(f"deferred {deferred} candidates outside the resolution band "
-              f"(min={min_h}, max={max_h}); they remain pending for another preset.")
-    return eligible
-
-
-def _validate_apply_args(args: argparse.Namespace) -> int:
-    """Pre-flight checks for cmd_apply. Returns 0 on ok, nonzero exit code."""
-    if args.mode == "side" and not args.output_root:
-        print("error: --mode side requires --output-root", file=sys.stderr)
-        return 2
-    if args.mode == "keep" and getattr(args, "output_root", None):
-        print("error: --mode keep is incompatible with --output-root "
-              "(keep writes alongside the source)", file=sys.stderr)
-        return 2
-    if args.backup and getattr(args, "recycle_to", None):
-        print("error: --backup and --recycle-to are mutually exclusive "
-              "(both preserve the original; pick one)", file=sys.stderr)
-        return 2
-    if getattr(args, "recycle_to", None) and args.mode != "replace":
-        print("error: --recycle-to only applies to --mode replace "
-              "(side mode never deletes originals)", file=sys.stderr)
-        return 2
-    if not _confirm_hard_delete_if_needed(args):
-        return 2
-    return 0
-
-
-def cmd_apply(args: argparse.Namespace) -> int:
-    """Encode pending decisions; per-file confirm unless --auto / --dry-run."""
-    rc = _validate_apply_args(args)
-    if rc != 0:
-        return rc
-
-    keep_langs = [s.strip() for s in args.keep_langs.split(",") if s.strip()]
-
-    with Database(args.db) as db:
-        run_id = db.start_run("apply", None, _args_dict(args))
-        # Stashed on the namespace so downstream helpers (_apply_one,
-        # _execute_encode, _finalize_output) can stamp every mark_decision
-        # with the apply run id without growing every signature. The
-        # post-run report (`_emit_run_report`) keys on this run id.
-        args._apply_run_id = run_id  # noqa: SLF001
-        pending = db.list_pending_decisions()
-        pending = _prefilter_resolution_gate(db, pending, args)
-
-        if args.limit > 0:
-            pending = pending[: args.limit]
-
-        if not pending:
-            print("nothing to apply: no pending decisions. run 'plan' first.")
-            db.end_run(run_id, {"applied": 0})
-            return 0
-
-        counts = {"applied": 0, "skipped": 0, "failed": 0,
-                  "deferred": 0, "dry_run": 0}
-        bytes_saved = 0
-        for i, dec in enumerate(pending, 1):
-            status, saved = _apply_one(db, dec, args, keep_langs, i, len(pending))
-            # Count every terminal/observable status so the report knows
-            # whether ≥1 decision was processed (dry_run included).
-            if status in counts:
-                counts[status] += 1
-            bytes_saved += saved
-
-        summary = {k: v for k, v in counts.items() if k != "dry_run"}
-        summary["approx_bytes_saved"] = bytes_saved
-        db.end_run(run_id, summary)
-        deferred_note = (f", {counts['deferred']} deferred (resolution gate)"
-                         if counts["deferred"] else "")
-        print(f"\napply done: {counts['applied']} encoded, "
-              f"{counts['skipped']} skipped, {counts['failed']} failed"
-              f"{deferred_note}; "
-              f"~{_format_bytes(bytes_saved)} saved")
-
-        touched = (counts["applied"] + counts["skipped"] + counts["failed"]
-                   + counts["dry_run"])
-        if touched and not getattr(args, "no_report", False):
-            _emit_run_report(db, run_id)
-    return 0
-
-
-def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
-               keep_langs: list[str], idx: int, total: int) -> tuple[str, int]:
-    """Process a single pending decision. Returns (status, bytes_saved)."""
     run_id = getattr(args, "_apply_run_id", None)
-    pr = _load_probe_for_decision(db, dec)
-    if pr is None:
-        print(f"[{idx}/{total}] {dec['path']}: probe missing, skipping")
-        db.mark_decision(dec["id"], "skipped",
-                         error="probe missing in cache (rerun scan)",
-                         run_id=run_id, expected_path=dec["path"])
-        return "skipped", 0
-
-    # Defense in depth: catch sources that disappeared between plan and
-    # apply (e.g. file moved to recycle by an earlier apply, or unmounted
-    # NFS share). cmd_plan already prunes these, but a long-running apply
-    # could lose a source mid-run.
-    if not Path(pr.path).exists():
-        print(f"[{idx}/{total}] {pr.path}: source no longer exists, skipping")
-        db.mark_decision(dec["id"], "skipped",
-                         error="source no longer exists at apply time",
-                         run_id=run_id, expected_path=pr.path)
-        return "skipped", 0
-
-    _print_decision_header(dec, pr, idx, total)
-
-    # Resolution gate: defer (leave pending) if outside the requested band.
-    # Used by HD/SD to skip UHD candidates and UHD to skip HD/SD, etc.
-    min_h = getattr(args, "min_height", None)
-    max_h = getattr(args, "max_height", None)
-    if min_h is not None and pr.height < min_h:
-        print(f"    DEFER: height {pr.height} < min {min_h} "
-              f"(left pending for another run)")
-        return "deferred", 0
-    if max_h is not None and pr.height > max_h:
-        print(f"    DEFER: height {pr.height} > max {max_h} "
-              f"(left pending for another run)")
-        return "deferred", 0
-
     if pr.is_hdr:
         # av1_qsv main profile + 10-bit + color metadata passthrough.
         # Mastering-display / MaxCLL not forwarded — see
@@ -1143,8 +713,9 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
 
     if not args.auto and not args.dry_run:
         if not _confirm("    encode this file? [y/N/q]: "):
-            db.mark_decision(dec["id"], "skipped", error="user declined",
-                             run_id=run_id, expected_path=pr.path)
+            if dec.get("id") is not None:
+                db.mark_decision(dec["id"], "skipped", error="user declined",
+                                 run_id=run_id, expected_path=pr.path)
             return "skipped", 0
 
     target = dec["target"]
@@ -1155,8 +726,9 @@ def _apply_one(db: Database, dec: dict, args: argparse.Namespace,
         enc_name = encoder.select_encoder(target, args.hwaccel)
     except RuntimeError as e:
         print(f"    FAIL: {e}")
-        db.mark_decision(dec["id"], "failed", error=str(e),
-                         run_id=run_id, expected_path=pr.path)
+        if dec.get("id") is not None:
+            db.mark_decision(dec["id"], "failed", error=str(e),
+                             run_id=run_id, expected_path=pr.path)
         return "failed", 0
 
     return _apply_one_after_validation(
@@ -1172,9 +744,8 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
                                 idx: int, total: int) -> tuple[str, int]:
     """Run DV prep (if needed), build the encode argv, dispatch, cleanup.
 
-    Split from `_apply_one` for readability. DV-prep work_dir lives next
-    to the source (same filesystem for the temp stream-copy); try/finally
-    guarantees teardown on encode failure.
+    DV-prep work_dir lives next to the source (same filesystem for the
+    temp stream-copy); try/finally guarantees teardown on encode failure.
     """
     # Dry-run runs *before* _prepare_dv_source so we don't spend hours
     # writing a 50 GB temp file just to print the argv.
@@ -1185,8 +756,6 @@ def _apply_one_after_validation(db: Database, dec: dict, pr: ProbeResult,
         )
         print(f"    DRY RUN ({desc}) → {output_path}")
         print("    " + " ".join(cmd))
-        db.stamp_decision_run(dec["id"], run_id,
-                              expected_path=pr.path)
         return "dry_run", 0
 
     dv_prep_dir: Path | None = None
@@ -1735,7 +1304,7 @@ def cmd_list_encoders(args: argparse.Namespace) -> int:  # noqa: ARG001
     print("does not guarantee they will run — they additionally need "
           "matching kernel")
     print("modules / drivers / GPU. Failures surface as non-zero exit "
-          "codes from apply.")
+          "codes from an encode.")
 
     print("\nEncoder picked with --hwaccel auto")
     print("==================================")
@@ -1861,11 +1430,8 @@ def _doctor_check_db(db_path: Path, issues: list[str]) -> None:
         with Database(db_path) as db:
             files_n = db.conn.execute(
                 "SELECT COUNT(*) FROM files").fetchone()[0]
-            pending_n = db.conn.execute(
-                "SELECT COUNT(*) FROM decisions WHERE status='pending'"
-            ).fetchone()[0]
         print(f"  {db_path}: ok")
-        print(f"    {files_n} files cached, {pending_n} pending decisions")
+        print(f"    {files_n} files cached")
     except sqlite3.Error as e:
         print(f"  {db_path}: ERROR ({e})")
         issues.append("database unreachable")
@@ -1996,19 +1562,70 @@ def _optimize_resolve_paths(
     return (mode, None, args.path, None)
 
 
-def _build_apply_namespace(args: argparse.Namespace, preset_name: str,
-                           mode: str, output_root: Path | None,
-                           source_root: Path,
-                           recycle_to: Path | None) -> argparse.Namespace:
-    """Construct the full apply Namespace for one preset run.
+@dataclass
+class RunConfig:
+    """Encode settings for one preset, built once at the job boundary.
 
-    Path-taking pipeline subcommands carry only the optimize-style flag
-    surface; the preset apply step needs additional fields (backup,
-    name_suffix, etc.) to reach cmd_apply. Hardcode the ones that aren't
-    user-facing on the optimize/SD/HD/UHD parsers.
+    Attribute names match the apply Namespace the encode helpers already
+    read, so Dolby Vision, bloat-retry, and ``_finalize_output`` stay
+    put. ``run_job`` does not build an apply Namespace.
     """
-    return argparse.Namespace(
-        cmd=preset_name,
+
+    auto: bool
+    mode: str
+    output_root: Path | None
+    source_root: Path | None
+    backup: Path | None
+    recycle_to: Path | None
+    allow_hard_delete: bool
+    quality: int
+    keep_langs: str
+    hwaccel: str
+    timeout: int | None
+    hw_decode: bool
+    compat_audio: bool
+    original_audio: bool
+    original_subs: bool
+    no_dotted: bool
+    name_suffix: str
+    reencode_tag_value: str
+    dry_run: bool
+    verbose: bool
+    target: str
+    rewrite_codec: bool
+    reencode_tag: bool
+    encoder_preset: str | None
+    qsv_overrides: dict[str, Any]
+    auto_relax_cq: bool = True
+    dv_p7_convert: bool = False
+    _apply_run_id: int | None = None
+    _cq_retried: bool = False
+
+
+def _build_run_config(args: argparse.Namespace, preset_name: str,
+                      mode: str, output_root: Path | None,
+                      source_root: Path | None,
+                      recycle_to: Path | None,
+                      run_id: int) -> RunConfig:
+    """Fill one preset's CQ and flags from PRESETS plus the CLI args."""
+    cfg = PRESETS[preset_name]
+    if args.quality is not None:
+        quality = args.quality
+    else:
+        quality = cast(int, cfg["quality"])
+    if args.keep_langs is not None:
+        keep_langs = args.keep_langs
+    else:
+        keep_langs = cast(str, cfg["keep_langs"])
+    if args.hw_decode is not None:
+        hw_decode = bool(args.hw_decode)
+    else:
+        hw_decode = bool(cfg.get("hw_decode", False))
+    raw_preset = cfg.get("encoder_preset")
+    encoder_preset = raw_preset if isinstance(raw_preset, str) else None
+    raw_qsv = cfg.get("qsv_overrides", {})
+    qsv_overrides = raw_qsv if isinstance(raw_qsv, dict) else {}
+    return RunConfig(
         auto=args.auto,
         mode=mode,
         output_root=output_root,
@@ -2016,78 +1633,43 @@ def _build_apply_namespace(args: argparse.Namespace, preset_name: str,
         backup=None,
         recycle_to=recycle_to,
         allow_hard_delete=False,
-        limit=args.limit,
-        min_height=None,
-        max_height=None,
-        quality=args.quality,
-        keep_langs=args.keep_langs,
+        quality=quality,
+        keep_langs=keep_langs,
         hwaccel=args.hwaccel,
-        timeout=None,
-        hw_decode=args.hw_decode,
+        timeout=getattr(args, "timeout", None),
+        hw_decode=hw_decode,
         compat_audio=True,
-        original_audio=getattr(args, "original_audio", False),
-        original_subs=getattr(args, "original_subs", False),
+        original_audio=bool(getattr(args, "original_audio", False)),
+        original_subs=bool(getattr(args, "original_subs", False)),
         no_dotted=False,
         name_suffix="",
         reencode_tag_value="REENCODE",
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-        db=args.db,
+        dry_run=bool(args.dry_run),
+        verbose=bool(args.verbose),
+        target=cast(str, cfg["target"]),
+        rewrite_codec=bool(cfg["rewrite_codec"]),
+        reencode_tag=bool(cfg["reencode_tag"]),
+        encoder_preset=encoder_preset,
+        qsv_overrides=qsv_overrides,
+        auto_relax_cq=bool(getattr(args, "auto_relax_cq", True)),
+        dv_p7_convert=bool(getattr(args, "dv_p7_convert", False)),
+        _apply_run_id=run_id,
     )
 
 
-def _apply_with_preset_config(args: argparse.Namespace) -> int:
-    """Fill preset config into args; dispatch to cmd_apply.
+def _preset_tiers(preset_name: str) -> frozenset[str]:
+    """Tiers this preset encodes. Never infers UHD-FILM from the file.
 
-    Internal helper used by `_run_path_pipeline`. Keeps the
-    apply-specific Namespace carrying everything cmd_apply expects
-    (target, rewrite_codec, reencode_tag, plus the preset's CQ /
-    keep_langs / height band / hw_decode defaults).
+    UHD-FILM is opt-in: only when the user named that preset, and only
+    for files whose tier is UHD. Every other preset encodes its own tier.
     """
-    cfg = PRESETS[args.cmd]
-    args.target = cfg["target"]
-    args.rewrite_codec = bool(cfg["rewrite_codec"])
-    args.reencode_tag = bool(cfg["reencode_tag"])
-    if args.quality is None:
-        args.quality = cfg["quality"]
-    # encoder_preset is a tier tuning, not a per-run knob — always from PRESETS.
-    args.encoder_preset = cfg.get("encoder_preset")
-    # av1_qsv knob overrides; empty dict = "use AV1_QSV_BASE/TIER globals".
-    # Resolution order: qsv_overrides → AV1_QSV_TIER → AV1_QSV_BASE.
-    args.qsv_overrides = cfg.get("qsv_overrides", {})
-    if args.keep_langs is None:
-        args.keep_langs = cfg["keep_langs"]
-    if args.min_height is None and "min_height" in cfg:
-        args.min_height = cfg["min_height"]
-    if args.max_height is None and "max_height" in cfg:
-        args.max_height = cfg["max_height"]
-    if args.hw_decode is None:
-        args.hw_decode = bool(cfg.get("hw_decode", False))
-    if args.verbose:
-        bounds = (f"[{args.min_height or '-'}..{args.max_height or '-'}]"
-                  if (args.min_height or args.max_height) else "any")
-        print(f"preset {args.cmd}: target={args.target}, quality={args.quality}, "
-              f"keep_langs={args.keep_langs}, height={bounds}, "
-              f"rewrite_codec={args.rewrite_codec}, "
-              f"reencode_tag={args.reencode_tag}, hw_decode={args.hw_decode}, "
-              f"compat_audio={args.compat_audio}")
-    return cmd_apply(args)
+    if preset_name == "UHD-FILM":
+        return frozenset({"UHD"})
+    return frozenset({preset_name})
 
 
-def _run_path_pipeline(args: argparse.Namespace,
-                       presets_to_run: tuple[str, ...],
-                       *, label: str) -> int:
-    """Shared scan + plan + apply pipeline for path-taking subcommands.
-
-    Used by `cmd_optimize` (all three tiers) and `cmd_preset` (one tier
-    per SD/HD/UHD invocation). The apply phase loops once per preset in
-    `presets_to_run`; each preset's own min_height/max_height filter
-    keeps its band isolated.
-    """
-    _apply_bare_invocation_defaults(args)
-    if getattr(args, "confirm", False):
-        args.auto = False
-
+def _reject_bad_job_path(args: argparse.Namespace, label: str) -> int:
+    """Return 2 if args.path is missing or not a file/directory."""
     if not args.path.exists():
         print(f"error: path not found: {args.path}", file=sys.stderr)
         return 2
@@ -2095,60 +1677,258 @@ def _run_path_pipeline(args: argparse.Namespace,
         print(f"error: {label} expects a directory or a single video file: "
               f"{args.path}", file=sys.stderr)
         return 2
+    return 0
 
+
+def _job_scan_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Args the existing scan helpers read. Not a second probe pool."""
+    return argparse.Namespace(
+        path=args.path,
+        no_recursive=False,
+        no_probe_cache=False,
+        min_size=getattr(args, "min_size", MIN_PROBE_SIZE_BYTES),
+        allow_extras=getattr(args, "allow_extras", False),
+        verbose=getattr(args, "verbose", False),
+    )
+
+
+def _scan_worker_count(args: argparse.Namespace) -> int:
+    workers = getattr(args, "workers", None)
+    if workers is None:
+        workers = min(8, os.cpu_count() or 4)
+    return max(1, workers)
+
+
+def _scan_for_job(db: Database, args: argparse.Namespace) -> None:
+    """Cache-aware probe of args.path. Does not write a runs row."""
+    print(f"==> scan: probing {args.path} (cache hits skip ffprobe)...")
+    scan_args = _job_scan_args(args)
+    workers = _scan_worker_count(args)
+    seen, cached, size_skipped, walk_errors, uncached = _scan_walk_phase(
+        scan_args, db, False)
+    probed, probe_errors = _scan_probe_phase(scan_args, db, uncached, workers)
+    errors = walk_errors + probe_errors
+    min_size = getattr(scan_args, "min_size", MIN_PROBE_SIZE_BYTES)
+    skip_note = ""
+    if size_skipped:
+        skip_note = f", {size_skipped} skipped (< {_format_size(min_size)})"
+    print(f"scan done: {seen} files seen, {probed} probed, "
+          f"{cached} cached{skip_note}, {errors} errors")
+    print()
+
+
+def _decide_flags(args: argparse.Namespace) -> dict[str, Any]:
+    skip_raw = getattr(args, "skip_codecs", "") or ""
+    skip_codecs = frozenset(
+        s.strip().lower() for s in skip_raw.split(",") if s.strip()
+    )
+    return {
+        "allow_reencoded": bool(getattr(args, "allow_reencoded", False)),
+        "allow_av1": bool(getattr(args, "allow_av1", False)),
+        "allow_extras": bool(getattr(args, "allow_extras", False)),
+        "allow_low_bitrate": bool(getattr(args, "allow_low_bitrate", False)),
+        "skip_codecs": skip_codecs,
+    }
+
+
+def _scope_path(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return path
+
+
+def _decisions_for_job(db: Database, args: argparse.Namespace,
+                       ) -> list[Decision]:
+    """Classify cached probes under args.path. Skips get no decision row."""
+    scope = _scope_path(args.path)
+    flags = _decide_flags(args)
+    counts = {key: 0 for key, _template in _PLAN_SKIP_MESSAGES}
+    encodes: list[Decision] = []
+    for pr in list(db.iter_probes()):
+        if not _path_under(pr.path, scope):
+            counts["out_of_scope"] += 1
+            continue
+        bucket, decision = _classify_probe(db, pr, **flags)
+        if bucket != "ok":
+            counts[bucket] += 1
+            continue
+        if decision is not None and decision.kind == "encode":
+            encodes.append(decision)
+    if counts["missing"]:
+        db.conn.commit()
+    _emit_plan_skip_summary(counts)
+    return encodes
+
+
+def _sorted_encodes(decisions: list[Decision]) -> list[Decision]:
+    """Biggest projected savings first. Stable for equal savings."""
+    def savings(d: Decision) -> float:
+        if d.candidate is None:
+            return 0.0
+        return d.candidate.total_projected_savings_mb
+    return sorted(decisions, key=savings, reverse=True)
+
+
+def _print_job_candidates(decisions: list[Decision]) -> None:
+    cands: list[Candidate] = []
+    for decision in decisions:
+        if decision.candidate is not None:
+            cands.append(decision.candidate)
+    print(report.format_candidates_text(cands))
+    print()
+
+
+def _fired_rules_json(cand: Candidate) -> str:
+    names = [v.rule for v in cand.fired if not _is_advisory(v.rule)]
+    return json.dumps(names)
+
+
+def _load_decision_row(db: Database, decision_id: int) -> dict:
+    row = db.conn.execute(
+        "SELECT * FROM decisions WHERE id = ?", (decision_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def _encode_job_file(db: Database, decision: Decision, cfg: RunConfig,
+                     idx: int, total: int) -> tuple[str, int]:
+    """Insert a running row (unless dry-run) and encode one candidate."""
+    cand = decision.candidate
+    if cand is None:
+        return "skipped", 0
+    pr = cand.probe
+    rules_json = _fired_rules_json(cand)
+    if cfg.dry_run:
+        dec = {
+            "id": None,
+            "path": pr.path,
+            "rules_fired_json": rules_json,
+            "target": cand.target,
+            "projected_savings_mb": cand.total_projected_savings_mb,
+        }
+    else:
+        dec_id = db.insert_running_decision(
+            pr.path, rules_json, cand.target,
+            cand.total_projected_savings_mb,
+            cast(int, cfg._apply_run_id),
+        )
+        dec = _load_decision_row(db, dec_id)
+    _print_decision_header(dec, pr, idx, total)
+    keep_langs = [s.strip() for s in cfg.keep_langs.split(",") if s.strip()]
+    return _encode_one(db, dec, pr, cfg, keep_langs, idx, total)
+
+
+def _print_preset_verbose(name: str, cfg: RunConfig) -> None:
+    print(f"preset {name}: target={cfg.target}, quality={cfg.quality}, "
+          f"keep_langs={cfg.keep_langs}, "
+          f"rewrite_codec={cfg.rewrite_codec}, "
+          f"reencode_tag={cfg.reencode_tag}, hw_decode={cfg.hw_decode}, "
+          f"compat_audio={cfg.compat_audio}")
+
+
+def _encode_preset(db: Database, args: argparse.Namespace,
+                   ordered: list[Decision], preset_name: str,
+                   mode: str, output_root: Path | None,
+                   source_root: Path | None, recycle_to: Path | None,
+                   run_id: int, limit: int) -> tuple[dict[str, int], int]:
+    """Encode one preset's band, biggest savings first, at most limit."""
+    preset = PRESETS[preset_name]
+    print(f"==> encode: {preset_name} ({preset['label']})")
+    cfg = _build_run_config(
+        args, preset_name, mode, output_root, source_root, recycle_to, run_id,
+    )
+    if args.verbose:
+        _print_preset_verbose(preset_name, cfg)
+    band = [d for d in ordered if d.tier in _preset_tiers(preset_name)]
+    if limit > 0:
+        band = band[:limit]
+    counts = {"applied": 0, "skipped": 0, "failed": 0, "dry_run": 0}
+    saved = 0
+    if not band:
+        print(f"nothing to encode in {preset_name}.")
+        print()
+        return counts, saved
+    for i, decision in enumerate(band, 1):
+        status, n = _encode_job_file(db, decision, cfg, i, len(band))
+        if status in counts:
+            counts[status] += 1
+        saved += n
+    print()
+    return counts, saved
+
+
+def _encode_all_presets(db: Database, args: argparse.Namespace,
+                        ordered: list[Decision],
+                        presets_to_run: tuple[str, ...],
+                        mode: str, output_root: Path | None,
+                        source_root: Path | None, recycle_to: Path | None,
+                        run_id: int) -> dict[str, int]:
+    """Encode presets in order. ``--limit`` applies inside each preset."""
+    totals = {"applied": 0, "skipped": 0, "failed": 0, "dry_run": 0}
+    bytes_saved = 0
+    limit = getattr(args, "limit", 0) or 0
+    for preset_name in presets_to_run:
+        counts, saved = _encode_preset(
+            db, args, ordered, preset_name, mode, output_root,
+            source_root, recycle_to, run_id, limit,
+        )
+        for key, value in counts.items():
+            totals[key] += value
+        bytes_saved += saved
+    summary = {k: v for k, v in totals.items() if k != "dry_run"}
+    summary["approx_bytes_saved"] = bytes_saved
+    touched = sum(totals.values())
+    if touched and not getattr(args, "no_report", False):
+        _emit_run_report(db, run_id)
+    print(f"\njob done: {totals['applied']} encoded, "
+          f"{totals['skipped']} skipped, {totals['failed']} failed; "
+          f"~{_format_bytes(bytes_saved)} saved")
+    return summary
+
+
+def run_job(args: argparse.Namespace,
+            presets_to_run: tuple[str, ...],
+            *, label: str) -> int:
+    """Probe one path, decide, and encode. One runs row for the whole job.
+
+    ``optimize`` passes ``("UHD", "HD", "SD")``. A preset passes
+    ``(name,)``. Files whose tier is not in this job are left out — no
+    pending row. ``--dry-run`` prints ffmpeg commands and writes no
+    decision rows. ``--limit N`` is N files per preset.
+    """
+    _apply_bare_invocation_defaults(args)
+    if getattr(args, "confirm", False):
+        args.auto = False
+    rc = _reject_bad_job_path(args, label)
+    if rc != 0:
+        return rc
     resolved = _optimize_resolve_paths(args)
     if isinstance(resolved, int):
         return resolved
     mode, output_root, source_root, recycle_to = resolved
-
     _print_pipeline_banner(args, label, mode, output_root, recycle_to)
-
-    total = 2 + len(presets_to_run)
-    print(f"==> [1/{total}] scan: probing {args.path} (cache hits skip ffprobe)...")
-    scan_ns = argparse.Namespace(
-        cmd="scan", path=args.path, no_recursive=False,
-        no_probe_cache=False, workers=args.workers,
-        min_size=args.min_size,
-        allow_extras=getattr(args, "allow_extras", False),
-        verbose=args.verbose, db=args.db,
-    )
-    rc = cmd_scan(scan_ns)
-    if rc != 0:
-        return rc
-    print()
-
-    print(f"==> [2/{total}] plan: evaluating rules against probe cache...")
-    plan_ns = argparse.Namespace(
-        cmd="plan", path=args.path, rules=None,
-        target="av1+mkv", json=False,
-        keep_langs=args.keep_langs or "en,und",
-        allow_reencoded=False,
-        allow_av1=getattr(args, "allow_av1", False),
-        allow_extras=getattr(args, "allow_extras", False),
-        allow_low_bitrate=getattr(args, "allow_low_bitrate", False),
-        skip_codecs=getattr(args, "skip_codecs", "") or "",
-        db=args.db,
-    )
-    rc = cmd_plan(plan_ns)
-    if rc != 0:
-        return rc
-    print()
-
-    aggregate_rc = 0
-    for step, preset_name in enumerate(presets_to_run, start=3):
-        cfg = PRESETS[preset_name]
-        print(f"==> [{step}/{total}] apply: {preset_name} ({cfg['label']})")
-        preset_ns = _build_apply_namespace(
-            args, preset_name, mode, output_root, source_root, recycle_to,
+    with Database(args.db) as db:
+        run_id = db.start_run(label, str(args.path), _args_dict(args))
+        _scan_for_job(db, args)
+        encodes = _decisions_for_job(db, args)
+        ordered = _sorted_encodes(encodes)
+        _print_job_candidates(ordered)
+        summary = _encode_all_presets(
+            db, args, ordered, presets_to_run, mode, output_root,
+            source_root, recycle_to, run_id,
         )
-        rc = _apply_with_preset_config(preset_ns)
-        if rc != 0:
-            aggregate_rc = rc
-        print()
-
-    if aggregate_rc == 0 and getattr(args, "cleanup_after", False):
+        db.end_run(run_id, summary)
+    if getattr(args, "cleanup_after", False):
         _invoke_cleanup_after(args)
-    return aggregate_rc
+    return 0
+
+
+def _run_path_pipeline(args: argparse.Namespace,
+                       presets_to_run: tuple[str, ...],
+                       *, label: str) -> int:
+    """Wizard encode step. Path commands call ``run_job`` directly."""
+    return run_job(args, presets_to_run, label=label)
 
 
 def _apply_bare_invocation_defaults(args: argparse.Namespace) -> None:
@@ -2195,8 +1975,8 @@ def _print_pipeline_banner(
 
 
 def cmd_optimize(args: argparse.Namespace) -> int:
-    """One-shot scan+plan+apply across all three tiers (UHD + HD + SD)."""
-    return _run_path_pipeline(args, ("UHD", "HD", "SD"), label="optimize")
+    """Probe, decide, and encode UHD, then HD, then SD."""
+    return run_job(args, ("UHD", "HD", "SD"), label="optimize")
 
 
 def _invoke_cleanup_after(args: argparse.Namespace) -> None:
@@ -2249,22 +2029,21 @@ def _invoke_cleanup_after(args: argparse.Namespace) -> None:
 
 
 def cmd_preset(args: argparse.Namespace) -> int:
-    """Tier-only path-taking pipeline (SD / HD / UHD subcommands).
+    """Probe, decide, and encode one preset's tier.
 
-    Same flow as `cmd_optimize` but applies a single preset, so only
-    files within that tier's height band get encoded.
+    UHD-FILM encodes only files whose tier is UHD, and only because
+    the user named that preset.
     """
-    return _run_path_pipeline(args, (args.cmd,), label=args.cmd)
+    return run_job(args, (args.cmd,), label=args.cmd)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Print recent run history plus the current pending decision queue."""
+    """Print recent run history."""
     with Database(args.db) as db:
         runs = db.recent_runs(limit=args.last)
-        pending = db.list_pending_decisions()
 
-    if not runs and not pending:
-        print("no history yet. run 'scan PATH' to start.")
+    if not runs:
+        print("no history yet.")
         return 0
 
     print(f"recent runs ({len(runs)}):")
@@ -2273,13 +2052,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         dur = (r["ended_at"] - r["started_at"]) if r["ended_at"] else 0
         summary = r["summary_json"] or "(no summary)"
         print(f"  {when}  {r['kind']:7s}  {dur:6.1f}s  {summary}")
-
-    print(f"\npending decisions: {len(pending)}")
-    for d in pending[:10]:
-        savings = d["projected_savings_mb"] or 0
-        print(f"  #{d['id']:>4}  {savings / 1024:6.1f} GB  {d['path']}")
-    if len(pending) > 10:
-        print(f"  ... and {len(pending) - 10} more")
     return 0
 
 
@@ -2291,7 +2063,7 @@ def cmd_replace_list(args: argparse.Namespace) -> int:
     won't help; the operator needs to grab a different release of the
     same title (or accept losing it from the archive backlog).
 
-    `plan` skips these files automatically — they won't re-queue. The
+    ``decide`` skips these files — they are not encoded again. The
     list here is purely informational.
     """
     with Database(args.db) as db:
@@ -2643,7 +2415,7 @@ def _finalize_output(pr: ProbeResult, output_path: Path,
 
 
 _FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
-    "scan", "reprobe", "apply", "list-encoders", "optimize",
+    "scan", "reprobe", "list-encoders", "optimize",
 })
 
 
@@ -2651,7 +2423,7 @@ _FFMPEG_DEPENDENT_CMDS: frozenset[str] = frozenset({
 # forward-declared subcommands (cleanup, wizard) so the dispatch logic
 # doesn't need re-editing when their full handlers land.
 KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
-    "scan", "reprobe", "plan", "apply", "status",
+    "scan", "reprobe", "status",
     "list-encoders", "replace-list", "doctor",
     "optimize", "cleanup", "wizard", "rename-fix",
 }) | frozenset(PRESETS.keys())
@@ -3021,48 +2793,77 @@ def _wizard_doctor_preflight(args: argparse.Namespace) -> bool:
     return ans == "y"
 
 
-def _wizard_run_scan_plan(args: argparse.Namespace, library: Path,
-                          skip_codecs: str = "") -> int:
-    """Run scan + plan against `library`. Returns 0 on success, nonzero else."""
-    print()
-    print(f"==> scan: probing {library}")
-    scan_ns = argparse.Namespace(
-        cmd="scan", path=library, no_recursive=False,
-        no_probe_cache=False, workers=None,
+def _wizard_preview_args(args: argparse.Namespace, library: Path,
+                         skip_codecs: str) -> argparse.Namespace:
+    """Args for the wizard's in-memory preview. Same gates as the encode."""
+    return argparse.Namespace(
+        path=library,
         min_size=MIN_PROBE_SIZE_BYTES,
-        verbose=False, db=args.db,
-    )
-    if cmd_scan(scan_ns) != 0:
-        print("scan failed; aborting", file=sys.stderr)
-        return 1
-    print()
-    print("==> plan: evaluating rules")
-    plan_ns = argparse.Namespace(
-        cmd="plan", path=library, rules=None,
-        target="av1+mkv", json=False,
-        keep_langs="en,und", allow_reencoded=False,
-        allow_av1=False, allow_extras=False,
+        allow_extras=False,
+        allow_av1=False,
         allow_low_bitrate=False,
+        verbose=False,
+        workers=None,
         skip_codecs=skip_codecs,
         db=args.db,
     )
-    if cmd_plan(plan_ns) != 0:
-        print("plan failed; aborting", file=sys.stderr)
-        return 1
-    return 0
 
 
-def _wizard_pick_limit(pending: list[dict], db: Database) -> int | None:
-    """Print the plan summary and ask how many files to encode.
+def _rows_for_limit_prompt(decisions: list[Decision]) -> list[dict]:
+    """Shape encode decisions for the limit prompt. Not written to the db."""
+    rows: list[dict] = []
+    for decision in decisions:
+        cand = decision.candidate
+        if cand is None:
+            continue
+        rows.append({
+            "path": cand.probe.path,
+            "projected_savings_mb": cand.total_projected_savings_mb,
+            "target": cand.target,
+        })
+    return rows
 
-    Returns the limit (0 == all), or None if the user chose to quit.
+
+def _wizard_preview(args: argparse.Namespace, library: Path,
+                    skip_codecs: str) -> list[dict]:
+    """Probe and decide for the summary. Writes no decision rows.
+
+    ``run_job`` probes the same tree again. Cache hits skip ffprobe.
+    Files the user does not encode are not stored.
     """
-    uhd, hd, sd, est_seconds = _wizard_estimate_seconds(pending, db)
+    preview_args = _wizard_preview_args(args, library, skip_codecs)
+    with Database(args.db) as db:
+        _scan_for_job(db, preview_args)
+        encodes = _sorted_encodes(_decisions_for_job(db, preview_args))
+    _print_job_candidates(encodes)
+    return _rows_for_limit_prompt(encodes)
+
+
+def _wizard_choose_limit(args: argparse.Namespace, library: Path,
+                         skip_codecs: str) -> int | None:
+    """Show candidates and ask for a limit. None means do not encode."""
+    rows = _wizard_preview(args, library, skip_codecs)
+    if not rows:
+        print()
+        print("no candidates found. nothing to do.")
+        return None
+    with Database(args.db) as db:
+        return _wizard_pick_limit(rows, db)
+
+
+def _wizard_pick_limit(candidates: list[dict], db: Database) -> int | None:
+    """Print the candidate summary and ask how many files to encode.
+
+    ``candidates`` are in-memory rows (path, projected savings). They
+    are not pending decisions. Returns the limit (0 == all), or None
+    if the user chose to quit.
+    """
+    uhd, hd, sd, est_seconds = _wizard_estimate_seconds(candidates, db)
     uhd_hours = _format_hours(uhd * EST_SECONDS_PER_FILE["UHD"])
     hd_hours = _format_hours(hd * EST_SECONDS_PER_FILE["HD"])
     sd_hours = _format_hours(sd * EST_SECONDS_PER_FILE["SD"])
     print()
-    print(f"Found {len(pending)} candidate(s): "
+    print(f"Found {len(candidates)} candidate(s): "
           f"{uhd} UHD ({uhd_hours}), {hd} HD ({hd_hours}), "
           f"{sd} SD ({sd_hours})")
     print(f"Estimated total time: {_format_hours(est_seconds)} on "
@@ -3259,10 +3060,10 @@ def cmd_rename_fix(args: argparse.Namespace) -> int:
 def cmd_wizard(args: argparse.Namespace) -> int:
     """Interactive prompt-based workflow.
 
-    Composes `cmd_doctor`, `cmd_scan`, `cmd_plan`, `cmd_optimize` (which
-    itself routes through `cmd_preset` → `cmd_apply`), and `cmd_cleanup`.
-    No new business logic — this is purely a Q&A surface for users who
-    don't want to read --help. See plan §6 / "Wizard prompt sequence".
+    Composes ``cmd_doctor``, an in-memory probe and decide preview, then
+    ``run_job`` (via ``_run_path_pipeline``), and ``cmd_cleanup``. The
+    preview writes no decision rows. Encoding stores only files the
+    chosen presets actually encode.
     """
     try:
         if not _wizard_doctor_preflight(args):
@@ -3279,17 +3080,7 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
         skip_codecs = _wizard_pick_skip_codecs()
 
-        rc = _wizard_run_scan_plan(args, library, skip_codecs=skip_codecs)
-        if rc != 0:
-            return rc
-
-        with Database(args.db) as db:
-            pending = db.list_pending_decisions()
-            if not pending:
-                print()
-                print("no candidates found. nothing to do.")
-                return 0
-            limit = _wizard_pick_limit(pending, db)
+        limit = _wizard_choose_limit(args, library, skip_codecs)
         if limit is None:
             return 0
 
@@ -3358,7 +3149,7 @@ def _preprocess_argv(argv: list[str]) -> list[str]:
 
 def _assert_external_tools_available(cmd: str) -> None:
     """Exit with a clear error if a subcommand needs ffmpeg/ffprobe but they
-    aren't on PATH. plan, status, and replace-list work purely against the
+    aren't on PATH. status and replace-list work purely against the
     cached probe data and don't need either binary."""
     needs_tools = cmd in _FFMPEG_DEPENDENT_CMDS or cmd in PRESETS
     if not needs_tools:
@@ -3394,8 +3185,6 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "scan": cmd_scan,
         "reprobe": cmd_reprobe,
-        "plan": cmd_plan,
-        "apply": cmd_apply,
         "status": cmd_status,
         "list-encoders": cmd_list_encoders,
         "replace-list": cmd_replace_list,

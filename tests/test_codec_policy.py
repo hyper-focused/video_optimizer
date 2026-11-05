@@ -16,6 +16,7 @@ from pathlib import Path
 from optimizer import encoder
 from optimizer.cli import _plan_probe_gate, _should_apply_denoise
 from optimizer.db import Database
+from optimizer.decide import decide
 from optimizer.rules import (
     HdNonAv1Rule,
     SdNonAv1Rule,
@@ -145,7 +146,9 @@ class SdNonAv1RuleTests(unittest.TestCase):
 
 
 class _GateTestBase(unittest.TestCase):
-    """Build a real on-disk Database so _plan_probe_gate's stall query runs."""
+    """On-disk file plus db. Pure checks call ``decide``; wrapper checks
+    that still need a stall read or a sibling stat use ``_plan_probe_gate``.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -166,26 +169,19 @@ class _GateTestBase(unittest.TestCase):
 
 class PlanGateAv1Tests(_GateTestBase):
     def test_av1_source_skipped_by_default(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(codec="av1")),
-                "av1_source",
-            )
+        d = decide(self._probe(codec="av1"), stall_count=0)
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "av1_source")
 
     def test_av1_admitted_with_override(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(codec="av1"),
-                                 allow_av1=True),
-                "ok",
-            )
+        d = decide(self._probe(codec="av1"), stall_count=0, allow_av1=True)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
     def test_non_av1_unaffected(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(codec="h264")),
-                "ok",
-            )
+        d = decide(self._probe(codec="h264"), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
 
 class PlanGateLowBitrateTests(_GateTestBase):
@@ -196,109 +192,86 @@ class PlanGateLowBitrateTests(_GateTestBase):
 
     def test_1080p_3mbps_skipped(self):
         # 1080p AV1 target is 5 Mbps; 3 Mbps is below.
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="h264", height=1080,
-                                    video_bitrate=3_000_000),
-                ),
-                "low_bitrate",
-            )
+        d = decide(
+            self._probe(codec="h264", height=1080, video_bitrate=3_000_000),
+            stall_count=0,
+        )
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "low_bitrate")
 
     def test_1080p_3mbps_admitted_with_override(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="h264", height=1080,
-                                    video_bitrate=3_000_000),
-                    allow_low_bitrate=True,
-                ),
-                "ok",
-            )
+        d = decide(
+            self._probe(codec="h264", height=1080, video_bitrate=3_000_000),
+            stall_count=0, allow_low_bitrate=True,
+        )
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
     def test_2160p_below_target_skipped(self):
         # 2160p target is 16 Mbps; 12 Mbps falls below.
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="hevc", height=2160,
-                                    video_bitrate=12_000_000),
-                ),
-                "low_bitrate",
-            )
+        d = decide(
+            self._probe(codec="hevc", height=2160, video_bitrate=12_000_000),
+            stall_count=0,
+        )
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "low_bitrate")
 
     def test_at_target_bitrate_admitted(self):
         # Sources at-or-above the AV1 target are admitted.
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="hevc", height=1080,
-                                    video_bitrate=5_500_000),
-                ),
-                "ok",
-            )
+        d = decide(
+            self._probe(codec="hevc", height=1080, video_bitrate=5_500_000),
+            stall_count=0,
+        )
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
     def test_unknown_bitrate_admitted(self):
         # Source bitrate == 0 means we can't decide; admit (the rule
         # engine will still gate on its own thresholds).
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="h264", height=1080,
-                                    video_bitrate=0),
-                ),
-                "ok",
-            )
+        d = decide(
+            self._probe(codec="h264", height=1080, video_bitrate=0),
+            stall_count=0,
+        )
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
 
 class PlanGateSkipCodecsTests(_GateTestBase):
     """`--skip-codecs hevc,h264,…` filters by source codec at plan time."""
 
     def test_hevc_skipped_when_in_skip_set(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="hevc", height=1080,
-                                    video_bitrate=20_000_000),
-                    skip_codecs=frozenset({"hevc"}),
-                ),
-                "skipped_codec",
-            )
+        d = decide(
+            self._probe(codec="hevc", height=1080, video_bitrate=20_000_000),
+            stall_count=0, skip_codecs=frozenset({"hevc"}),
+        )
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "skipped_codec")
 
     def test_h264_admitted_when_only_hevc_skipped(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="h264", height=1080,
-                                    video_bitrate=20_000_000),
-                    skip_codecs=frozenset({"hevc"}),
-                ),
-                "ok",
-            )
+        d = decide(
+            self._probe(codec="h264", height=1080, video_bitrate=20_000_000),
+            stall_count=0, skip_codecs=frozenset({"hevc"}),
+        )
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
     def test_av1_skip_still_takes_precedence(self):
         # AV1 sources hit the "av1_source" gate before the codec-skip
         # check, even when "av1" appears in the skip set.
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="av1", height=1080,
-                                    video_bitrate=20_000_000),
-                    skip_codecs=frozenset({"av1"}),
-                ),
-                "av1_source",
-            )
+        d = decide(
+            self._probe(codec="av1", height=1080, video_bitrate=20_000_000),
+            stall_count=0, skip_codecs=frozenset({"av1"}),
+        )
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "av1_source")
 
     def test_empty_skip_set_is_a_noop(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(
-                    db, self._probe(codec="hevc", height=1080,
-                                    video_bitrate=20_000_000),
-                    skip_codecs=frozenset(),
-                ),
-                "ok",
-            )
+        d = decide(
+            self._probe(codec="hevc", height=1080, video_bitrate=20_000_000),
+            stall_count=0, skip_codecs=frozenset(),
+        )
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
 
 class PlanGateSdTests(_GateTestBase):
@@ -306,20 +279,16 @@ class PlanGateSdTests(_GateTestBase):
     by the SdNonAv1Rule (or the SD preset, depending on the entry point)."""
 
     def test_sd_admitted_to_rules(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(height=480)),
-                "ok",
-            )
+        d = decide(self._probe(height=480), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "SD")
 
     def test_av1_skip_takes_precedence_at_sd(self):
         # An SD AV1 source should still report "av1_source" (already at
         # the target codec, regardless of resolution).
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe(codec="av1", height=480)),
-                "av1_source",
-            )
+        d = decide(self._probe(codec="av1", height=480), stall_count=0)
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "av1_source")
 
 
 class PlanGateExistingOutputTests(_GateTestBase):
@@ -390,26 +359,159 @@ class PlanGateExtrasTests(_GateTestBase):
         return p
 
     def test_trailer_suffix_skipped_by_default(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe_extras("Movie-trailer.mkv")),
-                "extras",
-            )
+        d = decide(self._probe_extras("Movie-trailer.mkv"), stall_count=0)
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "extras")
 
     def test_extras_admitted_with_override(self):
-        with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe_extras("Movie-trailer.mkv"),
-                                 allow_extras=True),
-                "ok",
-            )
+        d = decide(self._probe_extras("Movie-trailer.mkv"), stall_count=0,
+                   allow_extras=True)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
 
     def test_non_extras_filename_unaffected(self):
+        d = decide(self._probe_extras("Movie.mkv"), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
+
+
+class DecideTierTests(unittest.TestCase):
+    """Encode tier comes from PRESETS height gates, never UHD-FILM.
+
+    Height 0 is below SdNonAv1Rule's band (it starts at 1), so a legacy
+    codec is what makes the probe an encode whose tier we can read.
+    """
+
+    def _legacy(self, height, *, video_bitrate=40_000_000):
+        return make_probe(codec="mpeg2video", height=height,
+                          video_bitrate=video_bitrate)
+
+    def test_height_0_is_sd(self):
+        d = decide(self._legacy(0), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "SD")
+
+    def test_missing_height_is_sd(self):
+        # video_bitrate 0 so OverBitratedRule returns before it touches
+        # resolution_class (which can't compare a missing height).
+        pr = self._legacy(0, video_bitrate=0)
+        pr.height = None
+        d = decide(pr, stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "SD")
+
+    def test_height_720_is_hd(self):
+        d = decide(self._legacy(720), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "HD")
+
+    def test_height_1440_is_uhd(self):
+        d = decide(self._legacy(1440), stall_count=0)
+        self.assertEqual(d.kind, "encode")
+        self.assertEqual(d.tier, "UHD")
+
+    def test_uhd_film_is_never_returned(self):
+        expected = {
+            0: "SD", 480: "SD", 719: "SD",
+            720: "HD", 1080: "HD", 1439: "HD",
+            1440: "UHD", 2160: "UHD",
+        }
+        for height, tier in expected.items():
+            d = decide(self._legacy(height), stall_count=0)
+            self.assertEqual(d.kind, "encode", height)
+            self.assertEqual(d.tier, tier, height)
+            self.assertNotEqual(d.tier, "UHD-FILM", height)
+
+
+class DecideExistingOutputOrderTests(unittest.TestCase):
+    """existing_output is checked before the AV1 source skip."""
+
+    def test_av1_with_existing_output_skips_as_existing_output(self):
+        pr = make_probe(codec="av1", height=1080, video_bitrate=20_000_000)
+        d = decide(pr, stall_count=0, has_existing_output=True)
+        self.assertEqual(d.kind, "skip")
+        self.assertEqual(d.reason, "existing_output")
+        self.assertNotEqual(d.reason, "av1_source")
+
+
+class DecideCleanTests(unittest.TestCase):
+    def test_nothing_to_do_is_clean(self):
+        # AV1, between the 1080p target (5 Mbps) and the flag (10 Mbps):
+        # not a low-bitrate skip, and no non-advisory rule fires.
+        pr = make_probe(codec="av1", height=1080, video_bitrate=6_000_000)
+        d = decide(pr, stall_count=0, allow_av1=True)
+        self.assertEqual(d.kind, "clean")
+        self.assertIsNone(d.candidate)
+        self.assertIsNone(d.tier)
+
+
+class PlanProbeGateDbTests(_GateTestBase):
+    """Wrapper side effects: missing-file row deletion and the stall read."""
+
+    def _counts(self, db, path):
+        files = db.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE path = ?", (path,),
+        ).fetchone()[0]
+        decs = db.conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE path = ?", (path,),
+        ).fetchone()[0]
+        return files, decs
+
+    def test_missing_source_deletes_decisions_then_files(self):
+        gone = self.fake_file.parent / "gone.mkv"
+        pr = make_probe(codec="hevc", height=1080, video_bitrate=20_000_000)
+        pr.path = str(gone)
+        self.assertFalse(gone.exists())
         with Database(self.db_path) as db:
-            self.assertEqual(
-                _plan_probe_gate(db, self._probe_extras("Movie.mkv")),
-                "ok",
+            db.upsert_probe(pr)
+            run_id = db.start_run("encode", None, {})
+            db.insert_running_decision(
+                pr.path, '["hd_non_av1"]', "av1+mkv", 1.0, run_id,
             )
+            self.assertEqual(_plan_probe_gate(db, pr), "missing")
+            # Same connection: the DELETEs are uncommitted, but visible.
+            self.assertEqual(self._counts(db, pr.path), (0, 0))
+
+    def test_two_stalls_read_from_db(self):
+        pr = self._probe(codec="hevc", height=1080, video_bitrate=20_000_000)
+        with Database(self.db_path) as db:
+            db.upsert_probe(pr)
+            run_id = db.start_run("encode", None, {})
+            for _ in range(2):
+                dec_id = db.insert_running_decision(
+                    pr.path, '["hd_non_av1"]', "av1+mkv", 1.0, run_id,
+                )
+                db.mark_decision(
+                    dec_id, "failed",
+                    error="encoder stalled — no progress for 300s",
+                )
+            self.assertEqual(_plan_probe_gate(db, pr), "stalled")
+
+    def test_one_stall_does_not_trip_wrapper(self):
+        pr = self._probe(codec="hevc", height=1080, video_bitrate=20_000_000)
+        with Database(self.db_path) as db:
+            db.upsert_probe(pr)
+            run_id = db.start_run("encode", None, {})
+            dec_id = db.insert_running_decision(
+                pr.path, '["hd_non_av1"]', "av1+mkv", 1.0, run_id,
+            )
+            db.mark_decision(
+                dec_id, "failed",
+                error="encoder stalled — no progress for 300s",
+            )
+            self.assertEqual(_plan_probe_gate(db, pr), "ok")
+
+    def test_non_stall_failures_do_not_count(self):
+        pr = self._probe(codec="hevc", height=1080, video_bitrate=20_000_000)
+        with Database(self.db_path) as db:
+            db.upsert_probe(pr)
+            run_id = db.start_run("encode", None, {})
+            for _ in range(2):
+                dec_id = db.insert_running_decision(
+                    pr.path, '["hd_non_av1"]', "av1+mkv", 1.0, run_id,
+                )
+                db.mark_decision(dec_id, "failed", error="ffmpeg exited 234")
+            self.assertEqual(_plan_probe_gate(db, pr), "ok")
 
 
 # --------------------------------------------------------------------------- #

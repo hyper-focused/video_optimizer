@@ -75,9 +75,9 @@ class DvNoStrategyMarksSkippedTests(unittest.TestCase):
             with Database(db_path) as db:
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["over_bitrated"]', "av1+mkv", 0.0,
+                    run_id,
                 )
                 row = dict(db.conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (dec_id,),
@@ -124,9 +124,9 @@ class DvStripFailureMarksFailedTests(unittest.TestCase):
             with Database(db_path) as db:
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["over_bitrated"]', "av1+mkv", 0.0,
+                    run_id,
                 )
                 row = dict(db.conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (dec_id,),

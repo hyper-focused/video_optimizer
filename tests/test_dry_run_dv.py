@@ -39,9 +39,9 @@ class DryRunSkipsDvPrepTests(unittest.TestCase):
             with Database(db_path) as db:
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["over_bitrated"], "av1+mkv", 0.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["over_bitrated"]', "av1+mkv", 0.0,
+                    run_id,
                 )
                 row = dict(db.conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (dec_id,),
@@ -91,15 +91,15 @@ class DryRunSkipsDvPrepTests(unittest.TestCase):
 
             self.assertEqual(status, "dry_run")
             self.assertEqual(saved, 0)
-            # The decision row should be stamped with the run but not
-            # transitioned to a terminal status by the dry-run path.
+            # Dry-run must not terminalise the row. It stays running,
+            # still tied to the run that created it.
             with sqlite3.connect(str(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 final = dict(conn.execute(
                     "SELECT status, run_id FROM decisions WHERE id = ?",
                     (dec_id,),
                 ).fetchone())
-            self.assertEqual(final["status"], "pending")
+            self.assertEqual(final["status"], "running")
             self.assertEqual(final["run_id"], run_id)
 
 
@@ -129,9 +129,9 @@ class HdDvSourceSkipsDvPrepTests(unittest.TestCase):
             with Database(db_path) as db:
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["hd_non_av1"], "av1+mkv", 0.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["hd_non_av1"]', "av1+mkv", 0.0,
+                    run_id,
                 )
                 row = dict(db.conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (dec_id,),
@@ -193,9 +193,9 @@ class HdDvSourceSkipsDvPrepTests(unittest.TestCase):
             with Database(db_path) as db:
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["uhd_non_av1"], "av1+mkv", 0.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["uhd_non_av1"]', "av1+mkv", 0.0,
+                    run_id,
                 )
                 row = dict(db.conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (dec_id,),

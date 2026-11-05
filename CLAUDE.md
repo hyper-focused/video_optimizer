@@ -39,43 +39,55 @@ test suite only.
 
 ## Architecture: the pipeline and what glues it
 
-The CLI is a four-stage pipeline whose stages communicate **only through the SQLite db** (default `~/.video_optimizer/state.db`, override with `--db`). There is no in-process pipeline object — each subcommand opens the db, reads what it needs, writes its output rows, and exits.
+A path command probes, decides, and encodes in one process. `run_job` in `optimizer/cli.py` is that entry. `optimize`, `SD`, `HD`, `UHD`, `UHD-FILM`, and a bare path (rewritten to `optimize`) all go through it. One `runs` row for the job. `plan` and `apply` are not registered. There is no pending queue.
+
+The database (default `~/.video_optimizer/state.db`, override with `--db`) is a probe cache and an outcome log. `decide()` lives in `optimizer/decide.py`. It does not open SQLite and does not touch the filesystem; the caller passes the stall count and whether a reencode sibling already exists. Encode candidates stay in memory until `insert_running_decision` writes a row.
 
 ```
-scan PATH  ──►  files table (probe cache, keyed by path; invalidated by size+mtime)
-                │
-                ▼
-plan       ──►  decisions table (status='pending')      [clears prior pending first]
-                │
-                ▼
-apply      ──►  decisions table (status='completed' / 'failed' / 'skipped')
-                │
-                ▼
-status     ──►  read-only view of runs + pending decisions
+scan / reprobe PATH  ──►  files table (probe cache, keyed by path; size+mtime)
+                          a scan run is recorded; no decision rows
+
+path command         ──►  one runs row
+                          decide() in memory; decide-time skips are not stored
+                          each encode: decisions.status='running', then
+                          completed / failed / skipped
+                          --dry-run: ffmpeg argv on stdout, no decision rows
+
+status               ──►  recent runs, or `no history yet.`
+doctor               ──►  preflight; cached-file count only (not decisions)
 ```
 
-Three things to internalise about this pipeline before changing it:
+`cleanup --apply` and `rename-fix --apply` are flags on those commands. They are not an encode step, and they are not a subcommand named `apply`.
 
-1. **The probe cache key is `(size, mtime)`, not a content hash** (`db.Database.get_cached_probe`). A file edited in place with mtime preserved will produce stale probe data — `reprobe PATH` (alias for `scan --no-probe-cache`) is the escape hatch.
-2. **`plan` is destructive to the pending queue.** It deletes every `status='pending'` row before re-running rules (`db.clear_pending_decisions`). Half-applied queues from a previous run are preserved (their status is no longer `pending`), but you cannot "amend" a plan — re-running starts the queue over.
-3. **`apply` may leave a candidate `pending` rather than terminalising it** when the resolution gate (`--min-height` / `--max-height`) defers it. This is the mechanism that lets the `SD`, `HD`, and `UHD` presets share one queue: each preset processes its own band (height < 720, 720–1439, ≥1440 respectively) and skips the others', leaving those rows for a follow-up run.
+Three things to internalise before changing this:
+
+1. **The probe cache key is `(size, mtime)`, not a content hash** (`db.Database.get_cached_probe`). A file edited in place with mtime preserved will produce stale probe data — `reprobe PATH` (alias for `scan --no-probe-cache`) is the escape hatch. `scan` and `reprobe` only warm or refresh that cache. A path command probes through `_scan_for_job`, which does not open a second run.
+2. **Decision rows are outcomes, not a queue.** An encode is born `running` via `Database.insert_running_decision` (`owner_pid` is this process). Decide-time skips and `--dry-run` write no decision rows. On connect, leftover `status='pending'` rows are deleted (`_delete_leftover_pending_decisions`). A live `owner_pid` stays `running`, so `status` or `scan` does not interrupt an encode that is still going. A dead owner's `running` row, or a `running` row with NULL `owner_pid`, becomes `failed` with error exactly `interrupted`. That string does not match `error LIKE '%encoder stalled%'`, so it does not count as an encoder stall. Completed, failed, and skipped rows are left alone.
+3. **Tier order is the job, not a shared queue.** `cmd_optimize` calls `run_job` with `("UHD", "HD", "SD")`. `cmd_preset` calls `run_job` with `(args.cmd,)`. It does not delegate to `cmd_apply`. `UHD-FILM` runs only when that preset is named, and only for files whose tier is UHD (height ≥ 1440). It is not inferred from the file. Within a tier, biggest projected savings first (`_sorted_encodes`). `--limit N` is N files per preset, applied after that sort; `0` means no limit. Files outside the presets in this job are omitted. No row is written for them.
+
+`status` prints recent runs (`--last`, default 10). With no runs it prints `no history yet.` `doctor` prints the probe-cache file count. It does not count pending.
+
+The wizard previews in memory (`_wizard_preview`), asks for a limit, then encodes through `run_job` (`_run_path_pipeline`). It does not write pending rows.
+
+Path commands accept `--allow-reencoded`, `--timeout`, `--no-auto-relax-cq`, and `--dv-p7-convert`. `--timeout` omitted is the adaptive cap in the convention below; `0` disables; a positive value wins.
 
 ## Module map (what owns what)
 
-- **`optimizer/cli.py`** — argparse wiring, subcommand handlers, and the apply pipeline (`_apply_one`, `_build_apply_command`, `_execute_encode`, `_finalize_output`). Presets are defined in `optimizer/presets.py` and imported here; `cmd_preset` fills missing args from the preset config and delegates to `cmd_apply`.
+- **`optimizer/cli.py`** — argparse wiring, subcommand handlers, and the encode path (`run_job`, `_encode_one`, `_build_apply_command`, `_execute_encode`, `_finalize_output`). Presets are defined in `optimizer/presets.py` and imported here. `cmd_preset` calls `run_job` with `(args.cmd,)`; it does not delegate to `cmd_apply`. `cmd_optimize` calls `run_job` with `("UHD", "HD", "SD")`. The job builds each preset's `RunConfig` from `PRESETS` plus the CLI args.
 - **`optimizer/presets.py`** — single tuning surface. `PRESETS` (preset CQ + height gate), `AV1_QSV_TIER` (HD/UHD `maxrate` / `bufsize` / `look_ahead_depth` / `gop`), `AV1_QSV_BASE` (tier-independent av1_qsv flags), `BITRATE_FLAG_TABLE` (rules engine thresholds). When changing tunings, edit here — `cli.py`, `encoder.py`, and `rules.py` all read from this module. Deliberately a Python module rather than a TOML/YAML config: zero parser, zero precedence rules, comments allowed. If multiple co-existing tunings (per-machine, per-library) become a real need, this is the natural step where it graduates to `~/.video_optimizer/config.toml`; the shape maps cleanly.
 - **`optimizer/probe.py`** — `ffprobe` wrapper → `ProbeResult`. The probe layer is responsible for HDR detection (`is_hdr` derived from color metadata) and for synthesising a `video_bitrate` estimate when the stream-level value is absent.
 - **`optimizer/rules.py`** — `Rule` subclasses + the `RULES` registry + `RulesEngine`. A `Candidate` is produced **iff at least one non-advisory rule fires**; advisory rules (currently only `hdr_advisory`) are attached to the candidate but cannot create one alone. `remux_only` is set when *only* `container_migration` fires *and* the existing video codec is in `_MODERN_CODECS` ({h264, hevc, av1, vp9}).
+- **`optimizer/decide.py`** — `decide()`. Classifies one `ProbeResult` as skip, clean, or encode-plus-tier. No SQLite and no filesystem. The tier is `SD`, `HD`, or `UHD`, never `UHD-FILM`.
 - **`optimizer/encoder.py`** — encoder discovery (`get_available_encoders` parses `ffmpeg -encoders` and caches the result module-wide), `select_encoder(target, hwaccel)` (falls back through `ENCODER_PREFERENCE[codec][hwaccel]` then to software), and the ffmpeg argv builders for both encode and remux paths. Also owns the **3-stream audio ladder** (`_build_audio_ladder` → stream 0 highest-quality passthrough, stream 1 5.1 tier, stream 2 2.0 tier) and the `mov_text` subtitle conversion / image-sub drop when targeting MP4. HDR metadata flows through implicitly — no extraction code needed; libavcodec lifts mastering display + MaxCLL side_data onto AVFrames and the matroska muxer writes them as container HDR tags.
-- **`optimizer/db.py`** — SQLite schema (`files`, `decisions`, `runs`), context-manager wrapper, all CRUD. Schema is created idempotently on every connect; there is no migration system.
+- **`optimizer/db.py`** — SQLite schema (`files`, `decisions`, `runs`), context-manager wrapper, all CRUD. The database is a probe cache and an outcome log, not a work queue. Schema is created idempotently on every connect; there is no migration system. Connect deletes leftover `pending` rows and fails a dead owner's `running` row with `error='interrupted'`.
 - **`optimizer/models.py`** — dataclasses (`ProbeResult`, `AudioTrack`, `SubtitleTrack`, `RuleVerdict`, `Candidate`) plus the `to_json` / `probe_from_json` helpers that let `db.py` round-trip a `ProbeResult` through a single TEXT column. `ProbeResult.resolution_class` is the canonical resolution-bucket key shared with `presets.BITRATE_FLAG_TABLE`.
 - **`optimizer/naming.py`** — pure-string codec-token rewriting for `--rewrite-codec` / `--reencode-tag`. No I/O.
 - **`optimizer/crawler.py`** — recursive directory walk, video-extension filter.
-- **`optimizer/report.py`** — text and JSON candidate-list rendering for `plan`.
+- **`optimizer/report.py`** — the job preview calls `format_candidates_text`. `format_candidates_json` is defined and has no caller. The post-run report is `format_run_report`.
 
 ## Conventions worth respecting
 
-- **Subcommand handlers always open their own `Database`** via `with Database(args.db) as db:` and frame the work between `db.start_run(...)` and `db.end_run(...)`. Adding a new subcommand should follow this — `runs` is the audit trail.
+- **Not every subcommand writes a run.** `scan` and `reprobe` write one `runs` row (kind `scan`). `cleanup` writes one (kind `cleanup`) when it has a target run. A path command writes one through `run_job`: `optimize`, `SD`, `HD`, `UHD`, `UHD-FILM`, a bare path, and the wizard once it encodes. The wizard preview does not. `status`, `doctor`, and `replace-list` open the database and do not call `start_run`. `list-encoders` and `rename-fix` do not open it.
 - **ffmpeg invocations live in `encoder.build_*_command`**. `cli.py` should not assemble ffmpeg argv directly. The same goes for encoder selection — call `encoder.select_encoder` rather than reading `ENCODER_PREFERENCE` from the CLI.
 - **Tuning values belong in `presets.py`, not at the call site.** `_qsv_args`, `cmd_preset`, and `OverBitratedRule` all read their numeric knobs from `presets.py`. New tunable values (a new tier, a new resolution bucket, a new preset) should be defined there and consumed from there — don't reintroduce literals back into the consumer modules.
 - **Output-path computation belongs to `cli._compute_output_path`.** It is the single place that branches on `--mode side` vs `--mode replace`, applies `--source-root` stripping, and composes filename rewrites with the new extension. Replicating its logic anywhere else creates skew.

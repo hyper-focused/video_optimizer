@@ -12,13 +12,14 @@ The contract:
   * `_finalize_output` does *not* recycle, back up, or unlink the
     source — the original stays untouched and the operator (or a
     follow-up `cleanup --run N` command) decides when to remove it.
-  * `cmd_apply` rejects the combination of ``--mode keep`` and
-    ``--output-root`` because the latter is meaningless without `side`.
+  * ``run_job`` rejects ``--mode keep`` together with ``--output``
+    because an output directory is meaningless without side mode.
 
 These tests pin all three behaviors. The end-to-end test patches
 `encoder.select_encoder` and `_execute_encode` so no real ffmpeg runs;
-it only verifies that `cmd_apply` plumbs the keep contract end-to-end
-(source untouched, output recorded, decision marked completed).
+it only verifies that ``_encode_one`` plumbs the keep contract
+end-to-end (source untouched, output recorded, decision marked
+completed).
 """
 
 from __future__ import annotations
@@ -35,9 +36,11 @@ from unittest.mock import patch
 
 from optimizer import cli as cli_mod
 from optimizer.cli import (
+    RunConfig,
     _compute_output_path,
+    _encode_one,
     _finalize_output,
-    cmd_apply,
+    run_job,
 )
 from optimizer.db import Database
 from tests._fixtures import make_probe
@@ -117,9 +120,9 @@ class FinalizeOutputKeepTests(unittest.TestCase):
                 # decisions has a FK on files(path); seed the probe row.
                 db.upsert_probe(pr)
                 run_id = db.start_run("apply", None, {})
-                dec_id = db.insert_pending_decision(
-                    str(source), ["over_bitrated"], "av1+mkv", 1.0,
-                    run_id=run_id,
+                dec_id = db.insert_running_decision(
+                    str(source), '["over_bitrated"]', "av1+mkv", 1.0,
+                    run_id,
                 )
                 # Hand-fetch the dict shape `_finalize_output` expects.
                 row = dict(db.conn.execute(
@@ -157,34 +160,40 @@ class FinalizeOutputKeepTests(unittest.TestCase):
             self.assertGreater(actual_mb, 0)
 
 
-class CmdApplyValidationTests(unittest.TestCase):
-    """`cmd_apply` rejects --mode keep paired with --output-root."""
+class KeepOutputRejectionTests(unittest.TestCase):
+    """Keep mode rejects an output directory."""
 
-    def test_keep_with_output_root_is_rejected(self):
+    def test_keep_with_output_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
+            library = Path(tmp) / "lib"
+            library.mkdir()
             args = argparse.Namespace(
+                path=library,
                 mode="keep",
-                output_root=Path(tmp) / "outroot",
-                source_root=None,
-                backup=None,
+                output=Path(tmp) / "outroot",
+                replace=False,
                 recycle_to=None,
-                allow_hard_delete=False,
                 auto=True,
+                verbose=False,
+                confirm=False,
                 dry_run=False,
                 db=Path(tmp) / "state.db",
             )
             buf = io.StringIO()
             with redirect_stderr(buf):
-                rc = cmd_apply(args)
+                rc = run_job(args, ("HD",), label="HD")
             self.assertEqual(rc, 2)
-            self.assertIn("--mode keep", buf.getvalue())
-            self.assertIn("--output-root", buf.getvalue())
+            self.assertIn(
+                "--mode keep is incompatible with --output",
+                buf.getvalue(),
+            )
+            self.assertIn("keep writes alongside the source", buf.getvalue())
 
 
-class CmdApplyKeepE2ETests(unittest.TestCase):
-    """Run cmd_apply with `_execute_encode` stubbed: source must remain."""
+class KeepEncodeTests(unittest.TestCase):
+    """Run `_encode_one` with `_execute_encode` stubbed: source must remain."""
 
-    def test_keep_apply_leaves_originals_untouched(self):
+    def test_keep_encode_leaves_originals_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "foo.mkv"
@@ -195,11 +204,6 @@ class CmdApplyKeepE2ETests(unittest.TestCase):
             pr.size = source.stat().st_size
 
             db_path = tmp_path / "state.db"
-            with Database(db_path) as db:
-                db.upsert_probe(pr)
-                db.insert_pending_decision(
-                    str(source), ["over_bitrated"], "av1+mkv", 100.0,
-                )
 
             def fake_execute(db, dec, pr, cmd, desc, output_path,
                              args, label="", **_kw):
@@ -213,47 +217,60 @@ class CmdApplyKeepE2ETests(unittest.TestCase):
                 )
                 return "applied", int(actual_mb * 1024 * 1024)
 
-            args = argparse.Namespace(
-                mode="keep",
-                output_root=None,
-                source_root=None,
-                backup=None,
-                recycle_to=None,
-                allow_hard_delete=False,
-                auto=True,
-                dry_run=False,
-                db=db_path,
-                quality=21,
-                hwaccel="auto",
-                hw_decode=False,
-                compat_audio=True,
-                keep_langs="en,und",
-                timeout=0,
-                verbose=False,
-                limit=0,
-                min_height=None,
-                max_height=None,
-                rewrite_codec=True,
-                reencode_tag=True,
-                reencode_tag_value="REENCODE",
-                no_dotted=False,
-                name_suffix="",
-                no_report=True,
-            )
+            with Database(db_path) as db:
+                db.upsert_probe(pr)
+                run_id = db.start_run("optimize", None, {})
+                dec_id = db.insert_running_decision(
+                    str(source), '["over_bitrated"]', "av1+mkv", 100.0,
+                    run_id,
+                )
+                row = dict(db.conn.execute(
+                    "SELECT * FROM decisions WHERE id = ?",
+                    (dec_id,),
+                ).fetchone())
+                cfg = RunConfig(
+                    auto=True,
+                    mode="keep",
+                    output_root=None,
+                    source_root=None,
+                    backup=None,
+                    recycle_to=None,
+                    allow_hard_delete=False,
+                    quality=21,
+                    keep_langs="en,und",
+                    hwaccel="auto",
+                    timeout=0,
+                    hw_decode=False,
+                    compat_audio=True,
+                    original_audio=False,
+                    original_subs=False,
+                    no_dotted=False,
+                    name_suffix="",
+                    reencode_tag_value="REENCODE",
+                    dry_run=False,
+                    verbose=False,
+                    target="av1+mkv",
+                    rewrite_codec=True,
+                    reencode_tag=True,
+                    encoder_preset=None,
+                    qsv_overrides={},
+                    _apply_run_id=run_id,
+                )
+                with patch.object(cli_mod, "_execute_encode",
+                                  side_effect=fake_execute), \
+                     patch.object(cli_mod.encoder, "select_encoder",
+                                  return_value="libsvtav1"), \
+                     patch.object(cli_mod, "_build_apply_command",
+                                  return_value=(["ffmpeg"], "encode (stub)")), \
+                     patch.object(cli_mod.encoder, "validate_output",
+                                  return_value=(True, "")):
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        status, _saved = _encode_one(
+                            db, row, pr, cfg, ["en", "und"], 1, 1,
+                        )
 
-            with patch.object(cli_mod, "_execute_encode",
-                              side_effect=fake_execute), \
-                 patch.object(cli_mod.encoder, "select_encoder",
-                              return_value="libsvtav1"), \
-                 patch.object(cli_mod, "_build_apply_command",
-                              return_value=(["ffmpeg"], "encode (stub)")), \
-                 patch.object(cli_mod.encoder, "validate_output",
-                              return_value=(True, "")):
-                buf = io.StringIO()
-                with redirect_stdout(buf):
-                    rc = cmd_apply(args)
-
-            self.assertEqual(rc, 0)
+            self.assertEqual(status, "applied")
             # Source must still exist — keep mode never disposes of
             # the original.
             self.assertTrue(source.exists())
